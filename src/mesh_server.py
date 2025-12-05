@@ -1,0 +1,1444 @@
+import sqlite3
+import json
+import time
+import os
+from datetime import date, datetime
+from enum import Enum
+from mcp.server.fastmcp import FastMCP
+from typing import List, Dict
+
+# FIX #3: Environment Variable for DB Path - allows isolation between environments
+DB_FILE = os.getenv("ATOMIC_MESH_DB", os.path.join(os.getcwd(), "mesh.db"))
+DOCS_DIR = os.getenv("ATOMIC_MESH_DOCS", os.path.join(os.getcwd(), "docs"))
+MODE_FILE = ".mesh_mode"
+MILESTONE_FILE = ".milestone_date"
+
+# Server startup time for uptime tracking
+SERVER_START_TIME = time.time()
+
+mcp = FastMCP("AtomicMesh")
+
+# FIX #4: Input Validation Helpers
+def validate_task_id(task_id: int) -> bool:
+    """Ensures Task ID is a safe, positive integer within bounds."""
+    return isinstance(task_id, int) and 0 < task_id < 1_000_000
+
+def validate_port(port: int) -> bool:
+    """Ensures port is within valid range."""
+    return isinstance(port, int) and 0 < port < 65536
+
+class TaskType(str, Enum):
+    FRONTEND = "frontend"
+    BACKEND = "backend"
+    QA = "qa"
+
+class Mode(str, Enum):
+    VIBE = "vibe"       # Fast iteration, tests optional
+    CONVERGE = "converge"  # Unit tests required
+    SHIP = "ship"       # Full E2E, changelog required
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    # WAL mode for concurrent access - set once per connection
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+# Setup logging for server (Issue #1, #8)
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+server_logger = logging.getLogger("MeshServer")
+
+def init_db():
+    """Initialize database schema. WAL mode is already set in get_db()."""
+    try:
+        with get_db() as conn:
+            # Note: WAL mode already enabled in get_db(), no duplicate needed (Issue #6)
+            
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                desc TEXT NOT NULL,
+                deps TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'pending',
+                output TEXT,
+                worker_id TEXT,
+                updated_at INTEGER,
+                retry_count INTEGER DEFAULT 0,
+                priority INTEGER DEFAULT 1,
+                files_changed TEXT DEFAULT '[]',
+                test_result TEXT DEFAULT 'SKIPPED',
+                strictness TEXT DEFAULT 'normal',
+                auditor_status TEXT DEFAULT 'pending',
+                auditor_feedback TEXT DEFAULT '[]'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS artifacts (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                worker_id TEXT,
+                updated_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        # Decisions table for red/yellow/green priority queue
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                priority TEXT NOT NULL,
+                question TEXT NOT NULL,
+                context TEXT,
+                status TEXT DEFAULT 'pending',
+                answer TEXT,
+                created_at INTEGER
+            )
+        """)
+        # NEW: Audit log table for Auditor agent
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                action TEXT,
+                strictness TEXT,
+                reason TEXT,
+                retry_count INTEGER,
+                created_at INTEGER
+            )
+        """)
+        # NEW: Librarian operations log
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS librarian_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                manifest_id TEXT,
+                action TEXT,
+                from_path TEXT,
+                to_path TEXT,
+                risk_level TEXT,
+                status TEXT DEFAULT 'pending',
+                blocked_reason TEXT,
+                created_at INTEGER,
+                executed_at INTEGER
+            )
+        """)
+        # NEW: Restore points for librarian
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS restore_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                manifest_id TEXT,
+                script_path TEXT,
+                operations_json TEXT,
+                created_at INTEGER,
+                expires_at INTEGER,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+        # Initialize config if not exists
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'vibe')")
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('last_review', ?)", (str(int(time.time())),))
+    
+    except sqlite3.Error as e:
+        server_logger.critical(f"Database initialization failed: {e}")
+        raise  # Critical failure - cannot proceed without DB
+    except Exception as e:
+        server_logger.critical(f"Unexpected error during DB init: {e}")
+        raise
+
+init_db()
+
+# --- HEALTH CHECK (Issue #12) ---
+
+@mcp.tool()
+def system_health_check() -> str:
+    """
+    Returns system vitals for monitoring and status commands.
+    Used by monitoring scripts, 'status' command, and external integrations.
+    """
+    try:
+        # 1. Check DB Connection
+        db_ok = False
+        task_count = 0
+        with get_db() as conn:
+            conn.execute("SELECT 1")
+            db_ok = True
+            task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        
+        # 2. Calculate uptime
+        uptime_seconds = time.time() - SERVER_START_TIME
+        uptime_human = f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m"
+        
+        # 3. Check docs directory
+        docs_exist = os.path.isdir(DOCS_DIR)
+        
+        return json.dumps({
+            "status": "HEALTHY",
+            "component": "Atomic Mesh Server v7.4",
+            "database": {
+                "path": DB_FILE,
+                "connected": db_ok,
+                "wal_mode": True,
+                "task_count": task_count
+            },
+            "uptime": uptime_human,
+            "uptime_seconds": uptime_seconds,
+            "docs_directory": DOCS_DIR,
+            "docs_exist": docs_exist,
+            "timestamp": time.time()
+        })
+    
+    except sqlite3.Error as e:
+        server_logger.error(f"Health check DB error: {e}")
+        return json.dumps({
+            "status": "UNHEALTHY",
+            "component": "Atomic Mesh Server v7.4",
+            "error": f"Database error: {e}",
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        server_logger.error(f"Health check failed: {e}")
+        return json.dumps({
+            "status": "UNHEALTHY",
+            "component": "Atomic Mesh Server v7.4",
+            "error": str(e),
+            "timestamp": time.time()
+        })
+
+# --- MODE MANAGEMENT ---
+def get_mode() -> str:
+    """Get current mode, with auto-detection based on milestone date."""
+    # Check for milestone file
+    if os.path.exists(MILESTONE_FILE):
+        try:
+            with open(MILESTONE_FILE, 'r') as f:
+                milestone = date.fromisoformat(f.read().strip())
+            days_left = (milestone - date.today()).days
+            
+            if days_left <= 2:
+                return "ship"
+            elif days_left <= 7:
+                return "converge"
+            else:
+                return "vibe"
+        except:
+            pass
+    
+    # Fall back to manual mode
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM config WHERE key='mode'").fetchone()
+        return row[0] if row else "vibe"
+
+def run_watchdog(conn):
+    """Resets tasks stuck 'in_progress'."""
+    now = int(time.time())
+    conn.execute("""
+        UPDATE tasks SET status='pending', worker_id=NULL, retry_count=retry_count+1 
+        WHERE status='in_progress' AND type IN ('frontend', 'qa') AND updated_at < ?
+    """, (now - 300,))
+    conn.execute("""
+        UPDATE tasks SET status='pending', worker_id=NULL, retry_count=retry_count+1 
+        WHERE status='in_progress' AND type = 'backend' AND updated_at < ?
+    """, (now - 600,))
+
+# --- TOOLS ---
+@mcp.tool()
+def set_mode(mode: str) -> str:
+    """Set the strictness mode: vibe, converge, or ship."""
+    if mode not in ['vibe', 'converge', 'ship']:
+        return "Invalid mode. Use: vibe, converge, ship"
+    with get_db() as conn:
+        conn.execute("UPDATE config SET value=? WHERE key='mode'", (mode,))
+    # Remove milestone file if manually setting mode
+    if os.path.exists(MILESTONE_FILE):
+        os.remove(MILESTONE_FILE)
+    return f"Mode set to: {mode.upper()}"
+
+@mcp.tool()
+def get_current_mode() -> str:
+    """Get current mode with auto-detection info."""
+    mode = get_mode()
+    auto_msg = ""
+    if os.path.exists(MILESTONE_FILE):
+        try:
+            with open(MILESTONE_FILE, 'r') as f:
+                milestone = date.fromisoformat(f.read().strip())
+            days_left = (milestone - date.today()).days
+            auto_msg = f" (Auto: {days_left} days to milestone)"
+        except:
+            pass
+    
+    icons = {"vibe": "🟢", "converge": "🟡", "ship": "🔴"}
+    return f"{icons.get(mode, '⚪')} {mode.upper()}{auto_msg}"
+
+@mcp.tool()
+def set_milestone(date_str: str) -> str:
+    """Set milestone date (YYYY-MM-DD) for auto-dimmer."""
+    try:
+        milestone = date.fromisoformat(date_str)
+        with open(MILESTONE_FILE, 'w') as f:
+            f.write(date_str)
+        days = (milestone - date.today()).days
+        return f"Milestone set: {date_str} ({days} days). Auto-dimmer active."
+    except ValueError:
+        return "Invalid date format. Use: YYYY-MM-DD"
+
+@mcp.tool()
+def post_task(type: TaskType, description: str, dependencies: List[int] = [], priority: int = 1) -> str:
+    """Queues a new task."""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (type, desc, deps, status, updated_at, priority) VALUES (?, ?, ?, 'pending', ?, ?)",
+            (type.value, description, json.dumps(dependencies), int(time.time()), priority)
+        )
+        return f"Task {cursor.lastrowid} queued"
+
+@mcp.tool()
+def pick_task(worker_type: TaskType, worker_id: str) -> str:
+    """
+    Smart Picking v2:
+    1. THROTTLING (Backend < 2)
+    2. CASCADING BLOCKS: 
+       - If Parent FAILED/BLOCKED -> Mark Child BLOCKED (Partial Halt)
+       - If Parent PENDING/IN_PROGRESS -> Skip Child (Wait)
+       - If Parent COMPLETED -> Execute Child
+    """
+    with get_db() as conn:
+        run_watchdog(conn)
+        
+        # 1. THROTTLING
+        if worker_type == TaskType.BACKEND:
+            active = conn.execute(
+                "SELECT count(*) FROM tasks WHERE type='backend' AND status='in_progress'"
+            ).fetchone()[0]
+            if active >= 2:
+                return "NO_WORK (Throttled)"
+
+        # 2. SEARCH (include 'blocked' to check for auto-recovery)
+        cursor = conn.execute(
+            "SELECT * FROM tasks WHERE type = ? AND status IN ('pending', 'blocked') ORDER BY priority DESC, id ASC", 
+            (worker_type.value,)
+        )
+        
+        for task in cursor.fetchall():
+            deps = json.loads(task['deps'])
+            
+            if deps:
+                # Check status of ALL dependencies
+                placeholders = ','.join('?' for _ in deps)
+                dep_rows = conn.execute(
+                    f"SELECT status FROM tasks WHERE id IN ({placeholders})", deps
+                ).fetchall()
+                
+                statuses = [r[0] for r in dep_rows]
+                
+                # CONDITION 1: CASCADING BLOCK (Partial Halt)
+                # If any parent failed or is blocked, this task must block
+                if 'failed' in statuses or 'blocked' in statuses:
+                    if task['status'] != 'blocked':
+                        conn.execute(
+                            "UPDATE tasks SET status='blocked', updated_at=? WHERE id=?", 
+                            (int(time.time()), task['id'])
+                        )
+                    continue  # Skip to next task
+                
+                # CONDITION 2: WAIT
+                # If any parent is not completed, we must wait
+                if any(s != 'completed' for s in statuses):
+                    # Auto-recover from blocked if parent was fixed
+                    if task['status'] == 'blocked':
+                        conn.execute(
+                            "UPDATE tasks SET status='pending' WHERE id=?", 
+                            (task['id'],)
+                        )
+                    continue  # Skip to next task
+            
+            # CONDITION 3: EXECUTE
+            # All parents completed (or no deps) - ready to run!
+            
+            # Context Injection
+            deps_context = ""
+            if deps:
+                rows = conn.execute(
+                    f"SELECT id, output FROM tasks WHERE id IN ({','.join(map(str, deps))})"
+                ).fetchall()
+                for r in rows: 
+                    deps_context += f"\n[Task {r['id']} Output]: {r['output']}"
+            
+            # Include mode in task context
+            mode = get_mode()
+            mode_context = f"\n\n=== MODE: {mode.upper()} ===" 
+            if mode == "converge":
+                mode_context += "\nREQUIRED: Run unit tests before reporting done."
+            elif mode == "ship":
+                mode_context += "\nREQUIRED: Run full test suite. No TODOs allowed."
+            
+            full_desc = f"{task['desc']}\n\n=== CONTEXT ==={deps_context}{mode_context}"
+            
+            conn.execute(
+                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=?", 
+                (worker_id, int(time.time()), task['id'])
+            )
+            return f'{{"id": {task["id"]}, "description": "{full_desc}"}}'
+            
+    return "NO_WORK"
+
+
+@mcp.tool()
+def complete_task(task_id: int, output: str, success: bool = True, files_changed: str = "[]", test_result: str = "SKIPPED") -> str:
+    """Marks task complete with structured output."""
+    mode = get_mode()
+    
+    with get_db() as conn:
+        # Get task info for potential QA generation
+        task = conn.execute("SELECT type, desc FROM tasks WHERE id=?", (task_id,)).fetchone()
+        
+        if success:
+            conn.execute(
+                "UPDATE tasks SET status='completed', output=?, files_changed=?, test_result=?, updated_at=? WHERE id=?", 
+                (output, files_changed, test_result, int(time.time()), task_id)
+            )
+            
+            # AUTO-QA: Generate QA task in converge/ship mode for backend/frontend tasks
+            qa_msg = ""
+            if mode in ['converge', 'ship'] and task and task['type'] in ['backend', 'frontend']:
+                qa_desc = f"VERIFY Task {task_id}: {task['desc'][:100]}. Check: {output[:200]}"
+                cursor = conn.execute(
+                    "INSERT INTO tasks (type, desc, deps, status, updated_at, priority) VALUES ('qa', ?, ?, 'pending', ?, 2)",
+                    (qa_desc, json.dumps([task_id]), int(time.time()))
+                )
+                qa_msg = f" → QA Task {cursor.lastrowid} auto-generated."
+            
+            return f"Task Completed.{qa_msg}"
+        else:
+            row = conn.execute("SELECT retry_count FROM tasks WHERE id=?", (task_id,)).fetchone()
+            current_retries = row[0] if row else 0
+            
+            if current_retries < 3:
+                conn.execute(
+                    "UPDATE tasks SET status='pending', worker_id=NULL, retry_count=retry_count+1, output=?, updated_at=? WHERE id=?", 
+                    (f"Retry #{current_retries + 1}: {output}", int(time.time()), task_id)
+                )
+                return f"Task Failed. Auto-retrying ({current_retries + 1}/3)..."
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status='failed', output=?, updated_at=? WHERE id=?", 
+                    (output, int(time.time()), task_id)
+                )
+                return "Task Failed. Max retries exceeded."
+
+@mcp.tool()
+def reopen_task(task_id: int, reason: str = "") -> str:
+    """Reopen a completed/failed task for rework."""
+    with get_db() as conn:
+        task = conn.execute("SELECT status, desc FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        
+        new_desc = f"REWORK: {task['desc']}"
+        if reason:
+            new_desc += f"\n\nREASON: {reason}"
+        
+        conn.execute(
+            "UPDATE tasks SET status='pending', worker_id=NULL, desc=?, updated_at=? WHERE id=?",
+            (new_desc, int(time.time()), task_id)
+        )
+        return f"Task {task_id} reopened for rework."
+
+@mcp.tool()
+def get_review_stats() -> str:
+    """Get stats for milestone review."""
+    with get_db() as conn:
+        last_review = conn.execute("SELECT value FROM config WHERE key='last_review'").fetchone()
+        last_review_ts = int(last_review[0]) if last_review else 0
+        
+        # Count tasks since last review
+        completed = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='completed' AND updated_at > ?", (last_review_ts,)
+        ).fetchone()[0]
+        
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='failed' AND updated_at > ?", (last_review_ts,)
+        ).fetchone()[0]
+        
+        # Get all outputs for changelog
+        outputs = conn.execute(
+            "SELECT type, desc, output FROM tasks WHERE status='completed' AND updated_at > ? ORDER BY id", 
+            (last_review_ts,)
+        ).fetchall()
+        
+        changelog_items = []
+        for o in outputs:
+            if o['output']:
+                changelog_items.append(f"- [{o['type'].upper()}] {o['desc'][:60]}")
+        
+        mode = get_mode()
+        
+        return f"""📊 MILESTONE REVIEW
+Mode: {mode.upper()}
+Tasks completed: {completed}
+Tasks failed: {failed}
+Last review: {datetime.fromtimestamp(last_review_ts).strftime('%Y-%m-%d %H:%M') if last_review_ts else 'Never'}
+
+📝 CHANGELOG:
+{chr(10).join(changelog_items[:20]) if changelog_items else '(No completed tasks)'}"""
+
+@mcp.tool()
+def mark_review_done() -> str:
+    """Mark current time as last review point."""
+    with get_db() as conn:
+        conn.execute("UPDATE config SET value=? WHERE key='last_review'", (str(int(time.time())),))
+    return "Review checkpoint saved."
+
+@mcp.tool()
+def save_artifact(key: str, value: str, worker_id: str) -> str:
+    """Save shared knowledge."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO artifacts (key, value, worker_id, updated_at) VALUES (?, ?, ?, ?)",
+            (key.upper(), value, worker_id, int(time.time()))
+        )
+    return f"Artifact '{key}' saved."
+
+@mcp.tool()
+def read_artifact(key: str) -> str:
+    """Read shared knowledge."""
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM artifacts WHERE key = ?", (key.upper(),)).fetchone()
+    return row[0] if row else "NOT_FOUND"
+
+@mcp.tool()
+def list_artifacts() -> str:
+    """See what keys are available."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT key, value FROM artifacts").fetchall()
+    return "\n".join([f"{r[0]}: {r[1]}" for r in rows])
+
+@mcp.tool()
+def dashboard() -> str:
+    """Returns queue view with mode indicator and blocked status."""
+    mode = get_mode()
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, type, status, priority, desc, test_result FROM tasks ORDER BY id DESC LIMIT 15").fetchall()
+    
+    icons = {"vibe": "🟢", "converge": "🟡", "ship": "🔴"}
+    header = f"{icons.get(mode, '⚪')} MODE: {mode.upper()}\n{'─' * 50}\n"
+    
+    report = []
+    for r in rows:
+        desc_preview = (r[4][:35] + '..') if len(r[4]) > 35 else r[4]
+        # Status icons including BLOCKED
+        status_icons = {
+            "completed": "✅",
+            "in_progress": "🔄", 
+            "pending": "⏳",
+            "blocked": "🚫",  # NEW: Blocked by failed parent
+            "failed": "❌"
+        }
+        status_icon = status_icons.get(r[2], "❓")
+        test_badge = f"[{r[5]}]" if r[5] != "SKIPPED" else ""
+        report.append(f"[{r[0]}] {status_icon} {r[1].upper()} P{r[3]} {test_badge}: {desc_preview}")
+        
+    return header + ("\n".join(report) if report else "No tasks in queue.")
+
+@mcp.tool()
+def nuke_queue() -> str:
+    """🚨 EMERGENCY: Deletes all PENDING tasks."""
+    with get_db() as conn:
+        count = conn.execute("DELETE FROM tasks WHERE status='pending'").rowcount
+    return f"🚨 Deleted {count} pending tasks."
+
+# --- DECISION MANAGEMENT ---
+@mcp.tool()
+def post_decision(priority: str, question: str, context: str = "") -> str:
+    """Log a decision needed from Product Team (red/yellow/green)."""
+    if priority.lower() not in ['red', 'yellow', 'green']:
+        return "Invalid priority. Use: red, yellow, green"
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO decisions (priority, question, context, created_at) VALUES (?, ?, ?, ?)",
+            (priority.lower(), question, context, int(time.time()))
+        )
+    return f"Decision logged ({priority.upper()})."
+
+@mcp.tool()
+def get_pending_decisions() -> str:
+    """Get all pending decisions sorted by priority."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT id, priority, question 
+            FROM decisions 
+            WHERE status='pending' 
+            ORDER BY 
+                CASE priority WHEN 'red' THEN 1 WHEN 'yellow' THEN 2 ELSE 3 END,
+                created_at ASC
+            LIMIT 10
+        """).fetchall()
+    
+    if not rows:
+        return "No pending decisions."
+    
+    icons = {"red": "🔴", "yellow": "🟡", "green": "🟢"}
+    result = []
+    for r in rows:
+        result.append(f"[{r[0]}] {icons.get(r[1], '⚪')} {r[2]}")
+    return "\n".join(result)
+
+@mcp.tool()
+def resolve_decision(decision_id: int, answer: str) -> str:
+    """Resolve a pending decision with an answer."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE decisions SET status='resolved', answer=? WHERE id=?",
+            (answer, decision_id)
+        )
+    return f"Decision {decision_id} resolved."
+
+@mcp.tool()
+def get_project_status() -> str:
+    """Get full project status for control panel."""
+    mode = get_mode()
+    days_left = None
+    
+    if os.path.exists(MILESTONE_FILE):
+        try:
+            with open(MILESTONE_FILE, 'r') as f:
+                milestone = date.fromisoformat(f.read().strip())
+            days_left = (milestone - date.today()).days
+        except:
+            pass
+    
+    with get_db() as conn:
+        stats = conn.execute("""
+            SELECT status, COUNT(*) as c FROM tasks GROUP BY status
+        """).fetchall()
+        
+        decisions = conn.execute("""
+            SELECT priority, COUNT(*) as c FROM decisions 
+            WHERE status='pending' GROUP BY priority
+        """).fetchall()
+    
+    status_counts = {s[0]: s[1] for s in stats}
+    decision_counts = {d[0]: d[1] for d in decisions}
+    
+    return json.dumps({
+        "mode": mode,
+        "days_left": days_left,
+        "pending": status_counts.get("pending", 0),
+        "active": status_counts.get("in_progress", 0),
+        "completed": status_counts.get("completed", 0),
+        "failed": status_counts.get("failed", 0),
+        "blocked": status_counts.get("blocked", 0),
+        "decisions": {
+            "red": decision_counts.get("red", 0),
+            "yellow": decision_counts.get("yellow", 0),
+            "green": decision_counts.get("green", 0)
+        }
+    })
+
+# --- AUDITOR MANAGEMENT ---
+
+# Security Tripwire Patterns (override everything)
+BANNED_PATTERNS = [
+    "dangerouslySetInnerHTML", "innerHTML",  # XSS
+    "eval(", "exec(", "shell=True",          # Injection
+    "DROP TABLE", "DELETE FROM",             # DB Destructive
+    "api_key =", "password =", "secret =",   # Hardcoded Secrets
+    "0.0.0.0", "allow_origins=['*']",        # Permissive Config
+    "disable_ssl", "verify=False"            # Security Bypass
+]
+
+CRITICAL_FILE_PATTERNS = ['auth', 'security', 'payment', 'db', 'schema', 
+                          'api/admin', 'middleware', 'session', 'crypto']
+RELAXED_FILE_PATTERNS = ['css', 'style', 'ui/', 'component', '.test.', 
+                         '.spec.', 'mock', 'fixture']
+
+@mcp.tool()
+def determine_strictness(files_changed: str, task_desc: str, code_diff: str = "") -> str:
+    """Determine task strictness level with Security Tripwire protection."""
+    files_list = json.loads(files_changed) if files_changed else []
+    
+    # 1. SECURITY TRIPWIRES (Override EVERYTHING)
+    for pattern in BANNED_PATTERNS:
+        if pattern in code_diff:
+            return json.dumps({
+                "strictness": "CRITICAL",
+                "reason": f"TRIPWIRE: Found '{pattern}'",
+                "forced": True
+            })
+    
+    # 2. MANUAL OVERRIDES
+    desc_upper = task_desc.upper()
+    if "[CRITICAL]" in desc_upper:
+        return json.dumps({"strictness": "CRITICAL", "reason": "Manual tag", "forced": False})
+    if "[RELAXED]" in desc_upper:
+        return json.dumps({"strictness": "RELAXED", "reason": "Manual tag", "forced": False})
+    if "[NORMAL]" in desc_upper:
+        return json.dumps({"strictness": "NORMAL", "reason": "Manual tag", "forced": False})
+    
+    # 3. FILE PATTERN DETECTION
+    for f in files_list:
+        for pattern in CRITICAL_FILE_PATTERNS:
+            if pattern in f.lower():
+                return json.dumps({"strictness": "CRITICAL", "reason": f"File pattern: {pattern}", "forced": False})
+    
+    for f in files_list:
+        for pattern in RELAXED_FILE_PATTERNS:
+            if pattern in f.lower():
+                return json.dumps({"strictness": "RELAXED", "reason": f"File pattern: {pattern}", "forced": False})
+    
+    return json.dumps({"strictness": "NORMAL", "reason": "Default", "forced": False})
+
+@mcp.tool()
+def record_audit(task_id: int, action: str, strictness: str, reason: str = "") -> str:
+    """Record an audit action (review/reject/approve/escalate)."""
+    with get_db() as conn:
+        # Get current retry count
+        task = conn.execute("SELECT retry_count FROM tasks WHERE id=?", (task_id,)).fetchone()
+        retry_count = task[0] if task else 0
+        
+        conn.execute(
+            "INSERT INTO audit_log (task_id, action, strictness, reason, retry_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, action, strictness, reason, retry_count, int(time.time()))
+        )
+        
+        # Update task auditor status
+        if action == 'approve':
+            conn.execute("UPDATE tasks SET auditor_status='approved', retry_count=0 WHERE id=?", (task_id,))
+        elif action == 'reject':
+            conn.execute("UPDATE tasks SET auditor_status='rejected', retry_count=retry_count+1 WHERE id=?", (task_id,))
+        elif action == 'escalate':
+            conn.execute("UPDATE tasks SET auditor_status='escalated', status='blocked' WHERE id=?", (task_id,))
+    
+    return f"Audit recorded: {action} for task {task_id}"
+
+@mcp.tool()
+def get_audit_status(task_id: int) -> str:
+    """Get current audit status for a task."""
+    with get_db() as conn:
+        task = conn.execute(
+            "SELECT status, strictness, auditor_status, retry_count, auditor_feedback FROM tasks WHERE id=?",
+            (task_id,)
+        ).fetchone()
+        
+        if not task:
+            return json.dumps({"error": "Task not found"})
+        
+        logs = conn.execute(
+            "SELECT action, reason, created_at FROM audit_log WHERE task_id=? ORDER BY created_at DESC LIMIT 5",
+            (task_id,)
+        ).fetchall()
+    
+    return json.dumps({
+        "task_id": task_id,
+        "status": task[0],
+        "strictness": task[1],
+        "auditor_status": task[2],
+        "retry_count": task[3],
+        "can_continue": task[3] < 3 and task[2] != 'escalated',
+        "logs": [{"action": l[0], "reason": l[1], "at": l[2]} for l in logs]
+    })
+
+@mcp.tool()
+def reset_task_auditor(task_id: int) -> str:
+    """Reset auditor state after user intervention (for blocked tasks)."""
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE tasks 
+            SET retry_count=0, 
+                auditor_status='pending', 
+                auditor_feedback='[]',
+                status='pending'
+            WHERE id=?
+        """, (task_id,))
+        
+        conn.execute(
+            "INSERT INTO audit_log (task_id, action, strictness, reason, retry_count, created_at) VALUES (?, 'reset', 'N/A', 'User intervention', 0, ?)",
+            (task_id, int(time.time()))
+        )
+    
+    return f"Task {task_id} auditor state reset. Ready for retry."
+
+@mcp.tool()
+def get_audit_log(limit: int = 10) -> str:
+    """Get recent audit log entries."""
+    with get_db() as conn:
+        logs = conn.execute("""
+            SELECT a.id, a.task_id, t.desc, a.action, a.strictness, a.reason, a.retry_count, a.created_at
+            FROM audit_log a
+            LEFT JOIN tasks t ON a.task_id = t.id
+            ORDER BY a.created_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    
+    result = []
+    for l in logs:
+        result.append({
+            "id": l[0],
+            "task_id": l[1],
+            "task_desc": l[2][:30] if l[2] else "N/A",
+            "action": l[3],
+            "strictness": l[4],
+            "reason": l[5],
+            "retry": l[6],
+            "at": l[7]
+        })
+    
+    return json.dumps(result)
+
+# --- PATCH 2: CONTEXT FLUSH (Force Auditor Re-read) ---
+
+@mcp.tool()
+def flush_auditor_context(task_id: int) -> str:
+    """
+    Force Auditor to clear cache and re-read files from disk.
+    Use after user manual intervention on blocked tasks.
+    """
+    with get_db() as conn:
+        # Clear cached feedback
+        conn.execute("""
+            UPDATE tasks 
+            SET auditor_feedback='[]',
+                auditor_status='pending'
+            WHERE id=?
+        """, (task_id,))
+        
+        # Log the flush
+        conn.execute("""
+            INSERT INTO audit_log 
+            (task_id, action, strictness, reason, retry_count, created_at)
+            VALUES (?, 'context_flush', 'N/A', 'User intervention - context cleared', 0, ?)
+        """, (task_id, int(time.time())))
+    
+    return json.dumps({
+        "success": True,
+        "message": f"Context flushed for task {task_id}. Auditor will re-read from disk."
+    })
+
+# --- PATCH 3: PORT CLEANUP (Kill Zombie Processes) ---
+
+import socket
+import subprocess
+import platform
+
+@mcp.tool()
+def check_port_available(port: int) -> str:
+    """Check if a port is available for use."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('localhost', port))
+        sock.close()
+        return json.dumps({"available": True, "port": port})
+    except socket.error:
+        return json.dumps({"available": False, "port": port, "reason": "Port in use"})
+
+# Allowed port range for safety (Issue #7)
+ALLOWED_PORT_RANGE = range(3000, 10001)
+ALLOWED_EXTRA_PORTS = {8000, 8080, 5000, 5173, 4200, 9000}
+
+@mcp.tool()
+def kill_process_on_port(port: int) -> str:
+    """
+    Kill process occupying a specific port. Use for zombie server cleanup.
+    SECURITY: Port range validation, no shell=True, specific exception handling.
+    """
+    import logging
+    logger = logging.getLogger("MeshServer")
+    
+    # FIX Issue #7: Port range validation - prevent killing system services
+    if port not in ALLOWED_PORT_RANGE and port not in ALLOWED_EXTRA_PORTS:
+        return json.dumps({
+            "success": False, 
+            "error": f"Security Block: Port {port} outside allowed dev range (3000-10000)"
+        })
+    
+    try:
+        if platform.system() == "Windows":
+            # FIX Issue #2: No shell=True - use list arguments
+            # Step 1: Get netstat output
+            netstat_result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, 
+                text=True,
+                check=False
+            )
+            
+            pids = set()
+            target_str = f":{port}"
+            
+            for line in netstat_result.stdout.splitlines():
+                if target_str in line and ("LISTENING" in line or "ESTABLISHED" in line):
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[-1].isdigit():
+                        pids.add(parts[-1])
+            
+            if not pids:
+                return json.dumps({"success": True, "message": f"No process on port {port}"})
+            
+            killed = []
+            for pid in pids:
+                if not pid.isdigit():
+                    continue
+                try:
+                    # FIX Issue #2: No shell=True for taskkill
+                    subprocess.run(
+                        ["taskkill", "/PID", pid, "/F"],
+                        capture_output=True,
+                        check=False
+                    )
+                    killed.append(pid)
+                except subprocess.SubprocessError as e:
+                    logger.warning(f"Failed to kill PID {pid}: {e}")
+            
+            return json.dumps({"success": True, "killed_pids": killed, "port": port})
+        
+        else:
+            # Unix/Mac - use lsof without shell=True
+            try:
+                # FIX Issue #2: No shell=True - use list arguments
+                result = subprocess.run(
+                    ["lsof", "-t", f"-i:{port}"],
+                    capture_output=True, 
+                    text=True,
+                    check=False
+                )
+                
+                if not result.stdout.strip():
+                    return json.dumps({"success": True, "message": f"No process on port {port}"})
+                
+                pids = [p for p in result.stdout.strip().split('\n') if p.isdigit()]
+                
+                if pids:
+                    # FIX Issue #2: No shell=True for kill
+                    subprocess.run(
+                        ["kill", "-9"] + pids,
+                        capture_output=True,
+                        check=False
+                    )
+                
+                return json.dumps({"success": True, "killed_pids": pids, "port": port})
+            
+            except FileNotFoundError:
+                return json.dumps({"success": False, "error": "lsof command not found"})
+    
+    # FIX Issue #1: No bare except - specific exception handling
+    except subprocess.SubprocessError as e:
+        logger.error(f"Subprocess error killing port {port}: {e}")
+        return json.dumps({"success": False, "error": f"Subprocess error: {e}"})
+    except Exception as e:
+        logger.error(f"Failed to kill port {port}: {e}")
+        return json.dumps({"success": False, "error": str(e)})
+
+@mcp.tool()
+def cleanup_dev_environment() -> str:
+    """Kill common dev server zombie processes on typical ports."""
+    common_ports = [3000, 3001, 5000, 5173, 8000, 8080, 4200, 9000]
+    cleaned = []
+    still_busy = []
+    
+    for port in common_ports:
+        check = json.loads(check_port_available(port))
+        if not check["available"]:
+            result = json.loads(kill_process_on_port(port))
+            if result.get("success"):
+                cleaned.append(port)
+            else:
+                still_busy.append(port)
+    
+    return json.dumps({
+        "cleaned_ports": cleaned,
+        "still_busy": still_busy,
+        "message": f"Cleaned {len(cleaned)} ports"
+    })
+
+@mcp.tool()
+def get_port_status(ports: str = "3000,3001,5000,8000,8080") -> str:
+    """Check status of multiple ports. Comma-separated list."""
+    port_list = [int(p.strip()) for p in ports.split(",")]
+    status = []
+    
+    for port in port_list:
+        check = json.loads(check_port_available(port))
+        status.append({
+            "port": port,
+            "available": check["available"],
+            "status": "FREE" if check["available"] else "IN USE"
+        })
+    
+    return json.dumps({"ports": status})
+
+# --- SEMANTIC ROUTER ---
+
+# Import router
+try:
+    from router import SemanticRouter, IntentExecutor, create_router, route_and_execute
+    ROUTER_AVAILABLE = True
+except ImportError:
+    ROUTER_AVAILABLE = False
+
+# Create global router instance
+_router = None
+_executor = None
+
+def get_router():
+    global _router, _executor
+    if _router is None and ROUTER_AVAILABLE:
+        _router, _executor = create_router(DB_PATH)
+    return _router, _executor
+
+# --- PATCH 1: JIT CONTEXT INJECTION ---
+
+def get_jit_context() -> Dict:
+    """
+    Just-In-Time context fetch (Patch 1: Context Lag Fix).
+    Called IMMEDIATELY before delegator starts to ensure fresh context.
+    """
+    context = {
+        "decisions": "",
+        "resolved_decisions": [],
+        "blockers": [],
+        "notes": [],
+        "session": {}
+    }
+    
+    # 1. Latest decisions from file
+    decision_file = os.path.join(DOCS_DIR, "DECISION_LOG.md")
+    if os.path.exists(decision_file):
+        try:
+            with open(decision_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Get last 2000 chars for context window efficiency
+                context["decisions"] = content[-2000:] if len(content) > 2000 else content
+        except:
+            pass
+    
+    # 2. Resolved decisions from DB
+    with get_db() as conn:
+        resolved = conn.execute("""
+            SELECT question, answer FROM decisions 
+            WHERE status='resolved' 
+            ORDER BY id DESC LIMIT 5
+        """).fetchall()
+        context["resolved_decisions"] = [{"q": r[0], "a": r[1]} for r in resolved]
+        
+        # 3. Active blockers (RED priority)
+        blockers = conn.execute("""
+            SELECT question FROM decisions 
+            WHERE priority='red' AND status='pending'
+        """).fetchall()
+        context["blockers"] = [b[0] for b in blockers]
+        
+        # 4. Recent notes
+        notes = conn.execute("""
+            SELECT value FROM config WHERE key='last_note'
+        """).fetchone()
+        if notes:
+            context["notes"].append(notes[0])
+    
+    # 5. Session context (from router)
+    try:
+        with get_db() as conn:
+            session = conn.execute(
+                "SELECT key, value FROM session_context"
+            ).fetchall()
+            context["session"] = {s[0]: json.loads(s[1]) for s in session}
+    except:
+        pass
+    
+    return context
+
+@mcp.tool()
+def trigger_delegation(task_id: int) -> str:
+    """
+    EXECUTE trigger with JIT context injection (Patch 1).
+    This ensures the delegator always has the latest decisions/notes.
+    """
+    # CRITICAL: Fetch fresh context
+    context = get_jit_context()
+    
+    with get_db() as conn:
+        task = conn.execute(
+            "SELECT id, type, desc, status, priority FROM tasks WHERE id=?",
+            (task_id,)
+        ).fetchone()
+    
+    if not task:
+        return json.dumps({"error": f"Task {task_id} not found"})
+    
+    # Check for blockers
+    if context["blockers"]:
+        return json.dumps({
+            "status": "blocked",
+            "task_id": task_id,
+            "blockers": context["blockers"],
+            "message": f"🔴 {len(context['blockers'])} active blockers. Resolve before continuing."
+        })
+    
+    # Build augmented task payload
+    augmented = {
+        "task": {
+            "id": task[0],
+            "type": task[1],
+            "desc": task[2],
+            "status": task[3],
+            "priority": task[4]
+        },
+        "context": {
+            "decisions": context["decisions"],
+            "resolved": context["resolved_decisions"],
+            "notes": context["notes"]
+        }
+    }
+    
+    return json.dumps({
+        "status": "delegating",
+        "task_id": task_id,
+        "context_injected": True,
+        "decision_count": len(context["resolved_decisions"]),
+        "augmented_payload": augmented
+    })
+
+@mcp.tool()
+def route_input(user_input: str) -> str:
+    """
+    Route user input through the Semantic Router.
+    Returns classified intent, action, and parameters.
+    """
+    if not ROUTER_AVAILABLE:
+        return json.dumps({"error": "Router not available"})
+    
+    router, executor = get_router()
+    if not router:
+        return json.dumps({"error": "Router initialization failed"})
+    
+    route = router.route(user_input)
+    return json.dumps(route.to_dict())
+
+@mcp.tool()
+def execute_routed_intent(user_input: str) -> str:
+    """
+    Route AND execute user input in one call.
+    Returns execution result with route info.
+    """
+    if not ROUTER_AVAILABLE:
+        return json.dumps({"error": "Router not available"})
+    
+    result = route_and_execute(DB_PATH, user_input)
+    return json.dumps(result)
+
+@mcp.tool()
+def update_task_context(task_id: int, context_type: str = "shown") -> str:
+    """
+    Update session context for pronoun resolution.
+    context_type: 'shown' (displayed to user) or 'mentioned' (user referenced)
+    """
+    if not ROUTER_AVAILABLE:
+        return json.dumps({"error": "Router not available"})
+    
+    router, _ = get_router()
+    if context_type == "shown":
+        router.update_last_shown_task(task_id)
+    else:
+        router.update_last_mentioned_task(task_id)
+    
+    return json.dumps({"success": True, "task_id": task_id, "type": context_type})
+
+@mcp.tool()
+def get_route_history(limit: int = 10) -> str:
+    """Get recent routing decisions for debugging."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT input, intent, action, parameters, confidence, source, created_at
+            FROM route_log ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+    
+    result = []
+    for r in rows:
+        result.append({
+            "input": r[0],
+            "intent": r[1],
+            "action": r[2],
+            "parameters": json.loads(r[3]) if r[3] else None,
+            "confidence": r[4],
+            "source": r[5],
+            "at": r[6]
+        })
+    
+    return json.dumps(result)
+
+@mcp.tool()
+def reorder_task_by_keyword(keyword: str, position: str = "top") -> str:
+    """
+    Reorder tasks matching keyword to top or bottom.
+    Used for 'prioritize X' commands.
+    """
+    with get_db() as conn:
+        if position == "top":
+            conn.execute("""
+                UPDATE tasks SET priority = 99 
+                WHERE status='pending' AND desc LIKE ?
+            """, (f"%{keyword}%",))
+        else:
+            conn.execute("""
+                UPDATE tasks SET priority = 0 
+                WHERE status='pending' AND desc LIKE ?
+            """, (f"%{keyword}%",))
+        
+        affected = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE desc LIKE ?", 
+            (f"%{keyword}%",)
+        ).fetchone()[0]
+    
+    return json.dumps({
+        "success": True,
+        "keyword": keyword,
+        "position": position,
+        "tasks_affected": affected
+    })
+
+# --- LIBRARIAN MANAGEMENT ---
+
+# Import librarian tools
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from librarian_tools import (
+        librarian_full_scan, 
+        generate_restore_script,
+        execute_operation,
+        scan_for_secrets,
+        check_file_references
+    )
+    LIBRARIAN_AVAILABLE = True
+except ImportError:
+    LIBRARIAN_AVAILABLE = False
+
+@mcp.tool()
+def librarian_scan(project_path: str) -> str:
+    """Safely scan project directory and generate a manifest of proposed operations."""
+    if not LIBRARIAN_AVAILABLE:
+        return json.dumps({"error": "Librarian tools not available"})
+    
+    try:
+        manifest = librarian_full_scan(project_path)
+        
+        # Store pending operations in database
+        with get_db() as conn:
+            for op in manifest["operations"]:
+                conn.execute("""
+                    INSERT INTO librarian_ops 
+                    (manifest_id, action, from_path, to_path, risk_level, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """, (
+                    manifest["manifest_id"],
+                    op["action"],
+                    op.get("from", op.get("target", "")),
+                    op.get("to", ""),
+                    op.get("risk", "LOW"),
+                    int(time.time())
+                ))
+            
+            for blocked in manifest["blocked_operations"]:
+                conn.execute("""
+                    INSERT INTO librarian_ops 
+                    (manifest_id, action, from_path, risk_level, status, blocked_reason, created_at)
+                    VALUES (?, ?, ?, ?, 'blocked', ?, ?)
+                """, (
+                    manifest["manifest_id"],
+                    blocked["action"],
+                    blocked["target"],
+                    blocked["risk"],
+                    blocked["reason"],
+                    int(time.time())
+                ))
+        
+        return json.dumps(manifest)
+    
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+@mcp.tool()
+def librarian_approve(manifest_id: str) -> str:
+    """Approve a pending manifest for execution."""
+    with get_db() as conn:
+        # Check for blocked operations
+        blocked = conn.execute(
+            "SELECT COUNT(*) FROM librarian_ops WHERE manifest_id=? AND status='blocked'",
+            (manifest_id,)
+        ).fetchone()[0]
+        
+        if blocked > 0:
+            return json.dumps({
+                "approved": False,
+                "reason": f"{blocked} blocked operations require manual review"
+            })
+        
+        # Approve all pending
+        conn.execute(
+            "UPDATE librarian_ops SET status='approved' WHERE manifest_id=? AND status='pending'",
+            (manifest_id,)
+        )
+        
+        count = conn.execute(
+            "SELECT COUNT(*) FROM librarian_ops WHERE manifest_id=? AND status='approved'",
+            (manifest_id,)
+        ).fetchone()[0]
+    
+    return json.dumps({"approved": True, "operations_approved": count})
+
+@mcp.tool()
+def librarian_execute(manifest_id: str) -> str:
+    """Execute an approved manifest with backup."""
+    if not LIBRARIAN_AVAILABLE:
+        return json.dumps({"error": "Librarian tools not available"})
+    
+    backup_dir = os.path.join(DB_DIR, ".librarian_backups", manifest_id)
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    results = {"executed": 0, "failed": 0, "errors": [], "restore_script": ""}
+    
+    with get_db() as conn:
+        ops = conn.execute("""
+            SELECT id, action, from_path, to_path FROM librarian_ops 
+            WHERE manifest_id=? AND status='approved'
+        """, (manifest_id,)).fetchall()
+        
+        executed_ops = []
+        
+        for op in ops:
+            op_dict = {
+                "action": op[1],
+                "from": op[2],
+                "to": op[3],
+                "target": op[2]
+            }
+            
+            result = execute_operation(op_dict, backup_dir)
+            
+            if result["success"]:
+                conn.execute(
+                    "UPDATE librarian_ops SET status='executed', executed_at=? WHERE id=?",
+                    (int(time.time()), op[0])
+                )
+                executed_ops.append(op_dict)
+                results["executed"] += 1
+            else:
+                conn.execute(
+                    "UPDATE librarian_ops SET status='failed', blocked_reason=? WHERE id=?",
+                    (result.get("error", "Unknown error"), op[0])
+                )
+                results["errors"].append(result.get("error"))
+                results["failed"] += 1
+        
+        # Generate restore script
+        if executed_ops:
+            restore_dir = os.path.join(DB_DIR, ".system", "restore_points")
+            restore_path = generate_restore_script(manifest_id, executed_ops, restore_dir)
+            results["restore_script"] = restore_path
+            
+            # Store restore point
+            conn.execute("""
+                INSERT INTO restore_points (manifest_id, script_path, operations_json, created_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+            """, (
+                manifest_id,
+                restore_path,
+                json.dumps(executed_ops),
+                int(time.time()),
+                int(time.time()) + 604800  # 7 days
+            ))
+    
+    return json.dumps(results)
+
+@mcp.tool()
+def librarian_status() -> str:
+    """Get current librarian status and pending operations."""
+    with get_db() as conn:
+        pending = conn.execute(
+            "SELECT manifest_id, COUNT(*) as c FROM librarian_ops WHERE status='pending' GROUP BY manifest_id"
+        ).fetchall()
+        
+        approved = conn.execute(
+            "SELECT manifest_id, COUNT(*) as c FROM librarian_ops WHERE status='approved' GROUP BY manifest_id"
+        ).fetchall()
+        
+        blocked = conn.execute(
+            "SELECT manifest_id, action, from_path, blocked_reason FROM librarian_ops WHERE status='blocked' LIMIT 5"
+        ).fetchall()
+        
+        recent_executed = conn.execute(
+            "SELECT manifest_id, COUNT(*) as c, MAX(executed_at) FROM librarian_ops WHERE status='executed' GROUP BY manifest_id ORDER BY executed_at DESC LIMIT 3"
+        ).fetchall()
+    
+    return json.dumps({
+        "pending_manifests": [{"id": p[0], "count": p[1]} for p in pending],
+        "approved_manifests": [{"id": a[0], "count": a[1]} for a in approved],
+        "blocked_operations": [{"manifest": b[0], "action": b[1], "file": b[2], "reason": b[3]} for b in blocked],
+        "recent_executions": [{"id": r[0], "count": r[1]} for r in recent_executed]
+    })
+
+@mcp.tool()
+def librarian_restore(manifest_id: str) -> str:
+    """Restore from a previous manifest execution."""
+    with get_db() as conn:
+        restore = conn.execute(
+            "SELECT script_path, operations_json FROM restore_points WHERE manifest_id=? AND status='active'",
+            (manifest_id,)
+        ).fetchone()
+        
+        if not restore:
+            return json.dumps({"error": "No active restore point found"})
+        
+        script_path = restore[0]
+        
+        if not os.path.exists(script_path):
+            return json.dumps({"error": f"Restore script not found: {script_path}"})
+        
+        # Execute restore script
+        import subprocess
+        try:
+            result = subprocess.run(['bash', script_path], capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0:
+                conn.execute(
+                    "UPDATE restore_points SET status='used' WHERE manifest_id=?",
+                    (manifest_id,)
+                )
+                conn.execute(
+                    "UPDATE librarian_ops SET status='restored' WHERE manifest_id=?",
+                    (manifest_id,)
+                )
+                return json.dumps({"success": True, "output": result.stdout})
+            else:
+                return json.dumps({"success": False, "error": result.stderr})
+        
+        except subprocess.TimeoutExpired:
+            return json.dumps({"success": False, "error": "Restore timed out"})
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)})
+
+@mcp.tool()
+def check_secrets(file_path: str) -> str:
+    """Scan a specific file for secrets. BLOCKS if found."""
+    if not LIBRARIAN_AVAILABLE:
+        return json.dumps({"error": "Librarian tools not available"})
+    
+    result = scan_for_secrets(file_path)
+    return json.dumps(result)
+
+@mcp.tool()
+def check_references(file_path: str, project_root: str) -> str:
+    """Find all references to a file in the codebase."""
+    if not LIBRARIAN_AVAILABLE:
+        return json.dumps({"error": "Librarian tools not available"})
+    
+    result = check_file_references(file_path, project_root)
+    return json.dumps(result)
+
+if __name__ == "__main__":
+    mcp.run()
