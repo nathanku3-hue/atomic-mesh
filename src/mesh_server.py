@@ -37,6 +37,142 @@ class Mode(str, Enum):
     CONVERGE = "converge"  # Unit tests required
     SHIP = "ship"       # Full E2E, changelog required
 
+class AgentRole(str, Enum):
+    """Defines the roles for RBAC tool access."""
+    COMMANDER = "commander"      # Orchestrator - plans and delegates
+    WORKER = "worker"            # Builder - writes code (Codex, Claude)
+    AUDITOR = "auditor"          # Reviewer - QA, security checks
+    LIBRARIAN = "librarian"      # Organizer - file structure, cleanup
+
+# =============================================================================
+# ROLE-BASED ACCESS CONTROL (RBAC) FOR MCP TOOLS
+# =============================================================================
+# 
+# Each agent role gets access to specific tools based on their responsibilities.
+# This enables Workers to be "Senior Engineers" who can query the library themselves.
+#
+# COMMANDER (Orchestrator):
+#   - Read-only + planning tools
+#   - Can detect profiles, check standards, but delegates execution
+#
+# WORKER (Codex/Claude):
+#   - Full execution tools + knowledge access
+#   - Can read/write files, run commands, AND consult standards
+#   - This is the key to "Seniority" - autonomous lookup
+#
+# AUDITOR (QA):
+#   - Read-only + test execution
+#   - Can read files, run tests, check standards
+#   - Cannot write code directly
+#
+# LIBRARIAN:
+#   - File organization tools
+#   - Can move/delete files, check git, learn structures
+#
+
+TOOL_PERMISSIONS = {
+    AgentRole.COMMANDER: {
+        "allowed": [
+            # Knowledge
+            "consult_standard",
+            "detect_project_profile", 
+            "list_library_standards",
+            "get_reference",
+            # Planning
+            "add_task",
+            "get_pending_tasks",
+            "get_project_status",
+            "system_health_check",
+            # Read-only
+            "read_file",
+            "list_directory",
+        ],
+        "denied": ["write_file", "run_shell", "delete_file", "move_file"]
+    },
+    
+    AgentRole.WORKER: {
+        "allowed": [
+            # Execution (KEY: Workers can write and run)
+            "write_file",
+            "read_file",
+            "run_shell",
+            "edit_file",
+            # Knowledge (KEY: Workers can self-lookup)
+            "consult_standard",
+            "get_reference",
+            "list_library_standards",
+            # Context
+            "list_directory",
+            "update_task_status",
+            "record_decision",
+        ],
+        "denied": ["delete_file", "add_task"]  # Workers don't delete or create tasks
+    },
+    
+    AgentRole.AUDITOR: {
+        "allowed": [
+            # Read-only code access
+            "read_file",
+            "list_directory",
+            # Knowledge (KEY: Auditor verifies against standards)
+            "consult_standard",
+            "get_reference",
+            # Testing
+            "run_shell",  # For running test commands
+            # Reporting
+            "add_audit_entry",
+            "get_audit_log",
+            "update_task_status",
+        ],
+        "denied": ["write_file", "edit_file", "delete_file", "add_task"]
+    },
+    
+    AgentRole.LIBRARIAN: {
+        "allowed": [
+            # File organization
+            "read_file",
+            "move_file",
+            "delete_file",
+            "list_directory",
+            # Knowledge
+            "consult_standard",
+            "get_reference",
+            "detect_project_profile",
+            # Git awareness
+            "run_shell",  # For git commands
+            # Librarian-specific
+            "librarian_scan",
+            "librarian_approve",
+            "librarian_execute",
+        ],
+        "denied": ["write_file", "add_task"]  # Librarian moves, doesn't create
+    }
+}
+
+def get_tools_for_role(role: AgentRole) -> list:
+    """
+    Returns the list of allowed tool names for a given agent role.
+    Used by the MCP dispatcher to filter available tools.
+    """
+    perms = TOOL_PERMISSIONS.get(role, {})
+    return perms.get("allowed", [])
+
+def is_tool_allowed(role: AgentRole, tool_name: str) -> bool:
+    """
+    Checks if a specific tool is allowed for a given role.
+    """
+    perms = TOOL_PERMISSIONS.get(role, {})
+    allowed = perms.get("allowed", [])
+    denied = perms.get("denied", [])
+    
+    # Explicit deny takes precedence
+    if tool_name in denied:
+        return False
+    
+    # Check if explicitly allowed
+    return tool_name in allowed
+
+
 def get_db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -417,6 +553,76 @@ def list_library_standards(profile: str = "general") -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+@mcp.tool()
+def get_agent_tools(role: str) -> str:
+    """
+    Returns the list of MCP tools available for a specific agent role.
+    Used by orchestrators to understand what each agent can do.
+    
+    Args:
+        role: The agent role. Options: 'commander', 'worker', 'auditor', 'librarian'
+    
+    Returns:
+        JSON with allowed and denied tools for the role.
+    """
+    try:
+        agent_role = AgentRole(role.lower())
+    except ValueError:
+        return json.dumps({
+            "error": f"Unknown role: {role}",
+            "valid_roles": [r.value for r in AgentRole]
+        })
+    
+    perms = TOOL_PERMISSIONS.get(agent_role, {})
+    
+    return json.dumps({
+        "role": agent_role.value,
+        "allowed_tools": perms.get("allowed", []),
+        "denied_tools": perms.get("denied", []),
+        "description": {
+            "commander": "Orchestrator - plans, delegates, reads. Cannot write or execute.",
+            "worker": "Builder - writes code, runs commands, AND consults standards autonomously.",
+            "auditor": "Reviewer - reads code, runs tests, checks standards. Cannot write.",
+            "librarian": "Organizer - moves files, checks structure. Cannot write new code."
+        }.get(agent_role.value, "")
+    }, indent=2)
+
+@mcp.tool()
+def validate_tool_access(role: str, tool_name: str) -> str:
+    """
+    Checks if a specific tool is allowed for a given agent role.
+    Use this before executing sensitive operations.
+    
+    Args:
+        role: The agent role (commander, worker, auditor, librarian)
+        tool_name: The name of the tool to check
+    
+    Returns:
+        JSON with allowed status and reason.
+    """
+    try:
+        agent_role = AgentRole(role.lower())
+    except ValueError:
+        return json.dumps({"allowed": False, "reason": f"Unknown role: {role}"})
+    
+    allowed = is_tool_allowed(agent_role, tool_name)
+    
+    perms = TOOL_PERMISSIONS.get(agent_role, {})
+    denied_list = perms.get("denied", [])
+    
+    if tool_name in denied_list:
+        reason = f"Tool '{tool_name}' is explicitly denied for role '{role}'"
+    elif allowed:
+        reason = f"Tool '{tool_name}' is allowed for role '{role}'"
+    else:
+        reason = f"Tool '{tool_name}' is not in the allowed list for role '{role}'"
+    
+    return json.dumps({
+        "allowed": allowed,
+        "role": role,
+        "tool": tool_name,
+        "reason": reason
+    })
 
 def get_mode() -> str:
     """Get current mode, with auto-detection based on milestone date."""
