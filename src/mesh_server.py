@@ -144,6 +144,9 @@ TOOL_PERMISSIONS = {
             "librarian_scan",
             "librarian_approve",
             "librarian_execute",
+            # Priority checking (MUST check before touching files)
+            "check_file_priority",
+            "request_file_access",
         ],
         "denied": ["write_file", "add_task"]  # Librarian moves, doesn't create
     }
@@ -172,6 +175,213 @@ def is_tool_allowed(role: AgentRole, tool_name: str) -> bool:
     # Check if explicitly allowed
     return tool_name in allowed
 
+
+# =============================================================================
+# PRIORITY-AWARE RESOURCE ARBITER (v7.6.3)
+# =============================================================================
+#
+# Handles concurrent file access with priority-based locking.
+#
+# PRIORITY LEVELS:
+#   P3 (Critical) - AUDITOR: Exclusive lock. Can preempt anyone.
+#   P2 (High)     - BACKEND: Standard lock. Blocks Frontend/Librarian.
+#   P2 (High)     - FRONTEND: Standard lock. Blocks Librarian.
+#   P0 (Low)      - LIBRARIAN: Passive. Yields to everyone.
+#
+# RULES:
+#   1. Higher priority can preempt (cancel) lower priority operations
+#   2. Equal priority waits (first-come-first-served)
+#   3. Librarian MUST check locks before touching ANY file
+#   4. Auditor freezes files - no edits until audit complete
+#
+
+class Priority:
+    """Priority levels for resource contention."""
+    CRITICAL = 3  # Auditor - Safety gatekeeper
+    HIGH = 2      # Backend/Frontend Workers
+    MEDIUM = 1    # Reserved for future use
+    LOW = 0       # Librarian - Maintenance only
+
+AGENT_PRIORITY = {
+    AgentRole.AUDITOR: Priority.CRITICAL,
+    AgentRole.WORKER: Priority.HIGH,
+    AgentRole.COMMANDER: Priority.HIGH,
+    AgentRole.LIBRARIAN: Priority.LOW,
+}
+
+# More granular priority for task types
+TASK_TYPE_PRIORITY = {
+    "audit": Priority.CRITICAL,
+    "security_scan": Priority.CRITICAL,
+    "backend": Priority.HIGH,
+    "frontend": Priority.HIGH,
+    "qa": Priority.HIGH,
+    "cleanup": Priority.LOW,
+    "reorganize": Priority.LOW,
+    "librarian": Priority.LOW,
+}
+
+def get_agent_priority(role: AgentRole, task_type: str = None) -> int:
+    """
+    Returns the priority level for an agent, optionally considering task type.
+    """
+    # Task type can override role priority
+    if task_type and task_type.lower() in TASK_TYPE_PRIORITY:
+        return TASK_TYPE_PRIORITY[task_type.lower()]
+    
+    return AGENT_PRIORITY.get(role, Priority.LOW)
+
+def get_active_file_locks(file_paths: List[str] = None) -> List[Dict]:
+    """
+    Returns all active file locks, optionally filtered by specific files.
+    
+    Returns list of:
+    {
+        "file": "/path/to/file",
+        "agent_role": "worker",
+        "task_id": 123,
+        "priority": 2,
+        "locked_at": timestamp
+    }
+    """
+    try:
+        with get_db() as conn:
+            if file_paths:
+                # Check specific files
+                placeholders = ",".join(["?" for _ in file_paths])
+                query = f"""
+                    SELECT id, type, assignee, active_file_lock, updated_at 
+                    FROM tasks 
+                    WHERE status = 'in_progress' 
+                    AND active_file_lock IN ({placeholders})
+                """
+                rows = conn.execute(query, file_paths).fetchall()
+            else:
+                # Get all active locks
+                rows = conn.execute("""
+                    SELECT id, type, assignee, active_file_lock, updated_at 
+                    FROM tasks 
+                    WHERE status = 'in_progress' 
+                    AND active_file_lock IS NOT NULL
+                """).fetchall()
+            
+            locks = []
+            for row in rows:
+                task_type = row["type"] or "unknown"
+                priority = TASK_TYPE_PRIORITY.get(task_type.lower(), Priority.HIGH)
+                
+                locks.append({
+                    "file": row["active_file_lock"],
+                    "agent_role": row["assignee"] or "worker",
+                    "task_id": row["id"],
+                    "task_type": task_type,
+                    "priority": priority,
+                    "locked_at": row["updated_at"]
+                })
+            
+            return locks
+    except Exception as e:
+        server_logger.error(f"Error fetching file locks: {e}")
+        return []
+
+def can_access_file(requesting_role: AgentRole, file_path: str, task_type: str = None) -> Dict:
+    """
+    Determines if an agent can access a file based on priority rules.
+    
+    Returns:
+        {
+            "allowed": bool,
+            "reason": str,
+            "blocked_by": optional dict with blocker info,
+            "action": "proceed" | "wait" | "abort"
+        }
+    """
+    my_priority = get_agent_priority(requesting_role, task_type)
+    
+    # Get active locks on this file
+    active_locks = get_active_file_locks([file_path])
+    
+    if not active_locks:
+        return {
+            "allowed": True,
+            "reason": "File is not locked",
+            "action": "proceed"
+        }
+    
+    for lock in active_locks:
+        holder_priority = lock["priority"]
+        
+        # RULE 1: Cannot touch files held by higher or equal priority
+        if holder_priority >= my_priority:
+            action = "abort" if requesting_role == AgentRole.LIBRARIAN else "wait"
+            return {
+                "allowed": False,
+                "reason": f"File locked by {lock['agent_role']} (priority {holder_priority} >= {my_priority})",
+                "blocked_by": lock,
+                "action": action
+            }
+        
+        # RULE 2: Can preempt lower priority (but only Auditor should do this)
+        if holder_priority < my_priority and requesting_role == AgentRole.AUDITOR:
+            return {
+                "allowed": True,
+                "reason": f"Auditor preempting {lock['agent_role']} (task {lock['task_id']})",
+                "preempt_task": lock["task_id"],
+                "action": "preempt"
+            }
+    
+    return {
+        "allowed": True,
+        "reason": "Access granted",
+        "action": "proceed"
+    }
+
+def preempt_task(task_id: int, reason: str = "Preempted by higher priority") -> bool:
+    """
+    Forcibly stops a task due to preemption by higher priority agent.
+    """
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                UPDATE tasks 
+                SET status = 'preempted', 
+                    error = ?,
+                    active_file_lock = NULL,
+                    updated_at = ?
+                WHERE id = ?
+            """, (reason, int(time.time()), task_id))
+            conn.commit()
+            
+            server_logger.warning(f"Task {task_id} preempted: {reason}")
+            return True
+    except Exception as e:
+        server_logger.error(f"Failed to preempt task {task_id}: {e}")
+        return False
+
+def get_safe_files_for_librarian(file_list: List[str]) -> List[str]:
+    """
+    Filters a list of files to only those safe for Librarian to touch.
+    The Librarian is "cowardly" - it yields to everyone.
+    
+    Returns:
+        List of files with no active locks from higher priority agents.
+    """
+    all_locks = get_active_file_locks()
+    locked_files = {lock["file"] for lock in all_locks}
+    
+    safe_files = []
+    skipped = []
+    
+    for f in file_list:
+        if f in locked_files:
+            skipped.append(f)
+        else:
+            safe_files.append(f)
+    
+    if skipped:
+        server_logger.info(f"Librarian yielding on {len(skipped)} files with active work")
+    
+    return safe_files
 
 def get_db():
     conn = sqlite3.connect(DB_FILE)
@@ -623,6 +833,133 @@ def validate_tool_access(role: str, tool_name: str) -> str:
         "tool": tool_name,
         "reason": reason
     })
+
+# =============================================================================
+# PRIORITY-AWARE FILE ACCESS TOOLS
+# =============================================================================
+
+@mcp.tool()
+def check_file_priority(file_path: str, requesting_role: str = "worker") -> str:
+    """
+    Checks if a file can be accessed based on priority rules.
+    MUST be called by Librarian before touching ANY file.
+    
+    Args:
+        file_path: Path to the file to check
+        requesting_role: The role requesting access (worker, auditor, librarian)
+    
+    Returns:
+        JSON with access status, reason, and recommended action.
+    """
+    try:
+        role = AgentRole(requesting_role.lower())
+    except ValueError:
+        return json.dumps({
+            "allowed": False,
+            "reason": f"Unknown role: {requesting_role}",
+            "action": "abort"
+        })
+    
+    result = can_access_file(role, file_path)
+    return json.dumps(result, indent=2)
+
+@mcp.tool()
+def request_file_access(file_path: str, requesting_role: str, task_type: str = None) -> str:
+    """
+    Requests access to a file, potentially preempting lower priority tasks.
+    Only Auditor can preempt. Others must wait or abort.
+    
+    Args:
+        file_path: Path to the file
+        requesting_role: Role requesting access
+        task_type: Optional task type for priority override
+    
+    Returns:
+        JSON with access result and any preemption actions taken.
+    """
+    try:
+        role = AgentRole(requesting_role.lower())
+    except ValueError:
+        return json.dumps({
+            "granted": False,
+            "reason": f"Unknown role: {requesting_role}"
+        })
+    
+    access_result = can_access_file(role, file_path, task_type)
+    
+    # Handle preemption for Auditor
+    if access_result.get("action") == "preempt" and "preempt_task" in access_result:
+        task_id = access_result["preempt_task"]
+        preempt_success = preempt_task(task_id, f"Preempted by {requesting_role} for file: {file_path}")
+        
+        return json.dumps({
+            "granted": True,
+            "preempted_task": task_id,
+            "preempt_success": preempt_success,
+            "reason": access_result["reason"]
+        })
+    
+    return json.dumps({
+        "granted": access_result["allowed"],
+        "action": access_result.get("action", "unknown"),
+        "reason": access_result["reason"],
+        "blocked_by": access_result.get("blocked_by")
+    }, indent=2)
+
+@mcp.tool()
+def get_active_locks() -> str:
+    """
+    Returns all currently active file locks in the system.
+    Useful for dashboards and debugging contention issues.
+    
+    Returns:
+        JSON array of active locks with file, agent, task, and priority info.
+    """
+    locks = get_active_file_locks()
+    
+    return json.dumps({
+        "total_locks": len(locks),
+        "locks": locks,
+        "priority_legend": {
+            "3": "CRITICAL (Auditor)",
+            "2": "HIGH (Worker)",
+            "1": "MEDIUM",
+            "0": "LOW (Librarian)"
+        }
+    }, indent=2)
+
+@mcp.tool()
+def get_safe_librarian_files(files: str) -> str:
+    """
+    Filters a list of files to only those safe for Librarian to touch.
+    Librarian is 'cowardly' - yields to everyone.
+    
+    Args:
+        files: Comma-separated list of file paths, or JSON array
+    
+    Returns:
+        JSON with safe files and skipped files.
+    """
+    # Parse input
+    if files.startswith("["):
+        try:
+            file_list = json.loads(files)
+        except:
+            file_list = [f.strip() for f in files.split(",")]
+    else:
+        file_list = [f.strip() for f in files.split(",")]
+    
+    safe = get_safe_files_for_librarian(file_list)
+    skipped = [f for f in file_list if f not in safe]
+    
+    return json.dumps({
+        "safe_files": safe,
+        "safe_count": len(safe),
+        "skipped_files": skipped,
+        "skipped_count": len(skipped),
+        "message": f"Librarian can safely touch {len(safe)}/{len(file_list)} files"
+    }, indent=2)
+
 
 def get_mode() -> str:
     """Get current mode, with auto-detection based on milestone date."""
