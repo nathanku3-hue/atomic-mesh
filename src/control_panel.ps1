@@ -1,17 +1,30 @@
 # C:\Tools\atomic-mesh\control_panel.ps1
-# ATOMIC MESH COMMANDER v7.5 - Slash-Command Edition
-# FEATURES: Discord-style /commands, natural language chat, no hotkeys
+# ATOMIC MESH COMMANDER v7.5 - Slash-Command Edition + Multi-Project
+# FEATURES: Discord-style /commands, natural language chat, multi-project grid
 
-param()
+param(
+    [string]$ProjectName = "Standalone",
+    [string]$ProjectPath = "",
+    [string]$DbPath = "mesh.db"
+)
 
+# Set working directory and database
+if ($ProjectPath -and (Test-Path $ProjectPath)) {
+    Set-Location $ProjectPath
+}
 $CurrentDir = (Get-Location).Path
-$DB_FILE = "$CurrentDir\mesh.db"
+$DB_FILE = Join-Path $CurrentDir $DbPath
 $LogDir = "$CurrentDir\logs"
 $DocsDir = "$CurrentDir\docs"
 $MilestoneFile = "$CurrentDir\.milestone_date"
 $SpecFile = "$DocsDir\ACTIVE_SPEC.md"
+$RepoRoot = if ($PSScriptRoot) { Resolve-Path "$PSScriptRoot\.." } else { $CurrentDir }
 
-$host.UI.RawUI.WindowTitle = "Atomic Mesh v7.5"
+# Set environment for Python
+$env:ATOMIC_MESH_DB = $DB_FILE
+
+# Update window title
+$host.UI.RawUI.WindowTitle = "Atomic Mesh :: $ProjectName"
 
 # Ensure directories exist
 if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
@@ -41,6 +54,10 @@ $Global:Commands = [ordered]@{
     
     # STREAMS
     "stream"    = @{ Desc = "view worker output: /stream backend|frontend"; HasArgs = $true }
+    
+    # MULTI-PROJECT
+    "multi"     = @{ Desc = "launch multi-project grid: /multi 1 2 3"; HasArgs = $true }
+    "projects"  = @{ Desc = "list available projects" }
     
     # CONTEXT
     "decide"    = @{ Desc = "answer decision: /decide <id> <answer>"; HasArgs = $true }
@@ -126,13 +143,50 @@ function Show-Header {
     $proj = Get-ProjectMode
     $stats = Get-TaskStats
     
+    # Get console width for dynamic layout
+    $width = 77
+    try { 
+        $consoleWidth = $Host.UI.RawUI.WindowSize.Width
+        if ($consoleWidth -gt 50) { $width = [Math]::Min($consoleWidth - 2, 100) }
+    }
+    catch {}
+    
+    $line = "─" * ($width - 2)
+    
+    # Build title line: Project Name (left) ........ Path (right)
+    $path = $CurrentDir
+    $maxPathLen = $width - $ProjectName.Length - 15
+    if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
+        $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
+    }
+    
+    # Calculate padding between name and path
+    $padLen = $width - 6 - $ProjectName.Length - $path.Length
+    if ($padLen -lt 1) { $padLen = 1 }
+    $padding = " " * $padLen
+    
     Write-Host ""
-    Write-Host "┌─ Atomic Mesh v7.5 ─────────────────────────────────────────────────────────┐" -ForegroundColor Cyan
+    Write-Host "┌$line┐" -ForegroundColor Cyan
+    
+    # Line 1: Project Name (left) ........ Path (right)
+    Write-Host "│ " -NoNewline -ForegroundColor Cyan
+    Write-Host "📂 $ProjectName" -NoNewline -ForegroundColor Yellow
+    Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
+    Write-Host "│" -ForegroundColor Cyan
+    
+    # Line 2: Mode and Stats
     $modeStr = "$($proj.Icon) $($proj.Mode)"
     if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
     $statsStr = "$($stats.pending) pending | $($stats.in_progress) active | $($stats.completed) done"
-    Write-Host "│  $modeStr    $statsStr" -ForegroundColor White
-    Write-Host "└────────────────────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+    $statusLine = "  $modeStr | $statsStr"
+    $statusPad = $width - 3 - $statusLine.Length
+    if ($statusPad -lt 0) { $statusPad = 0 }
+    
+    Write-Host "│$statusLine" -NoNewline -ForegroundColor White
+    Write-Host (" " * $statusPad) -NoNewline
+    Write-Host "│" -ForegroundColor Cyan
+    
+    Write-Host "└$line┘" -ForegroundColor Cyan
 }
 
 # ============================================================================
@@ -287,12 +341,12 @@ function Show-Plan {
 }
 
 function Invoke-SlashCommand {
-    param([string]$Input)
+    param([string]$UserInput)
     
-    # Parse command and args
-    $parts = $Input.TrimStart("/").Split(" ", 2)
+    # Parse command and cmdArgs
+    $parts = $UserInput.TrimStart("/").Split(" ", 2)
     $cmd = $parts[0].ToLower()
-    $args = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+    $cmdArgs = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
     
     # Check for aliases
     foreach ($key in $Global:Commands.Keys) {
@@ -444,9 +498,9 @@ function Invoke-SlashCommand {
         
         # === CONFIGURATION ===
         "mode" {
-            if ($args -match "^(vibe|converge|ship)$") {
-                Invoke-Query "UPDATE config SET value='$args' WHERE key='mode'" | Out-Null
-                Write-Host "  🔧 Mode set to $($args.ToUpper())" -ForegroundColor Green
+            if ($cmdArgs -match "^(vibe|converge|ship)$") {
+                Invoke-Query "UPDATE config SET value='$cmdArgs' WHERE key='mode'" | Out-Null
+                Write-Host "  🔧 Mode set to $($cmdArgs.ToUpper())" -ForegroundColor Green
             }
             else {
                 $proj = Get-ProjectMode
@@ -456,12 +510,83 @@ function Invoke-SlashCommand {
             }
         }
         "milestone" {
-            if ($args -match "^\d{4}-\d{2}-\d{2}$") {
-                Set-Content -Path $MilestoneFile -Value $args
-                Write-Host "  📅 Milestone set to $args" -ForegroundColor Green
+            if ($cmdArgs -match "^\d{4}-\d{2}-\d{2}$") {
+                Set-Content -Path $MilestoneFile -Value $cmdArgs
+                Write-Host "  📅 Milestone set to $cmdArgs" -ForegroundColor Green
             }
             else {
                 Write-Host "  Usage: /milestone YYYY-MM-DD" -ForegroundColor Yellow
+            }
+        }
+        
+        # === MULTI-PROJECT ===
+        "projects" {
+            $configPath = Join-Path $RepoRoot "config\projects.json"
+            if (Test-Path $configPath) {
+                $projects = Get-Content $configPath | ConvertFrom-Json
+                Write-Host ""
+                Write-Host "  ═══ AVAILABLE PROJECTS ═══" -ForegroundColor Cyan
+                Write-Host ""
+                foreach ($p in $projects) {
+                    Write-Host "  [$($p.id)] ".PadRight(7) -NoNewline -ForegroundColor Yellow
+                    Write-Host "$($p.name)".PadRight(25) -NoNewline -ForegroundColor White
+                    Write-Host "$($p.path)" -ForegroundColor DarkGray
+                }
+                Write-Host ""
+                Write-Host "  Use: /multi 1 2 3  to launch grid" -ForegroundColor Gray
+            }
+            else {
+                Write-Host "  ⚠️ No projects.json found at $configPath" -ForegroundColor Yellow
+            }
+        }
+        "multi" {
+            $configPath = Join-Path $RepoRoot "config\projects.json"
+            $launcherPath = Join-Path $RepoRoot "launcher\mesh-up.ps1"
+            
+            if (-not (Test-Path $configPath)) {
+                Write-Host "  ⚠️ No projects.json found" -ForegroundColor Yellow
+                return
+            }
+            
+            $projects = Get-Content $configPath | ConvertFrom-Json
+            
+            # Show projects if no args
+            if ([string]::IsNullOrWhiteSpace($cmdArgs)) {
+                Write-Host ""
+                Write-Host "  ═══ SELECT PROJECTS FOR GRID ═══" -ForegroundColor Cyan
+                Write-Host ""
+                foreach ($p in $projects) {
+                    Write-Host "  [$($p.id)] ".PadRight(7) -NoNewline -ForegroundColor Yellow
+                    Write-Host "$($p.name)" -ForegroundColor White
+                }
+                Write-Host ""
+                Write-Host "  Enter IDs (e.g. '1 2' or '1 2 3 4'): " -NoNewline -ForegroundColor Green
+                $cmdArgs = Read-Host
+            }
+            
+            # Parse IDs
+            $ids = $cmdArgs -split "\s+" | Where-Object { $_ -match "^\d+$" } | ForEach-Object { [int]$_ }
+            
+            if ($ids.Count -eq 0) {
+                Write-Host "  ⚠️ No valid project IDs provided" -ForegroundColor Yellow
+                return
+            }
+            
+            if ($ids.Count -gt 4) {
+                Write-Host "  ⚠️ Maximum 4 projects supported" -ForegroundColor Yellow
+                $ids = $ids[0..3]
+            }
+            
+            Write-Host ""
+            Write-Host "  🚀 Launching Mission Control Grid..." -ForegroundColor Cyan
+            
+            # Launch the grid
+            if (Test-Path $launcherPath) {
+                $idStr = $ids -join ","
+                Start-Process powershell.exe -ArgumentList "-File `"$launcherPath`" -Ids $idStr"
+            }
+            else {
+                Write-Host "  ⚠️ Launcher not found at $launcherPath" -ForegroundColor Yellow
             }
         }
         
@@ -516,21 +641,21 @@ while ($true) {
     $proj = Get-ProjectMode
     Write-Host "¢ " -NoNewline -ForegroundColor Green
     
-    $input = Read-Host
+    $userInput = Read-Host
     
-    if ([string]::IsNullOrWhiteSpace($input)) { 
+    if ([string]::IsNullOrWhiteSpace($userInput)) { 
         continue 
     }
     
-    if ($input.StartsWith("/")) {
+    if ($userInput.StartsWith("/")) {
         # Check if just "/" or partial command for suggestions
-        if ($input -eq "/" -or ($input.Length -gt 1 -and -not $input.Contains(" "))) {
-            Show-CommandSuggestions -Filter $input
+        if ($userInput -eq "/" -or ($userInput.Length -gt 1 -and -not $userInput.Contains(" "))) {
+            Show-CommandSuggestions -Filter $userInput
             continue
         }
         
         # Execute slash command
-        $result = Invoke-SlashCommand -Input $input
+        $result = Invoke-SlashCommand -UserInput $userInput
         
         if ($result -eq "refresh") {
             Clear-Host
@@ -540,7 +665,7 @@ while ($true) {
     }
     else {
         # Natural language - send to AI router
-        Send-ToAI -Text $input
+        Send-ToAI -Text $userInput
     }
     
     Write-Host ""
