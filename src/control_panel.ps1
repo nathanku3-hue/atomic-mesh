@@ -1,6 +1,6 @@
 # C:\Tools\atomic-mesh\control_panel.ps1
-# ATOMIC MESH COMMANDER v7.1 - Self-Correcting Execution Engine
-# FEATURES: Auditor integration, Mode toggle, Continue command, Security Tripwire
+# ATOMIC MESH COMMANDER v7.5 - Slash-Command Edition
+# FEATURES: Discord-style /commands, natural language chat, no hotkeys
 
 param()
 
@@ -10,77 +10,95 @@ $LogDir = "$CurrentDir\logs"
 $DocsDir = "$CurrentDir\docs"
 $MilestoneFile = "$CurrentDir\.milestone_date"
 $SpecFile = "$DocsDir\ACTIVE_SPEC.md"
-$TuningFile = "$DocsDir\TUNING.md"
 
-$host.UI.RawUI.WindowTitle = "AtomicCommander"
+$host.UI.RawUI.WindowTitle = "Atomic Mesh v7.5"
 
 # Ensure directories exist
 if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
 if (!(Test-Path $DocsDir)) { New-Item -ItemType Directory -Path $DocsDir | Out-Null }
 
 # Layout constants
-$BoxWidth = 37
 $TotalWidth = 77
 
-# Mode toggle: TEXT (AI input) or PS (PowerShell execution)
-$script:CurrentMode = "TEXT"
+# ============================================================================
+# COMMAND REGISTRY - All slash commands defined here
+# ============================================================================
 
-# --- SQLITE QUERY HELPER (FIX #10, #11) ---
-# WARNING: Only pass queries from trusted sources (internal code).
-# Never interpolate user input directly into $Query.
-function Invoke-Query {
-    param(
-        [string]$Query,
-        [switch]$Silent  # If true, suppress error output
-    )
+$Global:Commands = [ordered]@{
+    # EXECUTION
+    "go"        = @{ Desc = "execute the next pending task"; Alias = @("continue", "c") }
     
-    # FIX #10: Basic validation - reject obvious SQL injection attempts
+    # TASK MANAGEMENT
+    "add"       = @{ Desc = "add task: /add backend|frontend <description>"; HasArgs = $true }
+    "skip"      = @{ Desc = "skip a task: /skip <task_id>"; HasArgs = $true }
+    "reset"     = @{ Desc = "reset failed task: /reset <task_id>"; HasArgs = $true }
+    "drop"      = @{ Desc = "delete a task: /drop <task_id>"; HasArgs = $true }
+    "nuke"      = @{ Desc = "clear all pending (requires --confirm)"; HasArgs = $true }
+    
+    # AGENTS
+    "audit"     = @{ Desc = "open auditor status and log" }
+    "lib"       = @{ Desc = "librarian: /lib scan|status|approve|execute"; HasArgs = $true }
+    
+    # STREAMS
+    "stream"    = @{ Desc = "view worker output: /stream backend|frontend"; HasArgs = $true }
+    
+    # CONTEXT
+    "decide"    = @{ Desc = "answer decision: /decide <id> <answer>"; HasArgs = $true }
+    "note"      = @{ Desc = "add a note: /note <text>"; HasArgs = $true }
+    "blocker"   = @{ Desc = "report blocker: /blocker <text>"; HasArgs = $true }
+    
+    # CONFIGURATION
+    "mode"      = @{ Desc = "show/toggle mode: /mode [vibe|converge|ship]"; HasArgs = $true }
+    "milestone" = @{ Desc = "set milestone: /milestone YYYY-MM-DD"; HasArgs = $true }
+    
+    # SESSION
+    "status"    = @{ Desc = "show system status dashboard" }
+    "plan"      = @{ Desc = "show project roadmap" }
+    "tasks"     = @{ Desc = "list all tasks" }
+    "help"      = @{ Desc = "show all available commands"; Alias = @("?") }
+    "refresh"   = @{ Desc = "refresh the display" }
+    "clear"     = @{ Desc = "clear the console screen" }
+    "quit"      = @{ Desc = "exit Atomic Mesh"; Alias = @("q", "exit") }
+}
+
+# ============================================================================
+# DATABASE HELPER
+# ============================================================================
+
+function Invoke-Query {
+    param([string]$Query, [switch]$Silent)
+    
+    # Basic SQL injection protection
     $dangerousPatterns = @("DROP TABLE", "DELETE FROM tasks", "--", ";--")
     foreach ($pattern in $dangerousPatterns) {
         if ($Query -match [regex]::Escape($pattern)) {
-            if (-not $Silent) {
-                Write-Host "🔴 Query rejected: Contains dangerous pattern" -ForegroundColor Red
-            }
+            if (-not $Silent) { Write-Host "  🔴 Query rejected" -ForegroundColor Red }
             return @()
         }
     }
     
     $script = @"
-import sqlite3, json, sys
+import sqlite3, json
 try:
     conn = sqlite3.connect('$DB_FILE')
     conn.row_factory = sqlite3.Row
     rows = conn.execute('''$Query''').fetchall()
     print(json.dumps([dict(r) for r in rows]))
     conn.close()
-except Exception as e:
-    print(json.dumps({"error": str(e)}), file=sys.stderr)
-    print('[]')
+except: print('[]')
 "@
     try {
         $result = $script | python 2>$null
-        if ($result) { 
-            $parsed = $result | ConvertFrom-Json
-            # FIX #11: Check for error response
-            if ($parsed.error) {
-                if (-not $Silent) {
-                    Write-Host "⚠️ Query warning: $($parsed.error)" -ForegroundColor Yellow
-                }
-                return @()
-            }
-            return $parsed
-        }
+        if ($result) { return $result | ConvertFrom-Json }
     }
-    catch {
-        # FIX #11: Report the error instead of silent catch
-        if (-not $Silent) {
-            Write-Host "🔴 Database Query Failed: $_" -ForegroundColor Red
-        }
-    }
+    catch {}
     return @()
 }
 
-# --- GET PROJECT MODE ---
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 function Get-ProjectMode {
     if (Test-Path $MilestoneFile) {
         try {
@@ -95,86 +113,86 @@ function Get-ProjectMode {
     return @{ Mode = "VIBE"; Days = $null; Color = "Green"; Icon = "🟢" }
 }
 
-# --- GET WORKER STATUS ---
-function Get-WorkerStatus {
-    param([string]$Type)
+function Get-TaskStats {
+    $stats = Invoke-Query "SELECT status, COUNT(*) as c FROM tasks GROUP BY status" -Silent
+    $result = @{ pending = 0; in_progress = 0; completed = 0; failed = 0 }
+    foreach ($s in $stats) {
+        if ($s.status) { $result[$s.status] = $s.c }
+    }
+    return $result
+}
+
+function Show-Header {
+    $proj = Get-ProjectMode
+    $stats = Get-TaskStats
     
-    $logFiles = Get-ChildItem "$LogDir\*-$Type.log" -ErrorAction SilentlyContinue
-    if (-not $logFiles) { return @{ Status = "DOWN"; Color = "Red"; Icon = "🔴" } }
+    Write-Host ""
+    Write-Host "┌─ Atomic Mesh v7.5 ─────────────────────────────────────────────────────────┐" -ForegroundColor Cyan
+    $modeStr = "$($proj.Icon) $($proj.Mode)"
+    if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
+    $statsStr = "$($stats.pending) pending | $($stats.in_progress) active | $($stats.completed) done"
+    Write-Host "│  $modeStr    $statsStr" -ForegroundColor White
+    Write-Host "└────────────────────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+}
+
+# ============================================================================
+# COMMAND SUGGESTION SYSTEM
+# ============================================================================
+
+function Show-CommandSuggestions {
+    param([string]$Filter)
     
-    $latestLog = $logFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    $age = (Get-Date) - $latestLog.LastWriteTime
+    # Remove leading slash
+    $filter = $Filter.TrimStart("/").ToLower()
     
-    if ($age.TotalSeconds -lt 60) {
-        return @{ Status = "UP (polling)"; Color = "Green"; Icon = "🟢" }
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    
+    $found = 0
+    foreach ($key in $Global:Commands.Keys) {
+        # Match if filter is empty or command starts with filter
+        if ($filter -eq "" -or $key.StartsWith($filter)) {
+            $desc = $Global:Commands[$key].Desc
+            $cmdDisplay = "/$key".PadRight(14)
+            Write-Host "  $cmdDisplay" -NoNewline -ForegroundColor Yellow
+            Write-Host "$desc" -ForegroundColor Gray
+            $found++
+        }
     }
-    elseif ($age.TotalMinutes -lt 5) {
-        return @{ Status = "WAITING"; Color = "Yellow"; Icon = "🟡" }
+    
+    if ($found -eq 0) {
+        Write-Host "  (No matching commands for '/$filter')" -ForegroundColor DarkGray
     }
-    else {
-        return @{ Status = "DOWN"; Color = "Red"; Icon = "🔴" }
-    }
+    
+    Write-Host "  ─────────────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
 }
 
-# --- OPEN FILE ---
-function Open-DocFile {
-    param([string]$Path)
-    if (!(Test-Path $Path)) { "" | Out-File $Path -Encoding UTF8 }
-    $vscode = "C:\Users\$env:USERNAME\AppData\Local\Programs\Microsoft VS Code\Code.exe"
-    if (Test-Path $vscode) { Start-Process $vscode -ArgumentList $Path }
-    else { Start-Process notepad.exe -ArgumentList $Path }
-}
+# ============================================================================
+# COMMAND EXECUTION
+# ============================================================================
 
-# --- PAD STRING TO WIDTH ---
-function Format-Cell {
-    param([string]$Text, [int]$Width)
-    if ($Text.Length -gt $Width) { return $Text.Substring(0, $Width) }
-    return $Text.PadRight($Width)
-}
-
-# --- MODE TOGGLE ---
-function Switch-Mode {
-    if ($script:CurrentMode -eq "TEXT") {
-        $script:CurrentMode = "PS"
-        Write-Host "  Switched to [PS>] PowerShell Mode" -ForegroundColor Blue
-    }
-    else {
-        $script:CurrentMode = "TEXT"
-        Write-Host "  Switched to [TEXT] Input Mode" -ForegroundColor Green
-    }
-    Start-Sleep -Milliseconds 500
-}
-
-# --- CONTINUE COMMAND ---
 function Invoke-Continue {
-    # 1. Check for RED decisions (blockers)
+    # Check for RED decisions (blockers)
     $redDecisions = Invoke-Query "SELECT id, question FROM decisions WHERE status='pending' AND priority='red' LIMIT 1"
     if ($redDecisions.Count -gt 0) {
         $dec = $redDecisions[0]
         Write-Host "  🔴 BLOCKED: Decision required" -ForegroundColor Red
         Write-Host "     [$($dec.id)] $($dec.question)" -ForegroundColor Yellow
+        Write-Host "     Use: /decide $($dec.id) <your answer>" -ForegroundColor Gray
         return
     }
     
-    # 2. Check for stuck tasks (3 strikes)
+    # Check for stuck tasks
     $stuckTasks = Invoke-Query "SELECT id, desc FROM tasks WHERE auditor_status='escalated' OR retry_count >= 3 LIMIT 1"
     if ($stuckTasks.Count -gt 0) {
         $stuck = $stuckTasks[0]
-        Write-Host "  🔴 STUCK: Auditor gave up on task" -ForegroundColor Red
+        Write-Host "  🔴 STUCK: Auditor escalated task" -ForegroundColor Red
         Write-Host "     [$($stuck.id)] $($stuck.desc)" -ForegroundColor Yellow
-        Write-Host "     Type 'reset $($stuck.id)' after fixing manually" -ForegroundColor Gray
+        Write-Host "     Use: /reset $($stuck.id) after fixing manually" -ForegroundColor Gray
         return
     }
     
-    # 3. Check if auditor is currently reviewing
-    $inReview = Invoke-Query "SELECT id, desc, retry_count FROM tasks WHERE auditor_status='rejected' LIMIT 1"
-    if ($inReview.Count -gt 0) {
-        $task = $inReview[0]
-        Write-Host "  ⏳ Auditor loop active: [$($task.id)] Retry $($task.retry_count)/3" -ForegroundColor Yellow
-        return
-    }
-    
-    # 4. Get next pending task
+    # Get next pending task
     $nextTask = Invoke-Query "SELECT id, type, desc, strictness FROM tasks WHERE status='pending' ORDER BY priority DESC, id LIMIT 1"
     if ($nextTask.Count -eq 0) {
         Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
@@ -185,512 +203,345 @@ function Invoke-Continue {
     $strictness = if ($task.strictness) { $task.strictness.ToUpper() } else { "NORMAL" }
     $icon = switch ($strictness) { "CRITICAL" { "🔴" } "RELAXED" { "🟢" } default { "🟡" } }
     
-    # 5. Dispatch
-    Write-Host "  ▶ Resuming [$icon $strictness]: [$($task.id)] $($task.desc)" -ForegroundColor Cyan
+    Write-Host "  ▶ Executing [$icon $strictness]: [$($task.id)] $($task.desc)" -ForegroundColor Cyan
     Invoke-Query "UPDATE tasks SET status='in_progress', updated_at=strftime('%s','now') WHERE id=$($task.id)" | Out-Null
 }
 
-# --- RESET TASK AUDITOR ---
-function Invoke-Reset {
-    param([int]$TaskId)
-    if ($TaskId -le 0) {
-        Write-Host "  Usage: reset <task_id>" -ForegroundColor Yellow
-        return
-    }
-    # Patch 2: Full context flush - reset retry count AND clear auditor cache
-    Invoke-Query "UPDATE tasks SET retry_count=0, auditor_status='pending', auditor_feedback='[]', status='pending' WHERE id=$TaskId" | Out-Null
-    # Log the context flush
-    $now = [int](Get-Date -UFormat %s)
-    Invoke-Query "INSERT INTO audit_log (task_id, action, strictness, reason, retry_count, created_at) VALUES ($TaskId, 'context_flush', 'N/A', 'User reset - context cleared', 0, $now)" | Out-Null
-    Write-Host "  ✅ Task $TaskId reset + context flushed. Auditor will re-read from disk." -ForegroundColor Green
-}
-
-# --- GET AUDIT LOG ---
-function Get-AuditLog {
-    $logs = Invoke-Query "SELECT task_id, action, strictness, reason, created_at FROM audit_log ORDER BY created_at DESC LIMIT 4"
-    return $logs
-}
-
-# --- LIBRARIAN FUNCTIONS ---
-function Get-LibrarianStatus {
-    $pending = Invoke-Query "SELECT manifest_id, COUNT(*) as c FROM librarian_ops WHERE status='pending' GROUP BY manifest_id LIMIT 1"
-    $blocked = Invoke-Query "SELECT COUNT(*) as c FROM librarian_ops WHERE status='blocked'"
-    $recent = Invoke-Query "SELECT manifest_id FROM librarian_ops WHERE status='executed' ORDER BY executed_at DESC LIMIT 1"
-    
-    return @{
-        Pending      = if ($pending.Count -gt 0) { $pending[0].c } else { 0 }
-        Blocked      = if ($blocked.Count -gt 0) { $blocked[0].c } else { 0 }
-        LastManifest = if ($recent.Count -gt 0) { $recent[0].manifest_id } else { "none" }
-    }
-}
-
-function Invoke-LibrarianScan {
-    Write-Host "  📚 Scanning project..." -ForegroundColor Cyan
-    # This would call the MCP tool - for now show placeholder
-    Write-Host "  Use 'lib scan' command to initiate full scan" -ForegroundColor Gray
-}
-
-function Show-LibrarianPanel {
-    Clear-Host
-    Write-Host ("=" * $TotalWidth) -ForegroundColor Cyan
-    Write-Host "  📚 THE LIBRARIAN - File System Architect" -ForegroundColor White
-    Write-Host ("=" * $TotalWidth) -ForegroundColor Cyan
-    
-    $status = Get-LibrarianStatus
-    Write-Host ""
-    Write-Host "  Status:" -ForegroundColor Yellow
-    Write-Host "    Pending Operations: $($status.Pending)" -ForegroundColor Gray
-    Write-Host "    Blocked (Secrets): $($status.Blocked)" -ForegroundColor $(if ($status.Blocked -gt 0) { "Red" } else { "Gray" })
-    Write-Host "    Last Manifest: $($status.LastManifest)" -ForegroundColor Gray
-    
-    Write-Host ""
-    Write-Host "  Commands:" -ForegroundColor Yellow
-    Write-Host "    lib scan     - Scan project for cleanup opportunities"
-    Write-Host "    lib status   - Show pending operations"
-    Write-Host "    lib approve  - Approve pending manifest"
-    Write-Host "    lib execute  - Execute approved manifest"
-    Write-Host "    lib restore  - Restore from last manifest"
-    
-    Write-Host ""
-    Write-Host ("-" * $TotalWidth) -ForegroundColor DarkGray
-    Write-Host "  Press Q to return..." -ForegroundColor Yellow
-    
-    while ($true) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true).KeyChar
-            if ($key -eq 'q' -or $key -eq 'Q') { return }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-}
-
-# --- DRAW DASHBOARD ---
-function Show-Dashboard {
-    Clear-Host
-    
-    # Get data
-    $proj = Get-ProjectMode
-    $beStatus = Get-WorkerStatus "backend"
-    $feStatus = Get-WorkerStatus "frontend"
-    
-    # Get stats
-    $stats = Invoke-Query "SELECT status, COUNT(*) as c FROM tasks GROUP BY status"
-    $pending = 0; $working = 0; $done = 0; $failed = 0; $blocked = 0
-    foreach ($s in $stats) {
-        switch ($s.status) { 
-            'pending' { $pending = $s.c } 
-            'in_progress' { $working = $s.c } 
-            'completed' { $done = $s.c } 
-            'failed' { $failed = $s.c } 
-            'blocked' { $blocked = $s.c } 
-        }
-    }
-    
-    # Get active tasks
-    $beActive = Invoke-Query "SELECT id, substr(desc,1,25) as d FROM tasks WHERE type='backend' AND status='in_progress' LIMIT 1"
-    $feActive = Invoke-Query "SELECT id, substr(desc,1,25) as d FROM tasks WHERE type='frontend' AND status='in_progress' LIMIT 1"
-    
-    # Get roadmap (pending tasks)
-    $beRoadmap = Invoke-Query "SELECT id, substr(desc,1,28) as d FROM tasks WHERE type='backend' AND status='pending' ORDER BY priority DESC, id LIMIT 2"
-    $feRoadmap = Invoke-Query "SELECT id, substr(desc,1,28) as d FROM tasks WHERE type='frontend' AND status='pending' ORDER BY priority DESC, id LIMIT 2"
-    
-    # Get decisions
-    $decisions = Invoke-Query "SELECT id, priority, substr(question,1,28) as q FROM decisions WHERE status='pending' ORDER BY CASE priority WHEN 'red' THEN 1 WHEN 'yellow' THEN 2 ELSE 3 END LIMIT 4"
-    
-    # Get COT stream
-    $cotLines = @()
-    $combinedLog = "$LogDir\combined.log"
-    if (Test-Path $combinedLog) { $cotLines = Get-Content $combinedLog -Tail 4 -ErrorAction SilentlyContinue }
-    
-    # === HEADER ===
-    $headerLine = "=" * $TotalWidth
-    Write-Host $headerLine -ForegroundColor Cyan
-    
-    $modeStr = "$($proj.Icon) $($proj.Mode)"
-    if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
-    $modeIndicator = if ($script:CurrentMode -eq "TEXT") { "[TEXT]" } else { "[PS>]" }
-    $modeColor = if ($script:CurrentMode -eq "TEXT") { "Green" } else { "Blue" }
-    $title = "  ATOMIC MESH COMMANDER v7.1"
-    $rightPad = $TotalWidth - $title.Length - $modeStr.Length - $modeIndicator.Length - 4
-    Write-Host "$title$(' ' * $rightPad)$modeStr " -NoNewline -ForegroundColor White
-    Write-Host $modeIndicator -ForegroundColor $modeColor
-    
-    Write-Host $headerLine -ForegroundColor Cyan
-    
-    # === TOP ROW: BACKEND | FRONTEND ===
-    $topBorder = "+" + ("-" * ($BoxWidth - 2)) + "+" + " " + "+" + ("-" * ($BoxWidth - 2)) + "+"
-    Write-Host $topBorder -ForegroundColor DarkGray
-    
-    # Row 1: Titles
-    $beTitle = Format-Cell " BACKEND" ($BoxWidth - 2)
-    $feTitle = Format-Cell " FRONTEND" ($BoxWidth - 2)
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $beTitle -NoNewline -ForegroundColor Cyan
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $feTitle -NoNewline -ForegroundColor Cyan
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 2: Status
-    $beStatusLine = Format-Cell " Status: $($beStatus.Icon) $($beStatus.Status)" ($BoxWidth - 2)
-    $feStatusLine = Format-Cell " Status: $($feStatus.Icon) $($feStatus.Status)" ($BoxWidth - 2)
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $beStatusLine -NoNewline -ForegroundColor $beStatus.Color
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $feStatusLine -NoNewline -ForegroundColor $feStatus.Color
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 3: Working on
-    $beWork = if ($beActive.Count -gt 0) { " Working: [$($beActive[0].id)] $($beActive[0].d)" } else { " Working: (idle)" }
-    $feWork = if ($feActive.Count -gt 0) { " Working: [$($feActive[0].id)] $($feActive[0].d)" } else { " Working: (idle)" }
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host (Format-Cell $beWork ($BoxWidth - 2)) -NoNewline -ForegroundColor White
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host (Format-Cell $feWork ($BoxWidth - 2)) -NoNewline -ForegroundColor White
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 4: Empty
-    $empty = Format-Cell "" ($BoxWidth - 2)
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $empty -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $empty -NoNewline
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 5: Roadmap header
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host (Format-Cell " Roadmap:" ($BoxWidth - 2)) -NoNewline -ForegroundColor Yellow
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host (Format-Cell " Roadmap:" ($BoxWidth - 2)) -NoNewline -ForegroundColor Yellow
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 6-7: Roadmap items
-    for ($i = 0; $i -lt 2; $i++) {
-        $beItem = if ($i -lt $beRoadmap.Count) { "   -> [$($beRoadmap[$i].id)] $($beRoadmap[$i].d)" } else { "" }
-        $feItem = if ($i -lt $feRoadmap.Count) { "   -> [$($feRoadmap[$i].id)] $($feRoadmap[$i].d)" } else { "" }
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host (Format-Cell $beItem ($BoxWidth - 2)) -NoNewline -ForegroundColor Gray
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host " " -NoNewline
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host (Format-Cell $feItem ($BoxWidth - 2)) -NoNewline -ForegroundColor Gray
-        Write-Host "|" -ForegroundColor DarkGray
-    }
-    
-    # Top row bottom border
-    Write-Host $topBorder -ForegroundColor DarkGray
-    
-    # === BOTTOM ROW: DECISIONS | COT STREAM ===
-    Write-Host $topBorder -ForegroundColor DarkGray
-    
-    # Row 1: Titles
-    $decTitle = Format-Cell " DECISIONS" ($BoxWidth - 2)
-    $cotTitle = Format-Cell " COT STREAM" ($BoxWidth - 2)
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $decTitle -NoNewline -ForegroundColor Cyan
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $cotTitle -NoNewline -ForegroundColor Cyan
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Row 2-5: Content
-    for ($i = 0; $i -lt 4; $i++) {
-        # Decision
-        $decLine = ""
-        $decColor = "Gray"
-        if ($i -lt $decisions.Count) {
-            $dec = $decisions[$i]
-            $icon = switch ($dec.priority) { 'red' { 'R' } 'yellow' { 'Y' } default { 'G' } }
-            $decLine = "   [$icon] $($dec.q)"
-            $decColor = switch ($dec.priority) { 'red' { 'Red' } 'yellow' { 'Yellow' } default { 'Green' } }
-        }
-        
-        # COT
-        $cotLine = ""
-        if ($i -lt $cotLines.Count -and $cotLines[$i]) {
-            $cotLine = " " + $cotLines[$i]
-            if ($cotLine.Length -gt ($BoxWidth - 2)) { $cotLine = $cotLine.Substring(0, $BoxWidth - 2) }
-        }
-        
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host (Format-Cell $decLine ($BoxWidth - 2)) -NoNewline -ForegroundColor $decColor
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host " " -NoNewline
-        Write-Host "|" -NoNewline -ForegroundColor DarkGray
-        Write-Host (Format-Cell $cotLine ($BoxWidth - 2)) -NoNewline -ForegroundColor DarkGray
-        Write-Host "|" -ForegroundColor DarkGray
-    }
-    
-    # Row 6: Empty
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $empty -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host " " -NoNewline
-    Write-Host "|" -NoNewline -ForegroundColor DarkGray
-    Write-Host $empty -NoNewline
-    Write-Host "|" -ForegroundColor DarkGray
-    
-    # Bottom border
-    Write-Host $topBorder -ForegroundColor DarkGray
-    
-    # === INPUT SECTION ===
-    $inputLine = "-" * $TotalWidth
-    Write-Host $inputLine -ForegroundColor DarkGray
-}
-
-# --- SHOW HOTKEYS ---
-function Show-Hotkeys {
-    Write-Host "[C]ontinue [M]ode [L]ib [1]BE [2]FE [A]udit [D]ec [R]ef [H]elp [Q]uit" -ForegroundColor DarkYellow
-}
-
-# --- STREAM VIEWER ---
 function Show-Stream {
     param([string]$Type)
     
-    $logFile = Get-ChildItem "$LogDir\*-$Type.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (!$logFile) { 
-        Write-Host "  No $Type log found." -ForegroundColor Red
-        Start-Sleep -Seconds 2
+    $logFile = Get-ChildItem "$LogDir\*-$Type.log" -ErrorAction SilentlyContinue | 
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    
+    if (-not $logFile) {
+        Write-Host "  No logs for $Type worker" -ForegroundColor Yellow
         return
     }
     
-    Clear-Host
-    $title = $Type.ToUpper()
-    Write-Host ("=" * $TotalWidth) -ForegroundColor Cyan
-    Write-Host "  $title COT STREAM" -ForegroundColor White
-    Write-Host ("=" * $TotalWidth) -ForegroundColor Cyan
-    Write-Host "  Source: $($logFile.Name)" -ForegroundColor Gray
-    Write-Host ("-" * $TotalWidth) -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  ═══ $($Type.ToUpper()) WORKER STREAM ═══" -ForegroundColor Cyan
+    Write-Host ""
     
     $lines = Get-Content $logFile.FullName -Tail 15 -ErrorAction SilentlyContinue
     foreach ($line in $lines) {
-        if ($line.Length -gt 75) { $line = $line.Substring(0, 75) }
-        Write-Host "  $line" -ForegroundColor White
+        Write-Host "  $line" -ForegroundColor Gray
     }
     
     Write-Host ""
-    Write-Host ("-" * $TotalWidth) -ForegroundColor DarkGray
-    Write-Host "  Press Q to return..." -ForegroundColor Yellow
+    Write-Host "  Press Enter to continue..." -ForegroundColor DarkGray
+    Read-Host | Out-Null
+}
+
+function Show-AuditLog {
+    Write-Host ""
+    Write-Host "  ═══ AUDIT LOG ═══" -ForegroundColor Cyan
+    Write-Host ""
     
-    while ($true) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true).KeyChar
-            if ($key -eq 'q' -or $key -eq 'Q') { return }
-        }
-        Start-Sleep -Milliseconds 200
+    $logs = Invoke-Query "SELECT task_id, action, strictness, reason, created_at FROM audit_log ORDER BY created_at DESC LIMIT 8"
+    
+    if ($logs.Count -eq 0) {
+        Write-Host "  No audit entries yet" -ForegroundColor Gray
+        return
+    }
+    
+    foreach ($log in $logs) {
+        $icon = switch ($log.action) { 'approve' { '✅' } 'reject' { '🔴' } 'escalate' { '⚠️' } default { '📋' } }
+        Write-Host "  $icon [$($log.task_id)] $($log.action.ToUpper()) - $($log.reason)" -ForegroundColor Gray
     }
 }
 
-# --- EXECUTE COMMAND ---
-function Invoke-Cmd {
-    param([string]$UserInput)
+function Show-Tasks {
+    Write-Host ""
+    Write-Host "  ═══ TASK LIST ═══" -ForegroundColor Cyan
+    Write-Host ""
     
-    $parts = $UserInput -split ' ', 2
+    $tasks = Invoke-Query "SELECT id, type, status, substr(desc,1,45) as d FROM tasks ORDER BY CASE status WHEN 'in_progress' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END, id LIMIT 15"
+    
+    if ($tasks.Count -eq 0) {
+        Write-Host "  No tasks in queue" -ForegroundColor Gray
+        return
+    }
+    
+    foreach ($task in $tasks) {
+        $icon = switch ($task.status) { 'completed' { '✅' } 'in_progress' { '⏳' } 'pending' { '⏸️' } 'failed' { '❌' } default { '📋' } }
+        $typeIcon = if ($task.type -eq 'backend') { 'BE' } else { 'FE' }
+        Write-Host "  $icon [$($task.id)] [$typeIcon] $($task.d)" -ForegroundColor $(if ($task.status -eq 'in_progress') { 'Cyan' } else { 'Gray' })
+    }
+}
+
+function Show-Plan {
+    Write-Host ""
+    Write-Host "  ═══ ROADMAP ═══" -ForegroundColor Cyan
+    Write-Host ""
+    
+    Write-Host "  BACKEND:" -ForegroundColor Yellow
+    $beTasks = Invoke-Query "SELECT id, substr(desc,1,50) as d FROM tasks WHERE type='backend' AND status='pending' ORDER BY priority DESC, id LIMIT 5"
+    if ($beTasks.Count -eq 0) { Write-Host "    (empty)" -ForegroundColor Gray }
+    foreach ($t in $beTasks) { Write-Host "    → [$($t.id)] $($t.d)" -ForegroundColor Gray }
+    
+    Write-Host ""
+    Write-Host "  FRONTEND:" -ForegroundColor Yellow
+    $feTasks = Invoke-Query "SELECT id, substr(desc,1,50) as d FROM tasks WHERE type='frontend' AND status='pending' ORDER BY priority DESC, id LIMIT 5"
+    if ($feTasks.Count -eq 0) { Write-Host "    (empty)" -ForegroundColor Gray }
+    foreach ($t in $feTasks) { Write-Host "    → [$($t.id)] $($t.d)" -ForegroundColor Gray }
+}
+
+function Invoke-SlashCommand {
+    param([string]$Input)
+    
+    # Parse command and args
+    $parts = $Input.TrimStart("/").Split(" ", 2)
     $cmd = $parts[0].ToLower()
-    $cmdArgs = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+    $args = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+    
+    # Check for aliases
+    foreach ($key in $Global:Commands.Keys) {
+        $aliases = $Global:Commands[$key].Alias
+        if ($aliases -and $aliases -contains $cmd) {
+            $cmd = $key
+            break
+        }
+    }
     
     switch ($cmd) {
-        'nuke' {
-            Invoke-Query "DELETE FROM tasks WHERE status='pending'" | Out-Null
-            Write-Host "  Nuked pending tasks!" -ForegroundColor Red
+        # === SESSION ===
+        "quit" { 
+            Write-Host "  👋 Goodbye!" -ForegroundColor Yellow
+            exit 
         }
-        'status' {
-            $stats = Invoke-Query "SELECT status, COUNT(*) as c FROM tasks GROUP BY status"
-            foreach ($s in $stats) { Write-Host "  $($s.status): $($s.c)" -ForegroundColor Gray }
+        "clear" { 
+            Clear-Host
+            return "refresh"
         }
-        'set' {
-            $setParts = $cmdArgs -split ' ', 2
-            if ($setParts.Count -ge 2) {
-                if (!(Test-Path $TuningFile)) { "| Parameter | Value | Source |`n|---|---|---|" | Out-File $TuningFile -Encoding UTF8 }
-                "| $($setParts[0]) | $($setParts[1]) | Manual |" | Out-File $TuningFile -Append -Encoding UTF8
-                Write-Host "  Tuned: $($setParts[0]) -> $($setParts[1])" -ForegroundColor Green
+        "refresh" { 
+            return "refresh" 
+        }
+        "help" {
+            Write-Host ""
+            Write-Host "  ═══ AVAILABLE COMMANDS ═══" -ForegroundColor Cyan
+            Write-Host ""
+            foreach ($key in $Global:Commands.Keys) {
+                $desc = $Global:Commands[$key].Desc
+                Write-Host "  /$key".PadRight(16) -NoNewline -ForegroundColor Yellow
+                Write-Host "$desc" -ForegroundColor Gray
             }
+            Write-Host ""
+            Write-Host "  TIP: Type '/' to see suggestions, '/a' to filter to 'a' commands" -ForegroundColor DarkGray
         }
-        'post' {
-            $postParts = $cmdArgs -split ' ', 2
-            if ($postParts.Count -ge 2) {
-                $type = $postParts[0]
-                $desc = $postParts[1] -replace "'", "''"
-                Invoke-Query "INSERT INTO tasks (type, desc, deps, status, updated_at, priority) VALUES ('$type', '$desc', '[]', 'pending', strftime('%s','now'), 1)" | Out-Null
-                Write-Host "  Posted to $type" -ForegroundColor Green
-            }
-        }
-        'decide' {
-            $decParts = $cmdArgs -split ' ', 2
-            if ($decParts.Count -ge 2 -and $decParts[0] -match '^\d+$') {
-                $answer = $decParts[1] -replace "'", "''"
-                Invoke-Query "UPDATE decisions SET status='resolved', answer='$answer' WHERE id=$($decParts[0])" | Out-Null
-                Write-Host "  Decision resolved" -ForegroundColor Green
-            }
-        }
-        'mode' {
-            $proj = Get-ProjectMode
-            Write-Host "  Mode: $($proj.Icon) $($proj.Mode)" -ForegroundColor $proj.Color
-        }
-        'milestone' {
-            if ($cmdArgs) {
-                $cmdArgs | Out-File $MilestoneFile -NoNewline -Encoding UTF8
-                Write-Host "  Milestone: $cmdArgs" -ForegroundColor Cyan
-            }
-        }
-        'reset' {
-            if ($cmdArgs -match '^\d+$') {
-                Invoke-Reset -TaskId ([int]$cmdArgs)
+        
+        # === EXECUTION ===
+        "go" { Invoke-Continue }
+        
+        # === TASK MANAGEMENT ===
+        "add" {
+            if ($args -match "^(backend|frontend)\s+(.+)$") {
+                $type = $Matches[1]
+                $desc = $Matches[2]
+                $now = [int](Get-Date -UFormat %s)
+                Invoke-Query "INSERT INTO tasks (type, desc, status, updated_at) VALUES ('$type', '$desc', 'pending', $now)" | Out-Null
+                Write-Host "  ✅ Added $type task: $desc" -ForegroundColor Green
             }
             else {
-                Write-Host "  Usage: reset <task_id>" -ForegroundColor Yellow
+                Write-Host "  Usage: /add backend|frontend <description>" -ForegroundColor Yellow
             }
         }
-        'help' {
-            Write-Host ""
-            Write-Host "  COMMANDS:" -ForegroundColor Cyan
-            Write-Host "    post <type> <desc>  - Post task"
-            Write-Host "    set <key> <val>     - Update tuning"
-            Write-Host "    decide <id> <ans>   - Resolve decision"
-            Write-Host "    reset <id>          - Reset stuck task"
-            Write-Host "    mode                - Show mode"
-            Write-Host "    milestone <date>    - Set milestone"
-            Write-Host "    nuke                - Clear pending"
-            Write-Host "    status              - Show stats"
-            Write-Host ""
-            Write-Host "  HOTKEYS:" -ForegroundColor Yellow
-            Write-Host "    C - Continue (auto-resume next task)"
-            Write-Host "    M - Toggle TEXT/PS mode"
-            Write-Host "    A - View audit log"
-            Write-Host ""
+        "skip" {
+            if ($args -match "^\d+$") {
+                Invoke-Query "UPDATE tasks SET status='skipped' WHERE id=$args" | Out-Null
+                Write-Host "  ⏭️ Skipped task #$args" -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "  Usage: /skip <task_id>" -ForegroundColor Yellow
+            }
         }
+        "reset" {
+            if ($args -match "^\d+$") {
+                Invoke-Query "UPDATE tasks SET retry_count=0, auditor_status='pending', auditor_feedback='[]', status='pending' WHERE id=$args" | Out-Null
+                Write-Host "  🔄 Reset task #$args" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Usage: /reset <task_id>" -ForegroundColor Yellow
+            }
+        }
+        "drop" {
+            if ($args -match "^\d+$") {
+                Invoke-Query "DELETE FROM tasks WHERE id=$args" | Out-Null
+                Write-Host "  🗑️ Deleted task #$args" -ForegroundColor Red
+            }
+            else {
+                Write-Host "  Usage: /drop <task_id>" -ForegroundColor Yellow
+            }
+        }
+        "nuke" {
+            if ($args -eq "--confirm") {
+                Invoke-Query "DELETE FROM tasks WHERE status='pending'" | Out-Null
+                Write-Host "  💥 All pending tasks cleared" -ForegroundColor Red
+            }
+            else {
+                Write-Host "  ⚠️ This will delete ALL pending tasks!" -ForegroundColor Red
+                Write-Host "  Type: /nuke --confirm" -ForegroundColor Yellow
+            }
+        }
+        
+        # === AGENTS ===
+        "audit" { Show-AuditLog }
+        "lib" {
+            $action = if ($args) { $args.Split(" ")[0] } else { "status" }
+            switch ($action) {
+                "scan" { 
+                    Write-Host "  📚 Starting Librarian scan..." -ForegroundColor Cyan
+                    Write-Host "  (Use MCP tool: librarian_scan)" -ForegroundColor Gray
+                }
+                "status" {
+                    $ops = Invoke-Query "SELECT status, COUNT(*) as c FROM librarian_ops GROUP BY status"
+                    Write-Host "  📚 Librarian Status:" -ForegroundColor Cyan
+                    foreach ($op in $ops) { Write-Host "    $($op.status): $($op.c)" -ForegroundColor Gray }
+                }
+                default { Write-Host "  Usage: /lib scan|status|approve|execute" -ForegroundColor Yellow }
+            }
+        }
+        
+        # === STREAMS ===
+        "stream" {
+            if ($args -eq "backend" -or $args -eq "be") { Show-Stream "backend" }
+            elseif ($args -eq "frontend" -or $args -eq "fe") { Show-Stream "frontend" }
+            else { Write-Host "  Usage: /stream backend|frontend" -ForegroundColor Yellow }
+        }
+        
+        # === CONTEXT ===
+        "decide" {
+            if ($args -match "^(\d+)\s+(.+)$") {
+                $id = $Matches[1]
+                $answer = $Matches[2]
+                Invoke-Query "UPDATE decisions SET answer='$answer', status='resolved' WHERE id=$id" | Out-Null
+                Write-Host "  ✅ Decision #$id resolved" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Usage: /decide <id> <answer>" -ForegroundColor Yellow
+            }
+        }
+        "note" {
+            if ($args) {
+                $notesFile = "$DocsDir\NOTES.md"
+                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
+                Add-Content -Path $notesFile -Value "`n## $timestamp`n$args`n"
+                Write-Host "  📝 Note added" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Usage: /note <text>" -ForegroundColor Yellow
+            }
+        }
+        "blocker" {
+            if ($args) {
+                $now = [int](Get-Date -UFormat %s)
+                Invoke-Query "INSERT INTO decisions (priority, question, status, created_at) VALUES ('red', '$args', 'pending', $now)" | Out-Null
+                Write-Host "  🔴 Blocker added" -ForegroundColor Red
+            }
+            else {
+                Write-Host "  Usage: /blocker <text>" -ForegroundColor Yellow
+            }
+        }
+        
+        # === CONFIGURATION ===
+        "mode" {
+            if ($args -match "^(vibe|converge|ship)$") {
+                Invoke-Query "UPDATE config SET value='$args' WHERE key='mode'" | Out-Null
+                Write-Host "  🔧 Mode set to $($args.ToUpper())" -ForegroundColor Green
+            }
+            else {
+                $proj = Get-ProjectMode
+                Write-Host "  Current mode: $($proj.Icon) $($proj.Mode)" -ForegroundColor White
+                if ($null -ne $proj.Days) { Write-Host "  Days to milestone: $($proj.Days)" -ForegroundColor Gray }
+                Write-Host "  Set with: /mode vibe|converge|ship" -ForegroundColor Gray
+            }
+        }
+        "milestone" {
+            if ($args -match "^\d{4}-\d{2}-\d{2}$") {
+                Set-Content -Path $MilestoneFile -Value $args
+                Write-Host "  📅 Milestone set to $args" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Usage: /milestone YYYY-MM-DD" -ForegroundColor Yellow
+            }
+        }
+        
+        # === VIEWS ===
+        "status" { return "refresh" }
+        "plan" { Show-Plan }
+        "tasks" { Show-Tasks }
+        
+        # === UNKNOWN ===
         default {
-            if ($UserInput.Trim()) {
-                Write-Host "  Unknown: $cmd (type 'help')" -ForegroundColor Red
-            }
+            Write-Host "  ❓ Unknown command: /$cmd" -ForegroundColor Red
+            Write-Host "  Type /help to see available commands" -ForegroundColor Gray
         }
+    }
+    
+    return $null
+}
+
+function Send-ToAI {
+    param([string]$Text)
+    
+    Write-Host ""
+    Write-Host "  → Routing to AI..." -ForegroundColor DarkGray
+    
+    # In production, this would call the Python router
+    # For now, show placeholder
+    try {
+        $result = python -c "from router import SemanticRouter; r = SemanticRouter('mesh.db'); print(r.route('$Text').to_dict())" 2>&1
+        if ($result) {
+            Write-Host "  📤 $result" -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Host "  💬 Message received: $Text" -ForegroundColor Gray
+        Write-Host "  (AI routing not connected)" -ForegroundColor DarkGray
     }
 }
 
-# --- MAIN LOOP ---
+# ============================================================================
+# MAIN INPUT LOOP
+# ============================================================================
+
+Clear-Host
+Show-Header
+Write-Host ""
+Write-Host "  Type naturally to chat with AI, or use '/' for commands." -ForegroundColor Gray
+Write-Host "  Type '/help' to see all available commands." -ForegroundColor DarkGray
+Write-Host ""
+
 while ($true) {
-    Show-Dashboard
-    
-    # Show prompt FIRST
+    # Prompt
     $proj = Get-ProjectMode
-    Write-Host "$($proj.Icon) commander> " -NoNewline -ForegroundColor White
+    Write-Host "¢ " -NoNewline -ForegroundColor Green
     
-    # Capture cursor position for later
-    $promptLine = [Console]::CursorTop
+    $input = Read-Host
     
-    # Add spacing to push hotkeys to bottom
-    Write-Host ""
-    Write-Host ""
-    Write-Host ""
-    Write-Host ""
-    Write-Host ""
-    Write-Host ""
-    Show-Hotkeys
-    
-    # Move cursor back to prompt line for input
-    [Console]::SetCursorPosition(14, $promptLine)
-    
-    # Input buffer
-    $inputBuffer = ""
-    
-    while ($true) {
-        if ([Console]::KeyAvailable) {
-            $keyInfo = [Console]::ReadKey($true)
-            $key = $keyInfo.Key
-            $char = $keyInfo.KeyChar
-            
-            # Handle hotkeys when buffer is empty
-            if ($inputBuffer -eq "") {
-                if ($char -eq 'c' -or $char -eq 'C') { 
-                    Write-Host ""
-                    Invoke-Continue
-                    Start-Sleep -Seconds 1
-                    break 
-                }
-                if ($char -eq 'm' -or $char -eq 'M') { 
-                    Write-Host ""
-                    Switch-Mode
-                    break 
-                }
-                if ($char -eq 'a' -or $char -eq 'A') { 
-                    Write-Host ""
-                    Write-Host "  AUDIT LOG:" -ForegroundColor Cyan
-                    $logs = Get-AuditLog
-                    foreach ($log in $logs) {
-                        $icon = switch ($log.action) { 'approve' { '✅' } 'reject' { '🔴' } 'escalate' { '⚠️' } default { '📋' } }
-                        Write-Host "    $icon [$($log.task_id)] $($log.action) - $($log.reason)" -ForegroundColor Gray
-                    }
-                    Start-Sleep -Seconds 2
-                    break
-                }
-                if ($char -eq 'l' -or $char -eq 'L') { 
-                    Show-LibrarianPanel
-                    break 
-                }
-                if ($char -eq '1') { Show-Stream "backend"; break }
-                if ($char -eq '2') { Show-Stream "frontend"; break }
-                if ($char -eq 'd' -or $char -eq 'D') { Open-DocFile "$DocsDir\DECISION_LOG.md"; break }
-                if ($char -eq 's' -or $char -eq 'S') { Open-DocFile $SpecFile; break }
-                if ($char -eq 'r' -or $char -eq 'R') { break }
-                if ($char -eq 'h' -or $char -eq 'H') { 
-                    Write-Host ""
-                    Invoke-Cmd "help"
-                    Start-Sleep -Seconds 2
-                    break 
-                }
-                if ($char -eq 'q' -or $char -eq 'Q') { 
-                    Write-Host ""
-                    Write-Host "  Goodbye!" -ForegroundColor Yellow
-                    exit 
-                }
-            }
-            
-            # Handle Enter
-            if ($key -eq 'Enter') {
-                Write-Host ""
-                if ($inputBuffer.Trim()) {
-                    Invoke-Cmd $inputBuffer
-                    Start-Sleep -Milliseconds 800
-                }
-                break
-            }
-            
-            # Handle Backspace
-            if ($key -eq 'Backspace') {
-                if ($inputBuffer.Length -gt 0) {
-                    $inputBuffer = $inputBuffer.Substring(0, $inputBuffer.Length - 1)
-                    Write-Host "`b `b" -NoNewline
-                }
-                continue
-            }
-            
-            # Handle Escape
-            if ($key -eq 'Escape') {
-                $inputBuffer = ""
-                break
-            }
-            
-            # Regular character
-            if ($char -match '[\x20-\x7E]') {
-                $inputBuffer += $char
-                Write-Host $char -NoNewline
-            }
-        }
-        Start-Sleep -Milliseconds 50
+    if ([string]::IsNullOrWhiteSpace($input)) { 
+        continue 
     }
     
-    # Show bottom separator and hotkeys after command
-    Write-Host ("-" * $TotalWidth) -ForegroundColor DarkGray
-    Show-Hotkeys
-    Start-Sleep -Milliseconds 300
+    if ($input.StartsWith("/")) {
+        # Check if just "/" or partial command for suggestions
+        if ($input -eq "/" -or ($input.Length -gt 1 -and -not $input.Contains(" "))) {
+            Show-CommandSuggestions -Filter $input
+            continue
+        }
+        
+        # Execute slash command
+        $result = Invoke-SlashCommand -Input $input
+        
+        if ($result -eq "refresh") {
+            Clear-Host
+            Show-Header
+            Write-Host ""
+        }
+    }
+    else {
+        # Natural language - send to AI router
+        Send-ToAI -Text $input
+    }
+    
+    Write-Host ""
 }
