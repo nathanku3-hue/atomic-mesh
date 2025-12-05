@@ -210,7 +210,214 @@ def system_health_check() -> str:
             "timestamp": time.time()
         })
 
-# --- MODE MANAGEMENT ---
+# =============================================================================
+# CENTRAL LIBRARY SYSTEM (v7.6)
+# =============================================================================
+
+# Library root - can be overridden via environment variable
+LIBRARY_ROOT = os.getenv("ATOMIC_MESH_LIB", os.path.join(os.path.dirname(__file__), "library"))
+
+@mcp.tool()
+def consult_standard(topic: str, profile: str = "general") -> str:
+    """
+    Retrieves Golden Standard guidelines from the Central Library.
+    
+    Args:
+        topic: The standard to retrieve. Options: 'security', 'architecture', 
+               'folder_structure', 'testing', 'git', 'code_review', 'components'
+        profile: The project profile. Options: 'python_backend', 'typescript_next',
+                'infrastructure', 'general'
+    
+    Returns:
+        The content of the standard file, prefixed with metadata.
+    """
+    # Load profile configuration
+    profile_path = os.path.join(LIBRARY_ROOT, "profiles", f"{profile}.json")
+    
+    # Fallback to general if specific profile missing
+    if not os.path.exists(profile_path):
+        if profile != "general":
+            return consult_standard(topic, "general")
+        return f"⚠️ Profile '{profile}' not found in library."
+    
+    try:
+        with open(profile_path, 'r', encoding='utf-8') as f:
+            profile_data = json.load(f)
+        
+        # Get the relative path for this topic
+        standards_map = profile_data.get("standards", {})
+        rel_path = standards_map.get(topic)
+        
+        if not rel_path:
+            return f"⚠️ No standard defined for '{topic}' in profile '{profile}'."
+        
+        # Read the standard file
+        full_path = os.path.join(LIBRARY_ROOT, "standards", rel_path)
+        
+        if not os.path.exists(full_path):
+            return f"⚠️ Standard file missing: {rel_path}"
+        
+        with open(full_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        return f"[STANDARD: {topic.upper()} | Profile: {profile}]\n\n{content}"
+        
+    except json.JSONDecodeError as e:
+        return f"⚠️ Invalid profile JSON: {e}"
+    except Exception as e:
+        server_logger.error(f"Error reading standard: {e}")
+        return f"⚠️ Error reading standard: {e}"
+
+@mcp.tool()
+def detect_project_profile(project_root: str) -> str:
+    """
+    Auto-detects the technology stack of a project directory.
+    
+    Args:
+        project_root: Absolute path to the project directory.
+    
+    Returns:
+        The detected profile name (e.g., 'python_backend', 'typescript_next').
+    """
+    try:
+        if not os.path.isdir(project_root):
+            return "general"
+        
+        files = os.listdir(project_root)
+        files_lower = [f.lower() for f in files]
+        
+        # Check for Node.js / TypeScript projects
+        if "package.json" in files_lower:
+            pkg_path = os.path.join(project_root, "package.json")
+            try:
+                with open(pkg_path, 'r', encoding='utf-8') as f:
+                    content = f.read().lower()
+                
+                if "next" in content:
+                    return "typescript_next"
+                if "react" in content and "next" not in content:
+                    return "typescript_react"
+                if "vue" in content:
+                    return "vue_frontend"
+                if "express" in content or "fastify" in content:
+                    return "node_backend"
+                    
+                return "node_general"
+            except:
+                return "node_general"
+        
+        # Check for Python projects
+        if "requirements.txt" in files_lower or "pyproject.toml" in files_lower or "setup.py" in files_lower:
+            # Try to detect specific framework
+            for check_file in ["requirements.txt", "pyproject.toml"]:
+                check_path = os.path.join(project_root, check_file)
+                if os.path.exists(check_path):
+                    try:
+                        with open(check_path, 'r', encoding='utf-8') as f:
+                            content = f.read().lower()
+                        if "fastapi" in content or "django" in content or "flask" in content:
+                            return "python_backend"
+                        if "pandas" in content or "numpy" in content or "scikit" in content:
+                            return "python_data"
+                    except:
+                        pass
+            return "python_backend"
+        
+        # Check for Infrastructure projects
+        if any(f.endswith(".tf") for f in files_lower):
+            return "infrastructure"
+        if "docker-compose.yml" in files_lower or "docker-compose.yaml" in files_lower:
+            return "infrastructure"
+        if "kubernetes" in str(files_lower) or any("k8s" in f for f in files_lower):
+            return "infrastructure"
+        
+        return "general"
+        
+    except Exception as e:
+        server_logger.warning(f"Profile detection failed: {e}")
+        return "general"
+
+@mcp.tool()
+def get_reference(reference_type: str, profile: str = "general") -> str:
+    """
+    Retrieves a reference code sample from the Central Library.
+    
+    Args:
+        reference_type: Type of reference (e.g., 'api_route', 'service', 'component', 'test')
+        profile: The project profile (e.g., 'python_backend', 'typescript_next')
+    
+    Returns:
+        The reference code content with metadata.
+    """
+    profile_path = os.path.join(LIBRARY_ROOT, "profiles", f"{profile}.json")
+    
+    if not os.path.exists(profile_path):
+        return f"⚠️ Profile '{profile}' not found."
+    
+    try:
+        with open(profile_path, 'r', encoding='utf-8') as f:
+            profile_data = json.load(f)
+        
+        references_map = profile_data.get("references", {})
+        rel_path = references_map.get(reference_type)
+        
+        if not rel_path:
+            return f"⚠️ No reference for '{reference_type}' in profile '{profile}'."
+        
+        full_path = os.path.join(LIBRARY_ROOT, "references", rel_path)
+        
+        if not os.path.exists(full_path):
+            return f"⚠️ Reference file missing: {rel_path}"
+        
+        with open(full_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        return f"[REFERENCE: {reference_type} | Profile: {profile}]\n\n{content}"
+        
+    except Exception as e:
+        server_logger.error(f"Error reading reference: {e}")
+        return f"⚠️ Error: {e}"
+
+@mcp.tool()
+def list_library_standards(profile: str = "general") -> str:
+    """
+    Lists all available standards for a given profile.
+    
+    Args:
+        profile: The project profile to list standards for.
+    
+    Returns:
+        JSON with available standards and references.
+    """
+    profile_path = os.path.join(LIBRARY_ROOT, "profiles", f"{profile}.json")
+    
+    if not os.path.exists(profile_path):
+        # List available profiles
+        profiles_dir = os.path.join(LIBRARY_ROOT, "profiles")
+        if os.path.isdir(profiles_dir):
+            available = [f.replace(".json", "") for f in os.listdir(profiles_dir) if f.endswith(".json")]
+            return json.dumps({
+                "error": f"Profile '{profile}' not found",
+                "available_profiles": available
+            })
+        return json.dumps({"error": "Library not initialized"})
+    
+    try:
+        with open(profile_path, 'r', encoding='utf-8') as f:
+            profile_data = json.load(f)
+        
+        return json.dumps({
+            "profile": profile,
+            "name": profile_data.get("name", "Unknown"),
+            "description": profile_data.get("description", ""),
+            "standards": list(profile_data.get("standards", {}).keys()),
+            "references": list(profile_data.get("references", {}).keys())
+        }, indent=2)
+        
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 def get_mode() -> str:
     """Get current mode, with auto-detection based on milestone date."""
     # Check for milestone file

@@ -1,0 +1,32 @@
+{
+    "name": "TypeScript Next.js",
+    "description": "Next.js full-stack applications with App Router",
+    "detection": {
+        "files": [
+            "package.json",
+            "next.config.ts",
+            "next.config.js",
+            "next.config.mjs"
+        ],
+        "content_hints": [
+            "next",
+            "react",
+            "@next/"
+        ]
+    },
+    "standards": {
+        "security": "universal/security.md",
+        "architecture": "typescript/architecture.md",
+        "components": "typescript/components.md",
+        "testing": "typescript/testing.md",
+        "folder_structure": "typescript/folder_map.md",
+        "git": "universal/git_workflow.md",
+        "code_review": "universal/code_review.md"
+    },
+    "references": {
+        "api_route": "typescript/perfect_api_route.ts",
+        "component": "typescript/perfect_component.tsx",
+        "hook": "typescript/perfect_hook.ts",
+        "test": "typescript/perfect_test.ts"
+    }
+}

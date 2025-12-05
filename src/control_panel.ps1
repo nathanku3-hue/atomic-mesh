@@ -59,6 +59,12 @@ $Global:Commands = [ordered]@{
     "multi"     = @{ Desc = "launch multi-project grid: /multi 1 2 3"; HasArgs = $true }
     "projects"  = @{ Desc = "list available projects" }
     
+    # LIBRARY (v7.6)
+    "init"      = @{ Desc = "auto-detect and link project to library profile" }
+    "profile"   = @{ Desc = "show/set project profile: /profile [name]"; HasArgs = $true }
+    "standard"  = @{ Desc = "view a standard: /standard security|architecture"; HasArgs = $true }
+    "standards" = @{ Desc = "list all standards for current profile" }
+    
     # CONTEXT
     "decide"    = @{ Desc = "answer decision: /decide <id> <answer>"; HasArgs = $true }
     "note"      = @{ Desc = "add a note: /note <text>"; HasArgs = $true }
@@ -587,6 +593,193 @@ function Invoke-SlashCommand {
             }
             else {
                 Write-Host "  ⚠️ Launcher not found at $launcherPath" -ForegroundColor Yellow
+            }
+        }
+        
+        # === LIBRARY (v7.6) ===
+        "init" {
+            Write-Host ""
+            Write-Host "  📚 PROJECT INITIALIZATION" -ForegroundColor Cyan
+            Write-Host ""
+            
+            # Detect profile using Python
+            $detectedProfile = "general"
+            try {
+                $pyScript = @"
+import sys
+sys.path.insert(0, r'$RepoRoot\src')
+from mesh_server import detect_project_profile
+print(detect_project_profile(r'$CurrentDir'))
+"@
+                $detectedProfile = $pyScript | python 2>$null
+                if (-not $detectedProfile) { $detectedProfile = "general" }
+            }
+            catch {
+                Write-Host "  ⚠️ Detection failed, using 'general'" -ForegroundColor Yellow
+            }
+            
+            Write-Host "  Scanned: $CurrentDir" -ForegroundColor Gray
+            Write-Host "  Detected Profile: " -NoNewline
+            Write-Host "$detectedProfile" -ForegroundColor Green
+            Write-Host ""
+            
+            # Show what standards are available
+            $profilePath = Join-Path $RepoRoot "library\profiles\$detectedProfile.json"
+            if (Test-Path $profilePath) {
+                $profileData = Get-Content $profilePath | ConvertFrom-Json
+                Write-Host "  Standards included:" -ForegroundColor Yellow
+                foreach ($standard in $profileData.standards.PSObject.Properties.Name) {
+                    Write-Host "    ✅ $standard" -ForegroundColor Gray
+                }
+            }
+            
+            Write-Host ""
+            $confirm = Read-Host "  Link this project to '$detectedProfile'? [Y/n]"
+            if ($confirm -eq "n" -or $confirm -eq "N") { return }
+            
+            # Update projects.json
+            $regPath = Join-Path $RepoRoot "config\projects.json"
+            if (Test-Path $regPath) {
+                $projects = Get-Content $regPath | ConvertFrom-Json
+                
+                # Find existing or create new
+                $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
+                
+                if ($existing) {
+                    $existing | ForEach-Object { $_.profile = $detectedProfile }
+                    Write-Host "  ✅ Updated existing project entry" -ForegroundColor Green
+                }
+                else {
+                    $newId = ($projects | Measure-Object -Property id -Maximum).Maximum + 1
+                    $newEntry = @{
+                        id      = $newId
+                        name    = Split-Path $CurrentDir -Leaf
+                        path    = $CurrentDir
+                        db      = "mesh.db"
+                        profile = $detectedProfile
+                    }
+                    $projects = @($projects) + $newEntry
+                    Write-Host "  ✅ Added new project (ID: $newId)" -ForegroundColor Green
+                }
+                
+                $projects | ConvertTo-Json -Depth 4 | Set-Content $regPath
+            }
+            
+            # Store profile in script context
+            $script:CurrentProfile = $detectedProfile
+            Write-Host "  ✅ Initialization Complete" -ForegroundColor Green
+        }
+        
+        "profile" {
+            $regPath = Join-Path $RepoRoot "config\projects.json"
+            
+            if ($cmdArgs) {
+                # Set profile
+                if (Test-Path $regPath) {
+                    $projects = Get-Content $regPath | ConvertFrom-Json
+                    $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
+                    if ($existing) {
+                        $existing | ForEach-Object { $_.profile = $cmdArgs }
+                        $projects | ConvertTo-Json -Depth 4 | Set-Content $regPath
+                        Write-Host "  ✅ Profile set to: $cmdArgs" -ForegroundColor Green
+                    }
+                    else {
+                        Write-Host "  ⚠️ Project not in registry. Run /init first." -ForegroundColor Yellow
+                    }
+                }
+            }
+            else {
+                # Show current profile
+                $profile = "unknown"
+                if (Test-Path $regPath) {
+                    $projects = Get-Content $regPath | ConvertFrom-Json
+                    $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
+                    if ($existing) { $profile = $existing.profile }
+                }
+                Write-Host ""
+                Write-Host "  Current Profile: $profile" -ForegroundColor Cyan
+                Write-Host "  Project Path: $CurrentDir" -ForegroundColor Gray
+                Write-Host ""
+                Write-Host "  Available profiles:" -ForegroundColor Yellow
+                $profilesPath = Join-Path $RepoRoot "library\profiles"
+                if (Test-Path $profilesPath) {
+                    Get-ChildItem $profilesPath -Filter "*.json" | ForEach-Object {
+                        $name = $_.BaseName
+                        $indicator = if ($name -eq $profile) { " ←" } else { "" }
+                        Write-Host "    - $name$indicator" -ForegroundColor Gray
+                    }
+                }
+            }
+        }
+        
+        "standard" {
+            if (-not $cmdArgs) {
+                Write-Host "  Usage: /standard <topic>" -ForegroundColor Yellow
+                Write-Host "  Topics: security, architecture, folder_structure, testing, git, code_review" -ForegroundColor Gray
+                return
+            }
+            
+            # Get current profile
+            $profile = "general"
+            $regPath = Join-Path $RepoRoot "config\projects.json"
+            if (Test-Path $regPath) {
+                $projects = Get-Content $regPath | ConvertFrom-Json
+                $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
+                if ($existing -and $existing.profile) { $profile = $existing.profile }
+            }
+            
+            # Fetch standard via Python
+            try {
+                $pyScript = @"
+import sys
+sys.path.insert(0, r'$RepoRoot\src')
+from mesh_server import consult_standard
+print(consult_standard('$cmdArgs', '$profile'))
+"@
+                $result = $pyScript | python 2>$null
+                Write-Host ""
+                Write-Host $result
+            }
+            catch {
+                Write-Host "  ⚠️ Failed to fetch standard" -ForegroundColor Yellow
+            }
+        }
+        
+        "standards" {
+            # Get current profile
+            $profile = "general"
+            $regPath = Join-Path $RepoRoot "config\projects.json"
+            if (Test-Path $regPath) {
+                $projects = Get-Content $regPath | ConvertFrom-Json
+                $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
+                if ($existing -and $existing.profile) { $profile = $existing.profile }
+            }
+            
+            Write-Host ""
+            Write-Host "  ═══ AVAILABLE STANDARDS ═══" -ForegroundColor Cyan
+            Write-Host "  Profile: $profile" -ForegroundColor Gray
+            Write-Host ""
+            
+            $profilePath = Join-Path $RepoRoot "library\profiles\$profile.json"
+            if (Test-Path $profilePath) {
+                $profileData = Get-Content $profilePath | ConvertFrom-Json
+                
+                Write-Host "  Standards:" -ForegroundColor Yellow
+                foreach ($standard in $profileData.standards.PSObject.Properties.Name) {
+                    Write-Host "    • $standard" -ForegroundColor White
+                }
+                
+                Write-Host ""
+                Write-Host "  References:" -ForegroundColor Yellow
+                foreach ($ref in $profileData.references.PSObject.Properties.Name) {
+                    Write-Host "    • $ref" -ForegroundColor White
+                }
+                
+                Write-Host ""
+                Write-Host "  Use: /standard <topic>" -ForegroundColor Gray
+            }
+            else {
+                Write-Host "  ⚠️ Profile '$profile' not found" -ForegroundColor Yellow
             }
         }
         
