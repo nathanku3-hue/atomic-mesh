@@ -457,7 +457,94 @@ function Invoke-SlashCommand {
                     Write-Host "  📚 Librarian Status:" -ForegroundColor Cyan
                     foreach ($op in $ops) { Write-Host "    $($op.status): $($op.c)" -ForegroundColor Gray }
                 }
-                default { Write-Host "  Usage: /lib scan|status|approve|execute" -ForegroundColor Yellow }
+                "mount" {
+                    # Mount external reference project via symlink
+                    $parts = $action_args -split "\s+", 2
+                    $name = $parts[0]
+                    $targetPath = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+                    
+                    if (-not $name -or -not $targetPath) {
+                        Write-Host "  Usage: /lib mount <name> <path>" -ForegroundColor Yellow
+                        Write-Host "  Example: /lib mount context7 E:\Code\reference-project" -ForegroundColor Gray
+                        return
+                    }
+                    
+                    $refsPath = Join-Path $RepoRoot "library\references"
+                    $linkPath = Join-Path $refsPath $name
+                    
+                    if (-not (Test-Path $targetPath)) {
+                        Write-Host "  ⚠️ Target path does not exist: $targetPath" -ForegroundColor Yellow
+                        return
+                    }
+                    
+                    if (Test-Path $linkPath) {
+                        Write-Host "  ⚠️ '$name' already mounted. Use /lib unmount $name first." -ForegroundColor Yellow
+                        return
+                    }
+                    
+                    try {
+                        # Create junction (symlink alternative that doesn't need admin)
+                        New-Item -ItemType Junction -Path $linkPath -Target $targetPath | Out-Null
+                        Write-Host "  ✅ Mounted '$name' → $targetPath" -ForegroundColor Green
+                        Write-Host "  Agents can now access: library/references/$name" -ForegroundColor Gray
+                    }
+                    catch {
+                        Write-Host "  ⚠️ Failed to create junction. Try running as Admin." -ForegroundColor Yellow
+                        Write-Host "  Or manually: New-Item -ItemType Junction -Path '$linkPath' -Target '$targetPath'" -ForegroundColor Gray
+                    }
+                }
+                "unmount" {
+                    $name = $action_args
+                    if (-not $name) {
+                        Write-Host "  Usage: /lib unmount <name>" -ForegroundColor Yellow
+                        return
+                    }
+                    
+                    $linkPath = Join-Path $RepoRoot "library\references\$name"
+                    
+                    if (-not (Test-Path $linkPath)) {
+                        Write-Host "  ⚠️ '$name' is not mounted" -ForegroundColor Yellow
+                        return
+                    }
+                    
+                    try {
+                        # Remove junction (use cmd's rmdir to safely remove junction without deleting target)
+                        cmd /c "rmdir `"$linkPath`"" 2>$null
+                        Write-Host "  ✅ Unmounted '$name'" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "  ⚠️ Failed to unmount. Try: cmd /c rmdir '$linkPath'" -ForegroundColor Yellow
+                    }
+                }
+                "refs" {
+                    # List mounted references
+                    $refsPath = Join-Path $RepoRoot "library\references"
+                    Write-Host ""
+                    Write-Host "  ═══ MOUNTED REFERENCES ═══" -ForegroundColor Cyan
+                    Write-Host ""
+                    
+                    $items = Get-ChildItem $refsPath -Directory -ErrorAction SilentlyContinue
+                    if ($items) {
+                        foreach ($item in $items) {
+                            $isJunction = (Get-Item $item.FullName).Attributes -band [IO.FileAttributes]::ReparsePoint
+                            $icon = if ($isJunction) { "🔗" } else { "📁" }
+                            $target = if ($isJunction) {
+                                try { (Get-Item $item.FullName).Target } catch { "→ (junction)" }
+                            }
+                            else { "(local)" }
+                            
+                            Write-Host "    $icon $($item.Name)" -NoNewline -ForegroundColor Yellow
+                            Write-Host " $target" -ForegroundColor Gray
+                        }
+                    }
+                    else {
+                        Write-Host "    (No references mounted)" -ForegroundColor Gray
+                    }
+                    
+                    Write-Host ""
+                    Write-Host "  Mount with: /lib mount <name> <path>" -ForegroundColor Gray
+                }
+                default { Write-Host "  Usage: /lib scan|status|mount|unmount|refs" -ForegroundColor Yellow }
             }
         }
         
