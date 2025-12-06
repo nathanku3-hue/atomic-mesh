@@ -1,11 +1,10 @@
 {
     "version": "7.8",
-    "name": "Dream Team",
-    "description": "SOTA model roster for Zero-Spaghetti development",
+    "name": "Dream Team - SOTA Only",
+    "description": "State-of-the-art model roster for Zero-Spaghetti development",
     "roster": {
         "logic_max": {
             "id": "gpt-5.1-codex-max",
-            "fallback": "gpt-4o",
             "env_var": "MODEL_LOGIC_MAX",
             "description": "The Logician - Rigid architecture, perfect syntax, security",
             "roles": [
@@ -17,8 +16,7 @@
             ]
         },
         "creative_fast": {
-            "id": "claude-3-5-sonnet-20241022",
-            "fallback": "claude-3-5-sonnet-20240620",
+            "id": "claude-sonnet-4-5@20250929",
             "env_var": "MODEL_CREATIVE_FAST",
             "description": "The Artist - Visuals, React, Tailwind, vibes",
             "roles": [
@@ -28,8 +26,7 @@
             ]
         },
         "reasoning_ultra": {
-            "id": "claude-3-5-opus-20241022",
-            "fallback": "claude-3-opus-20240229",
+            "id": "claude-opus-4-5-20251101",
             "env_var": "MODEL_REASONING_ULTRA",
             "description": "The Heavy - Deep architectural planning, complex refactoring",
             "roles": [

@@ -309,10 +309,10 @@ def get_model_for_role(role: str, complexity: str = "normal") -> str:
     Returns:
         Model identifier string
     """
-    # Environment-based configuration
-    logic_max = os.getenv("MODEL_LOGIC_MAX", "gpt-4o")
-    creative_fast = os.getenv("MODEL_CREATIVE_FAST", "claude-3-5-sonnet-20240620")
-    reasoning_ultra = os.getenv("MODEL_REASONING_ULTRA", "claude-3-opus-20240229")
+    # Environment-based configuration - SOTA models only
+    logic_max = os.getenv("MODEL_LOGIC_MAX", "gpt-5.1-codex-max")
+    creative_fast = os.getenv("MODEL_CREATIVE_FAST", "claude-sonnet-4-5@20250929")
+    reasoning_ultra = os.getenv("MODEL_REASONING_ULTRA", "claude-opus-4-5-20251101")
     
     # The Heavy for complex tasks
     if complexity == "high":

@@ -17,16 +17,16 @@ MILESTONE_FILE = ".milestone_date"
 SERVER_START_TIME = time.time()
 
 # =============================================================================
-# DREAM TEAM MODEL CONFIGURATION (v7.8)
+# DREAM TEAM MODEL CONFIGURATION (v7.8) - SOTA ONLY
 # =============================================================================
-# Logic Cluster: GPT-5.1/4o for Backend, Librarian, QA1, Commander
-MODEL_LOGIC_MAX = os.getenv("MODEL_LOGIC_MAX", "gpt-4o")
+# Logic Cluster: GPT-5.1-Codex-Max for Backend, Librarian, QA1, Commander
+MODEL_LOGIC_MAX = os.getenv("MODEL_LOGIC_MAX", "gpt-5.1-codex-max")
 
-# Creative Cluster: Claude Sonnet for Frontend, QA2
-MODEL_CREATIVE_FAST = os.getenv("MODEL_CREATIVE_FAST", "claude-3-5-sonnet-20241022")
+# Creative Cluster: Claude Sonnet 4.5 for Frontend, QA2
+MODEL_CREATIVE_FAST = os.getenv("MODEL_CREATIVE_FAST", "claude-sonnet-4-5@20250929")
 
-# The Heavy: Claude Opus for complex refactoring
-MODEL_REASONING_ULTRA = os.getenv("MODEL_REASONING_ULTRA", "claude-3-5-opus-20241022")
+# The Heavy: Claude Opus 4.5 for complex refactoring
+MODEL_REASONING_ULTRA = os.getenv("MODEL_REASONING_ULTRA", "claude-opus-4-5-20251101")
 
 # Complexity triggers for Opus escalation
 COMPLEXITY_TRIGGERS = [
