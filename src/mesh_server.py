@@ -2902,6 +2902,85 @@ def get_llm_client() -> CLIBasedLLM:
     return llm
 
 
+# =============================================================================
+# v8.5 HOT SWAP PROTOCOL
+# =============================================================================
+# Allows user to interrupt and redirect Worker mid-execution.
+# "No, use Blue" → Cancel current Worker → Update Spec → Restart
+
+CURRENT_RUNNING_TASK_ID = None
+CURRENT_WORKER_TASK_OBJ = None
+
+@mcp.tool()
+async def apply_correction_hot_swap(instruction: str) -> str:
+    """
+    Hot Swap Protocol: Interrupt & Redirect the AI mid-thought.
+    
+    1. Updates ACTIVE_SPEC.md with the correction
+    2. Kills the current running task
+    3. Restarts the task immediately with fresh context
+    
+    Args:
+        instruction: The correction (e.g., "No, use Blue instead")
+    
+    Returns:
+        Status message
+    """
+    global CURRENT_WORKER_TASK_OBJ, CURRENT_RUNNING_TASK_ID
+    
+    print("")
+    print("═══════════════════════════════════════════════════════════════")
+    print("⚡ HOT SWAP TRIGGERED")
+    print("═══════════════════════════════════════════════════════════════")
+    print(f"   Correction: '{instruction}'")
+    print("")
+    
+    # 1. UPDATE SPEC (Append constraint immediately)
+    # Simple heuristic for v8.5: direct append
+    # v9.0 can use LLM extraction for smarter parsing
+    spec_path = os.path.join(DOCS_DIR, "ACTIVE_SPEC.md")
+    constraint_line = f"\n\n## User Corrections\n- [Constraint] {instruction}\n"
+    
+    if os.path.exists(spec_path):
+        with open(spec_path, "a", encoding="utf-8") as f:
+            f.write(constraint_line)
+        print(f"   📝 Spec Updated: {spec_path}")
+    else:
+        # Create minimal spec if doesn't exist
+        with open(spec_path, "w", encoding="utf-8") as f:
+            f.write(f"# Active Specification\n\n{constraint_line}")
+        print(f"   📝 Spec Created: {spec_path}")
+    
+    msg = f"✅ Spec Updated with: '{instruction}'"
+
+    # 2. HOT SWAP LOGIC
+    if CURRENT_RUNNING_TASK_ID and CURRENT_WORKER_TASK_OBJ:
+        target_id = CURRENT_RUNNING_TASK_ID
+        print(f"   🛑 Cancelling Task #{target_id}...")
+        
+        try:
+            # Kill the old brain
+            CURRENT_WORKER_TASK_OBJ.cancel()
+            
+            # Restart the new brain (Schedule immediately)
+            asyncio.create_task(run_autonomous_loop(target_id))
+            
+            msg += f"\n🔄 Worker #{target_id} Restarted with new Context."
+            print(f"   🔄 Worker Restarted with fresh spec")
+        except Exception as e:
+            msg += f"\n⚠️ Restart error: {e}"
+            print(f"   ⚠️ Restart error: {e}")
+    else:
+        msg += "\n(No active worker to restart, but spec is updated for next run)"
+        print("   ℹ️ No active worker - spec updated for next run")
+    
+    print("")
+    print("═══════════════════════════════════════════════════════════════")
+    print("")
+    
+    return json.dumps({"success": True, "message": msg})
+
+
 # Gap #7 Fix: Secret Detection Regex
 SECRET_PATTERNS = [
     r'api_key\s*=\s*["\'][^"\']{20,}["\']',
@@ -2939,7 +3018,7 @@ async def run_autonomous_loop(task_id: int, project_profile: str = None) -> dict
     Wires all agents together in sequence:
     1. Fetch Task -> 2. Worker -> 3. Pre-Flight -> 4. Dual QA -> 5. Product Owner
     
-    This closes Gaps #1, #2, #5 by actually calling each phase.
+    v8.5: Now supports Hot Swap (task tracking + CancelledError handling)
     
     Args:
         task_id: The task ID to execute
@@ -2948,6 +3027,12 @@ async def run_autonomous_loop(task_id: int, project_profile: str = None) -> dict
     Returns:
         Dict with loop status and results from each phase
     """
+    global CURRENT_RUNNING_TASK_ID, CURRENT_WORKER_TASK_OBJ
+    
+    # v8.5: Track this task for Hot Swap
+    CURRENT_RUNNING_TASK_ID = task_id
+    CURRENT_WORKER_TASK_OBJ = asyncio.current_task()
+    
     print(f"\n🔄 ═══════════════════════════════════════════")
     print(f"   AUTONOMOUS LOOP: Task #{task_id}")
     print(f"   ═══════════════════════════════════════════\n")
@@ -3114,11 +3199,30 @@ if __name__ == "__main__":
         
         return results
         
+    except asyncio.CancelledError:
+        # v8.5: Hot Swap interruption
+        print(f"\n🛑 ═══════════════════════════════════════════")
+        print(f"   HOT SWAP: Task #{task_id} Interrupted")
+        print(f"   Restarting with updated context...")
+        print(f"   ═══════════════════════════════════════════\n")
+        
+        results["status"] = "INTERRUPTED"
+        results["message"] = "Hot Swapped - restarting with new spec"
+        
+        # Re-raise so asyncio handles the exit cleanly
+        raise
+        
     except Exception as e:
         print(f"\n❌ LOOP ERROR: {e}")
         results["status"] = "ERROR"
         results["message"] = str(e)
         return results
+    
+    finally:
+        # v8.5: Cleanup tracking on any exit
+        if CURRENT_RUNNING_TASK_ID == task_id:
+            CURRENT_RUNNING_TASK_ID = None
+            CURRENT_WORKER_TASK_OBJ = None
 
 
 def run_autonomous_loop_sync(task_id: int, project_profile: str = None) -> dict:

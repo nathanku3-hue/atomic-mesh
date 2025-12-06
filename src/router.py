@@ -78,6 +78,14 @@ FAST_PATH_PATTERNS = [
     (r"^decision:\s*(.+)$", "CONTEXT_SET", "add_decision", lambda m: {"content": m.group(1)}),
     (r"^blocker:\s*(.+)$", "CONTEXT_SET", "add_blocker", lambda m: {"content": m.group(1)}),
     (r"^note:\s*(.+)$", "CONTEXT_SET", "add_note", lambda m: {"content": m.group(1)}),
+    
+    # v8.5 HOT SWAP - User corrections that should interrupt the Worker
+    # "No, use Blue instead" → Cancel current task, update spec, restart
+    (r"^no,\s+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
+    (r"^wrong,?\s+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
+    (r"^actually[,\s]+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
+    (r"^instead[,\s]+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
+    (r"^change it[,\s]+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
 ]
 
 # Pronoun patterns for resolution

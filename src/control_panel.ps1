@@ -204,6 +204,32 @@ function Show-Header {
     Write-Host "│" -ForegroundColor Cyan
     
     Write-Host "└$line┘" -ForegroundColor Cyan
+    
+    # --- v8.5 DECISION TICKER ---
+    $LogPath = Join-Path (Get-Location) "docs\DECISION_LOG.md"
+    if (Test-Path $LogPath) {
+        # Get last 3 entries that start with '|' and contain a number (ignoring headers)
+        $Entries = Get-Content $LogPath | Where-Object { $_ -match "^\|\s*\d+" } | Select-Object -Last 3
+        
+        if ($Entries -and $Entries.Count -gt 0) {
+            Write-Host "┌─ RECENT DECISIONS ─$("─" * ($width - 22))┐" -ForegroundColor DarkGray
+            
+            foreach ($Row in $Entries) {
+                # Format: Clean up pipes and spacing, limit width
+                $Clean = $Row -replace "\|", " " -replace "\s+", " " 
+                $Clean = $Clean.Trim()
+                $maxLen = $width - 4
+                if ($Clean.Length -gt $maxLen) { $Clean = $Clean.Substring(0, $maxLen - 3) + "..." }
+                $rowPad = $width - 3 - $Clean.Length
+                if ($rowPad -lt 0) { $rowPad = 0 }
+                Write-Host "│ $Clean" -NoNewline -ForegroundColor Gray
+                Write-Host (" " * $rowPad) -NoNewline
+                Write-Host "│" -ForegroundColor DarkGray
+            }
+            
+            Write-Host "└$("─" * ($width - 2))┘" -ForegroundColor DarkGray
+        }
+    }
 }
 
 # ============================================================================
