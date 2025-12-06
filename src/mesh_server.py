@@ -16,7 +16,27 @@ MILESTONE_FILE = ".milestone_date"
 # Server startup time for uptime tracking
 SERVER_START_TIME = time.time()
 
+# =============================================================================
+# DREAM TEAM MODEL CONFIGURATION (v7.8)
+# =============================================================================
+# Logic Cluster: GPT-5.1/4o for Backend, Librarian, QA1, Commander
+MODEL_LOGIC_MAX = os.getenv("MODEL_LOGIC_MAX", "gpt-4o")
+
+# Creative Cluster: Claude Sonnet for Frontend, QA2
+MODEL_CREATIVE_FAST = os.getenv("MODEL_CREATIVE_FAST", "claude-3-5-sonnet-20241022")
+
+# The Heavy: Claude Opus for complex refactoring
+MODEL_REASONING_ULTRA = os.getenv("MODEL_REASONING_ULTRA", "claude-3-5-opus-20241022")
+
+# Complexity triggers for Opus escalation
+COMPLEXITY_TRIGGERS = [
+    "refactor", "rewrite", "migrate", "architecture",
+    "redesign", "microservices", "overhaul", "rebuild",
+    "from scratch", "entire system", "major change"
+]
+
 mcp = FastMCP("AtomicMesh")
+
 
 # FIX #4: Input Validation Helpers
 def validate_task_id(task_id: int) -> bool:
@@ -1149,6 +1169,186 @@ def get_decision_log() -> str:
         return f"[DECISION LOG]\n\n{content}"
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# =============================================================================
+# DREAM TEAM MODEL ROUTING (v7.8)
+# =============================================================================
+
+@mcp.tool()
+def get_model_for_role(role: str, complexity: str = "normal") -> str:
+    """
+    Routes to the optimal SOTA model based on agent role and task complexity.
+    
+    The Dream Team:
+      - Logic Cluster (GPT-5.1/4o): Backend, Librarian, QA1, Commander
+      - Creative Cluster (Sonnet): Frontend, QA2
+      - The Heavy (Opus): Complex refactoring tasks
+    
+    Args:
+        role: Agent role (backend, frontend, qa1, qa2, librarian, commander)
+        complexity: Task complexity ("normal" or "high")
+    
+    Returns:
+        JSON with selected model and reasoning.
+    """
+    role_lower = role.lower()
+    
+    # The Heavy for complex tasks
+    if complexity == "high":
+        return json.dumps({
+            "model": MODEL_REASONING_ULTRA,
+            "role": role,
+            "tier": "The Heavy",
+            "reason": "Complex task requiring deep reasoning (Opus)"
+        })
+    
+    # Role-based routing
+    # Logic Cluster (GPT)
+    if role_lower in ["backend", "librarian", "qa1", "commander", "orchestrator", "auditor"]:
+        return json.dumps({
+            "model": MODEL_LOGIC_MAX,
+            "role": role,
+            "tier": "Logic Cluster",
+            "reason": "Hard logic, security, architecture (GPT)"
+        })
+    
+    # Creative Cluster (Claude Sonnet)
+    if role_lower in ["frontend", "qa2", "writer", "designer"]:
+        return json.dumps({
+            "model": MODEL_CREATIVE_FAST,
+            "role": role,
+            "tier": "Creative Cluster",
+            "reason": "Visuals, style, readability (Sonnet)"
+        })
+    
+    # Default fallback
+    return json.dumps({
+        "model": MODEL_LOGIC_MAX,
+        "role": role,
+        "tier": "Default",
+        "reason": "Unknown role, using Logic Cluster"
+    })
+
+@mcp.tool()
+def analyze_complexity(user_input: str) -> str:
+    """
+    Analyzes task complexity to determine if The Heavy (Opus) is needed.
+    
+    Looks for trigger words like "refactor", "rewrite", "migrate", etc.
+    Also considers prompt length as a heuristic.
+    
+    Args:
+        user_input: The user's task description
+    
+    Returns:
+        JSON with complexity level and detected triggers.
+    """
+    input_lower = user_input.lower()
+    detected_triggers = []
+    
+    # Check for trigger phrases
+    for trigger in COMPLEXITY_TRIGGERS:
+        if trigger in input_lower:
+            detected_triggers.append(trigger)
+    
+    # Word count heuristic
+    word_count = len(user_input.split())
+    long_prompt = word_count > 150
+    
+    # Multiple file mentions
+    file_mentions = sum(1 for ext in [".py", ".ts", ".tsx", ".js", ".jsx", ".sql"] 
+                       if ext in input_lower)
+    
+    # Determine complexity
+    if detected_triggers or long_prompt or file_mentions >= 3:
+        complexity = "high"
+        recommended_model = MODEL_REASONING_ULTRA
+        reason = "Complex task detected"
+    else:
+        complexity = "normal"
+        recommended_model = None
+        reason = "Standard task"
+    
+    return json.dumps({
+        "complexity": complexity,
+        "triggers_found": detected_triggers,
+        "word_count": word_count,
+        "file_mentions": file_mentions,
+        "recommended_model": recommended_model,
+        "reason": reason
+    }, indent=2)
+
+@mcp.tool()
+def get_model_roster() -> str:
+    """
+    Returns the current Dream Team model configuration.
+    
+    Shows which models are assigned to which roles.
+    """
+    return json.dumps({
+        "version": "7.8",
+        "name": "Dream Team",
+        "roster": {
+            "logic_cluster": {
+                "model": MODEL_LOGIC_MAX,
+                "roles": ["backend", "librarian", "qa1", "commander", "auditor"],
+                "specialization": "Hard logic, security, architecture"
+            },
+            "creative_cluster": {
+                "model": MODEL_CREATIVE_FAST,
+                "roles": ["frontend", "qa2", "writer"],
+                "specialization": "Visuals, style, readability"
+            },
+            "the_heavy": {
+                "model": MODEL_REASONING_ULTRA,
+                "trigger": "complexity=high",
+                "specialization": "Complex refactoring, architecture redesign"
+            }
+        },
+        "qa_protocol": {
+            "qa1": {
+                "name": "The Compiler",
+                "model": MODEL_LOGIC_MAX,
+                "focus": "Security, types, architecture"
+            },
+            "qa2": {
+                "name": "The Critic",
+                "model": MODEL_CREATIVE_FAST,
+                "focus": "Readability, style, spaghetti detection"
+            }
+        }
+    }, indent=2)
+
+@mcp.tool()
+def request_dual_qa(code_content: str, context: str = "") -> str:
+    """
+    Submits code for Dual QA review (Zero-Spaghetti Protocol).
+    
+    Code must pass BOTH:
+      - QA1 (Compiler): Hard logic checks
+      - QA2 (Critic): Style/readability checks
+    
+    Args:
+        code_content: The code to review
+        context: Optional context about the code
+    
+    Returns:
+        JSON with QA result (APPROVED/REJECTED) and issues.
+    
+    Note: This is a placeholder for the async Dual QA.
+    Full implementation requires LLM client integration.
+    """
+    # This is a stub - actual implementation in qa_protocol.py
+    return json.dumps({
+        "status": "PENDING",
+        "message": "Dual QA request queued",
+        "qa1_model": MODEL_LOGIC_MAX,
+        "qa2_model": MODEL_CREATIVE_FAST,
+        "code_length": len(code_content),
+        "context": context or "No context provided",
+        "note": "Full Dual QA requires async LLM integration"
+    }, indent=2)
 
 
 def get_mode() -> str:

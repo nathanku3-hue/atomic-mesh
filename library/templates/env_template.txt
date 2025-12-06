@@ -23,6 +23,22 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 
 # =============================================================================
+# ATOMIC MESH v7.8 - DREAM TEAM MODEL CONFIGURATION
+# =============================================================================
+
+# Logic Cluster: GPT-5.1/4o for Backend, Librarian, QA1, Commander
+# Use the best available logic model
+MODEL_LOGIC_MAX=gpt-4o
+
+# Creative Cluster: Claude Sonnet for Frontend, QA2
+# Use the best available creative model
+MODEL_CREATIVE_FAST=claude-3-5-sonnet-20241022
+
+# The Heavy: Claude Opus for complex refactoring tasks
+# Only triggered for high-complexity tasks (refactor, rewrite, migrate)
+MODEL_REASONING_ULTRA=claude-3-5-opus-20241022
+
+# =============================================================================
 # APPLICATION
 # =============================================================================
 APP_ENV=development
