@@ -58,6 +58,7 @@ QA1_CHECKS = [
 ]
 
 QA2_CHECKS = [
+    # Style Quality
     "Is variable naming descriptive (not x, temp, data)?",
     "Is function length reasonable (< 50 lines)?",
     "Is code DRY (Don't Repeat Yourself)?",
@@ -66,6 +67,21 @@ QA2_CHECKS = [
     "Are magic numbers explained with constants?",
     "Are complex sections commented?",
     "Does the code 'smell' clean?",
+    
+    # v8.4.1 YAGNI PROTOCOL (Minimum Necessity)
+    "YAGNI: Is there speculative generality (code for 'future use cases' that don't exist)?",
+    "YAGNI: Is there premature abstraction (helpers/services for logic used only once)?",
+    "YAGNI: Are there over-typed complex Generics<T> where simple types work?",
+    "YAGNI: Is there ghost code (commented out code, unused imports)?",
+    "YAGNI: Were unnecessary files/directories created 'just in case'?",
+]
+
+QA2_FAIL_ON = [
+    "Speculative generality - code written for imaginary future requirements",
+    "Premature abstraction - extracted function/class used exactly once",
+    "Helper file with single function that should be inlined",
+    "Config for single value that should be a constant",
+    "Ghost code - commented blocks or unused imports",
 ]
 
 # =============================================================================

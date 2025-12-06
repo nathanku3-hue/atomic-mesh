@@ -89,6 +89,9 @@ $Global:Commands = [ordered]@{
     
     # v8.2 DIAGNOSTICS
     "doctor"    = @{ Desc = "run system health check (Gap #3)" }
+    
+    # v8.4.1 SPEC ANALYSIS
+    "refine"    = @{ Desc = "analyze ACTIVE_SPEC.md for ambiguities" }
 }
 
 
@@ -1207,6 +1210,72 @@ print(consult_standard('$cmdArgs', '$profile'))
             else {
                 Write-Host "  STATUS: 🔴 ISSUES DETECTED" -ForegroundColor Red
             }
+            Write-Host ""
+        }
+        
+        # === v8.4.1 SPEC LINTER ===
+        "refine" {
+            Write-Host ""
+            Write-Host "  🧐 SPEC LINTER (v8.4.1)" -ForegroundColor Cyan
+            Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host ""
+            
+            $specPath = Join-Path (Get-Location) "docs\ACTIVE_SPEC.md"
+            
+            if (-not (Test-Path $specPath)) {
+                Write-Host "  ❌ No ACTIVE_SPEC.md found." -ForegroundColor Red
+                Write-Host "     Run /init first to create spec template." -ForegroundColor Gray
+                return
+            }
+            
+            Write-Host "  Analyzing: docs/ACTIVE_SPEC.md" -ForegroundColor Gray
+            Write-Host ""
+            
+            # Run Python spec linter
+            try {
+                $result = & python -c "from spec_linter import run_spec_linter_sync; print(run_spec_linter_sync())" 2>&1
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host $result -ForegroundColor Yellow
+                }
+                else {
+                    # Fallback: Simple local analysis
+                    $specContent = Get-Content $specPath -Raw
+                    $issues = @()
+                    
+                    $patterns = @(
+                        @{Pattern = "should"; Reason = "Vague - does this mean 'must'?" }
+                        @{Pattern = "etc"; Reason = "Incomplete list - what else?" }
+                        @{Pattern = "appropriate"; Reason = "Subjective - define criteria" }
+                        @{Pattern = "somehow"; Reason = "Implementation unclear" }
+                        @{Pattern = "various"; Reason = "Which ones specifically?" }
+                    )
+                    
+                    foreach ($p in $patterns) {
+                        if ($specContent -match $p.Pattern) {
+                            $issues += "  ⚠️ Found '$($p.Pattern)': $($p.Reason)"
+                        }
+                    }
+                    
+                    if ($issues.Count -gt 0) {
+                        Write-Host "  Found $($issues.Count) potential ambiguities:" -ForegroundColor Yellow
+                        Write-Host ""
+                        foreach ($issue in $issues) {
+                            Write-Host $issue -ForegroundColor DarkYellow
+                        }
+                    }
+                    else {
+                        Write-Host "  ✅ No obvious ambiguities detected." -ForegroundColor Green
+                    }
+                }
+            }
+            catch {
+                Write-Host "  ⚠️ Linter error: $_" -ForegroundColor Yellow
+            }
+            
+            Write-Host ""
+            Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host "  TIP: Update docs/ACTIVE_SPEC.md to resolve queries." -ForegroundColor Gray
             Write-Host ""
         }
         

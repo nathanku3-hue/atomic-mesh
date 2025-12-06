@@ -229,6 +229,40 @@ Pattern: PLAN → PEEK (max {max_peeks}) → BUILD → VALIDATE
 Choose your references wisely, then EXECUTE.
 """
 
+
+# =============================================================================
+# v8.4.1 YAGNI PROTOCOL (Minimum Necessity)
+# =============================================================================
+# This guardrail penalizes over-engineering and speculative coding.
+# "You Ain't Gonna Need It" - only build what's explicitly required.
+
+SIMPLEX_RULE = """
+[MINIMUM NECESSITY PROTOCOL - YAGNI]
+You Ain't Gonna Need It. Write the simplest code that works.
+
+STRICT RULES:
+1. ❌ NO "just in case" code: Don't create files, classes, or functions for "future use"
+2. ❌ NO premature abstraction: If logic is used ONCE, inline it. Don't extract to a helper.
+3. ❌ NO over-typing: Use simple types. Avoid complex Generics<T> unless truly needed.
+4. ❌ NO ghost code: No commented-out code. No unused imports.
+
+SIMPLICITY CHECKS:
+- If a function is < 5 lines and used once → INLINE IT
+- If a class has only one method → MAKE IT A FUNCTION  
+- If a helper file has one function → PUT IT IN THE CALLER
+- If a config has one value → JUST USE A CONSTANT
+
+PHILOSOPHY:
+- "Boring code" is GOOD code. Clever code is a liability.
+- Complexity is a bug, not a feature.
+- The user asked for X. Build X. Nothing more.
+
+WHEN IN DOUBT:
+Ask: "Does the ACTIVE_SPEC.md explicitly require this?" 
+If NO → Don't build it.
+"""
+
+
 # =============================================================================
 # COMBINED GUARDRAILS
 # =============================================================================
@@ -236,6 +270,8 @@ Choose your references wisely, then EXECUTE.
 def get_worker_guardrails(task_prompt: str = "") -> str:
     """
     Returns combined guardrails for Worker agents.
+    
+    v8.4.1: Now includes SIMPLEX_RULE (YAGNI Protocol)
     
     Args:
         task_prompt: Used to determine dynamic limits
@@ -245,7 +281,11 @@ def get_worker_guardrails(task_prompt: str = "") -> str:
     """
     limits = get_dynamic_limits(task_prompt) if task_prompt else {"max_peeks": 3}
     
-    return CONTEXT7_GUARDRAIL + "\n\n" + get_efficiency_rule(limits.get("max_peeks", 3))
+    return (
+        CONTEXT7_GUARDRAIL + "\n\n" + 
+        get_efficiency_rule(limits.get("max_peeks", 3)) + "\n\n" +
+        SIMPLEX_RULE
+    )
 
 def get_full_guardrails(task_prompt: str) -> Dict:
     """
