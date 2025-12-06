@@ -86,6 +86,9 @@ $Global:Commands = [ordered]@{
     "refresh"   = @{ Desc = "refresh the display" }
     "clear"     = @{ Desc = "clear the console screen" }
     "quit"      = @{ Desc = "exit Atomic Mesh"; Alias = @("q", "exit") }
+    
+    # v8.2 DIAGNOSTICS
+    "doctor"    = @{ Desc = "run system health check (Gap #3)" }
 }
 
 
@@ -454,6 +457,17 @@ function Invoke-SlashCommand {
             $action = if ($args) { $args.Split(" ")[0] } else { "status" }
             switch ($action) {
                 "scan" { 
+                    # Gap #4 Fix: Git Guard
+                    $gitStatus = git status --porcelain 2>&1
+                    if (-not [string]::IsNullOrWhiteSpace($gitStatus)) {
+                        Write-Host "  🔴 BLOCKED: Git working tree is dirty." -ForegroundColor Red
+                        Write-Host "     Commit or stash changes before running Librarian." -ForegroundColor Gray
+                        Write-Host ""
+                        Write-Host "     Changed files:" -ForegroundColor Yellow
+                        $gitStatus -split "`n" | ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
+                        return
+                    }
+                    
                     Write-Host "  📚 Starting Librarian scan..." -ForegroundColor Cyan
                     Write-Host "  (Use MCP tool: librarian_scan)" -ForegroundColor Gray
                 }
@@ -1080,6 +1094,120 @@ print(consult_standard('$cmdArgs', '$profile'))
             catch {
                 Write-Host "  ⚠️ Test execution error: $_" -ForegroundColor Yellow
             }
+        }
+        
+        # === v8.2 DIAGNOSTICS (Gap #3 Fix) ===
+        "doctor" {
+            Write-Host ""
+            Write-Host "  🏥 ATOMIC MESH DOCTOR (v8.2)" -ForegroundColor Cyan
+            Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+            Write-Host ""
+            
+            $allGreen = $true
+            
+            # 1. Check Database
+            Write-Host "  Database:" -NoNewline
+            if (Test-Path $env:ATOMIC_MESH_DB) {
+                Write-Host " 🟢 OK" -ForegroundColor Green -NoNewline
+                Write-Host " ($env:ATOMIC_MESH_DB)" -ForegroundColor Gray
+            }
+            else {
+                Write-Host " 🔴 NOT FOUND" -ForegroundColor Red
+                $allGreen = $false
+            }
+            
+            # 2. Check Python
+            Write-Host "  Python:" -NoNewline
+            try {
+                $pyVer = & python --version 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host " 🟢 OK" -ForegroundColor Green -NoNewline
+                    Write-Host " ($pyVer)" -ForegroundColor Gray
+                }
+                else {
+                    Write-Host " 🔴 ERROR" -ForegroundColor Red
+                    $allGreen = $false
+                }
+            }
+            catch {
+                Write-Host " 🔴 NOT FOUND" -ForegroundColor Red
+                $allGreen = $false
+            }
+            
+            # 3. Check WAL Mode
+            Write-Host "  DB Mode:" -NoNewline
+            try {
+                $walCheck = & python -c "import sqlite3; print(sqlite3.connect('$env:ATOMIC_MESH_DB').execute('PRAGMA journal_mode').fetchone()[0])" 2>&1
+                if ($walCheck -eq "wal") {
+                    Write-Host " 🟢 WAL Enabled" -ForegroundColor Green
+                }
+                else {
+                    Write-Host " 🟡 $walCheck" -ForegroundColor Yellow -NoNewline
+                    Write-Host " (should be WAL)" -ForegroundColor Gray
+                }
+            }
+            catch {
+                Write-Host " ⚠️ Could not check" -ForegroundColor Yellow
+            }
+            
+            # 4. Check MCP Module
+            Write-Host "  MCP Library:" -NoNewline
+            try {
+                $mcpCheck = & python -c "import mcp; print('ok')" 2>&1
+                if ($mcpCheck -eq "ok") {
+                    Write-Host " 🟢 OK" -ForegroundColor Green
+                }
+                else {
+                    Write-Host " 🔴 MISSING" -ForegroundColor Red -NoNewline
+                    Write-Host " (pip install mcp)" -ForegroundColor Gray
+                    $allGreen = $false
+                }
+            }
+            catch {
+                Write-Host " 🔴 MISSING" -ForegroundColor Red
+                $allGreen = $false
+            }
+            
+            # 5. Check Git Status
+            Write-Host "  Git:" -NoNewline
+            try {
+                $gitStatus = git status --porcelain 2>&1
+                if ([string]::IsNullOrWhiteSpace($gitStatus)) {
+                    Write-Host " 🟢 Clean" -ForegroundColor Green
+                }
+                else {
+                    $changeCount = ($gitStatus -split "`n").Count
+                    Write-Host " 🟡 $changeCount uncommitted changes" -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host " ⚠️ Not a git repo" -ForegroundColor Yellow
+            }
+            
+            # 6. Check Core Modules
+            Write-Host "  Modules:" -NoNewline
+            $modules = @("qa_protocol", "product_owner", "guardrails")
+            $modOk = $true
+            foreach ($mod in $modules) {
+                $modCheck = & python -c "import $mod; print('ok')" 2>&1
+                if ($modCheck -ne "ok") { $modOk = $false }
+            }
+            if ($modOk) {
+                Write-Host " 🟢 All loaded" -ForegroundColor Green
+            }
+            else {
+                Write-Host " 🟡 Some missing" -ForegroundColor Yellow
+            }
+            
+            Write-Host ""
+            Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+            if ($allGreen) {
+                Write-Host "  STATUS: 🟢 HEALTHY" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  STATUS: 🔴 ISSUES DETECTED" -ForegroundColor Red
+            }
+            Write-Host ""
         }
         
         # === VIEWS ===
