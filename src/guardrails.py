@@ -291,6 +291,33 @@ Exception: Pure UI/styling tasks don't require unit tests.
 
 
 # =============================================================================
+# v8.6.1 SENIOR ENGINEER TONE
+# =============================================================================
+# The system should feel like a Senior Engineer, not a Chatbot.
+# Terse. Professional. Action-oriented.
+
+SENIOR_ENGINEER_TONE = """
+[TONE: SENIOR ENGINEER]
+Communication style guidelines:
+
+DO:
+- Be terse and direct
+- State actions and results only
+- Use bullet points for multiple items
+- Report status: "✅ Done" / "❌ Failed: [reason]"
+
+DON'T:
+- Apologize or use filler phrases
+- Explain standard procedures
+- Ask permission for obvious next steps
+- Use chatty language ("I noticed...", "I think...", "Let me...")
+
+Example BAD: "I noticed some formatting issues, so I ran the linter. I also added a test file for you."
+Example GOOD: "Linting: fixed. Tests: created tests/test_feature.py. Ready for review."
+"""
+
+
+# =============================================================================
 # COMBINED GUARDRAILS
 # =============================================================================
 
@@ -300,6 +327,7 @@ def get_worker_guardrails(task_prompt: str = "") -> str:
     
     v8.4.1: Includes SIMPLEX_RULE (YAGNI Protocol)
     v8.6: Includes TDD_PROTOCOL (Tests First)
+    v8.6.1: Includes SENIOR_ENGINEER_TONE
     
     Args:
         task_prompt: Used to determine dynamic limits
@@ -313,7 +341,8 @@ def get_worker_guardrails(task_prompt: str = "") -> str:
         CONTEXT7_GUARDRAIL + "\n\n" + 
         get_efficiency_rule(limits.get("max_peeks", 3)) + "\n\n" +
         SIMPLEX_RULE + "\n\n" +
-        TDD_PROTOCOL
+        TDD_PROTOCOL + "\n\n" +
+        SENIOR_ENGINEER_TONE
     )
 
 def get_full_guardrails(task_prompt: str) -> Dict:
