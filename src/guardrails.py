@@ -318,32 +318,97 @@ Example GOOD: "Linting: fixed. Tests: created tests/test_feature.py. Ready for r
 
 
 # =============================================================================
+# v9.0 CITATION PROTOCOL (Compliance Engineering)
+# =============================================================================
+# Every core function MUST cite its source from CODE_BOOK.md
+
+CITATION_PROTOCOL = """
+[CITATION PROTOCOL - MANDATORY FOR COMPLIANCE]
+Every core logic function MUST include a citation in its docstring.
+
+REQUIRED FORMAT:
+```python
+def calculate_penalty(days_late: int) -> float:
+    '''
+    @citation 4.2.3
+    
+    Implements: Section 4.2.3 - Late Payment Penalties
+    Logic: 1.5% per day, capped at 15% maximum
+    '''
+    ...
+```
+
+THE SYSTEM WILL:
+1. Parse all @citation tags
+2. Verify cited sections exist in docs/CODE_BOOK.md
+3. REJECT code missing citations or citing non-existent sections
+
+This enables full traceability for audits.
+"""
+
+
+# =============================================================================
+# v9.0 CLOSED WORLD RULE (Compliance Engineering)
+# =============================================================================
+# Prohibits use of external knowledge not in project docs
+
+CLOSED_WORLD_RULE = """
+[CLOSED WORLD ASSUMPTION - STRICT]
+You are PROHIBITED from using knowledge not found in these documents:
+- docs/CODE_BOOK.md (The Law)
+- docs/DOMAIN_RULES.md (The Constitution)
+- docs/TECH_STACK.md (Approved Technologies)
+
+WHEN KNOWLEDGE IS MISSING:
+- DO NOT improvise or use "common sense"
+- DO NOT infer from similar patterns
+- MUST raise: "Undefined Domain State: [description]"
+- MUST flag for human review
+
+FORBIDDEN:
+- External knowledge from training data
+- "Industry standard" patterns not in docs
+- "Best practices" not explicitly approved
+
+THE LAW IS THE CODE BOOK. NOTHING ELSE.
+"""
+
+
+# =============================================================================
 # COMBINED GUARDRAILS
 # =============================================================================
 
-def get_worker_guardrails(task_prompt: str = "") -> str:
+def get_worker_guardrails(task_prompt: str = "", compliance_mode: bool = False) -> str:
     """
     Returns combined guardrails for Worker agents.
     
     v8.4.1: Includes SIMPLEX_RULE (YAGNI Protocol)
     v8.6: Includes TDD_PROTOCOL (Tests First)
     v8.6.1: Includes SENIOR_ENGINEER_TONE
+    v9.0: Includes CITATION_PROTOCOL + CLOSED_WORLD_RULE (if compliance_mode)
     
     Args:
         task_prompt: Used to determine dynamic limits
+        compliance_mode: If True, adds strict compliance rules
     
     Returns:
         Combined guardrail prompts
     """
     limits = get_dynamic_limits(task_prompt) if task_prompt else {"max_peeks": 3}
     
-    return (
+    base_guardrails = (
         CONTEXT7_GUARDRAIL + "\n\n" + 
         get_efficiency_rule(limits.get("max_peeks", 3)) + "\n\n" +
         SIMPLEX_RULE + "\n\n" +
         TDD_PROTOCOL + "\n\n" +
         SENIOR_ENGINEER_TONE
     )
+    
+    # v9.0: Add compliance rules if enabled
+    if compliance_mode:
+        base_guardrails += "\n\n" + CITATION_PROTOCOL + "\n\n" + CLOSED_WORLD_RULE
+    
+    return base_guardrails
 
 def get_full_guardrails(task_prompt: str) -> Dict:
     """

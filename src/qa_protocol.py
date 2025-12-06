@@ -25,6 +25,20 @@ import shutil
 from typing import Dict, List, Optional
 from datetime import datetime
 
+# v9.0: Compliance Suite Integration
+try:
+    from compliance_tools import (
+        run_compliance_checks,
+        verify_import_whitelist,
+        verify_citations,
+        log_compliance_incident,
+        append_traceability
+    )
+    COMPLIANCE_ENABLED = True
+except ImportError:
+    COMPLIANCE_ENABLED = False
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -75,15 +89,29 @@ QA2_CHECKS = [
     "YAGNI: Are there over-typed complex Generics<T> where simple types work?",
     "YAGNI: Is there ghost code (commented out code, unused imports)?",
     "YAGNI: Were unnecessary files/directories created 'just in case'?",
+    
+    # v9.0 SCOPE COP (Gold Plating Detector)
+    "SCOPE: Did the worker add helper functions not required by the strict spec?",
+    "SCOPE: Did the worker handle edge cases that the spec defines as 'Impossible'?",
+    "SCOPE: Is there 'extra' logic (retry mechanisms, auto-recovery) not in spec?",
+    "SCOPE: Did the worker add 'nice to have' error messages not specified?",
 ]
 
 QA2_FAIL_ON = [
+    # YAGNI Violations
     "Speculative generality - code written for imaginary future requirements",
     "Premature abstraction - extracted function/class used exactly once",
     "Helper file with single function that should be inlined",
     "Config for single value that should be a constant",
     "Ghost code - commented blocks or unused imports",
+    
+    # v9.0 SCOPE COP Violations (Critical for Compliance)
+    "Gold Plating - feature added that is not in ACTIVE_SPEC.md",
+    "Scope Creep - handling edge case marked 'Impossible' in CODE_BOOK.md",
+    "Unauthorized convenience feature - auto-retry, friendly errors not specified",
+    "Logic Divergence - implementation differs from cited rule",
 ]
+
 
 # =============================================================================
 # PRE-FLIGHT TESTS (v8.0)
