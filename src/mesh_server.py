@@ -2775,40 +2775,129 @@ def check_references(file_path: str, project_root: str) -> str:
 import re
 import asyncio
 
-# Gap #1 Fix: LLM Client Factory
-class LocalLLMClient:
+# =============================================================================
+# v8.3 CLI WRAPPER (The Live Wire)
+# =============================================================================
+# Wraps existing CLI tools (codex, claude) to power the Agents.
+# Zero new dependencies - uses subprocess to call your existing binaries.
+# This means QA uses the SAME auth/config as your Workers.
+
+class CLIBasedLLM:
     """
-    Factory for LLM client. In production, wraps OpenAI/Anthropic SDK.
-    For testing, can return mock responses.
+    Wraps local CLI tools (codex, claude) to power the Agents.
+    Uses the OS Shell as a Universal API Client.
     """
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-        self._mock_mode = not bool(self.api_key)
     
     async def generate_json(self, model: str, system: str, user: str) -> dict:
         """
-        Generates JSON response from LLM.
-        In mock mode, returns simulated PASS response for testing.
-        """
-        if self._mock_mode:
-            # Mock response for testing without API keys
-            print(f"   [MOCK LLM] Model: {model[:20]}...")
-            return {
-                "status": "PASS",
-                "score": 85,
-                "issues": [],
-                "summary": "Mock QA - Configure API keys for real analysis"
-            }
+        Executes the CLI command and robustly parses the output as JSON.
         
-        # TODO: Implement real API calls
-        # from openai import AsyncOpenAI
-        # client = AsyncOpenAI(api_key=self.api_key)
-        # ...
-        return {"status": "PASS", "issues": [], "summary": "API integration pending"}
+        Args:
+            model: Model identifier (routes to codex or claude based on name)
+            system: System prompt
+            user: User message / code to review
+        
+        Returns:
+            Parsed JSON dict from model response
+        """
+        # 1. Combine Prompt - CLIs usually take one string argument
+        # Enforce JSON output strictly in the prompt
+        full_prompt = (
+            f"{system}\n\n"
+            f"USER REQUEST:\n{user}\n\n"
+            "CRITICAL INSTRUCTION: Output ONLY valid JSON. No markdown, no prose, no explanation."
+        )
+        
+        # 2. Select Command based on Model/Role
+        cmd = []
+        if "claude" in model.lower():
+            # Use Anthropic CLI
+            # Flag --print ensures stdout only
+            cmd = ["claude", "--print", full_prompt]
+        else:
+            # Default to OpenAI/Codex CLI
+            # 'codex exec' is your existing command
+            cmd = ["codex", "exec", full_prompt]
+            
+        print(f"    🔌 CLI: {cmd[0]} → {model[:30]}...")
 
-def get_llm_client() -> LocalLLMClient:
-    """Factory function for LLM client."""
-    return LocalLLMClient()
+        # 3. Execute via Subprocess
+        try:
+            # Run with timeout to prevent zombie processes
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                encoding='utf-8',
+                timeout=120,
+                shell=False  # Security: don't use shell
+            )
+            
+            if result.returncode != 0:
+                print(f"    ❌ CLI Error (Code {result.returncode}):")
+                if result.stderr:
+                    print(f"       {result.stderr[:200]}...")
+                return {"status": "FAIL", "issues": ["CLI tool execution failed"], "score": 0}
+
+            # 4. Clean & Parse JSON
+            raw_output = result.stdout.strip()
+            return self._clean_and_parse_json(raw_output)
+
+        except subprocess.TimeoutExpired:
+            print("    ❌ CLI Timed Out (120s)")
+            return {"status": "FAIL", "issues": ["Model timeout - 120s exceeded"], "score": 0}
+        except FileNotFoundError as e:
+            print(f"    ❌ CLI Not Found: {cmd[0]}")
+            print(f"       Ensure '{cmd[0]}' is in your PATH")
+            return {"status": "FAIL", "issues": [f"CLI tool '{cmd[0]}' not found"], "score": 0}
+        except Exception as e:
+            print(f"    ❌ Wrapper Error: {e}")
+            return {"status": "FAIL", "issues": [str(e)], "score": 0}
+
+    def _clean_and_parse_json(self, text: str) -> dict:
+        """
+        Extracts JSON from potentially chatty CLI output.
+        Handles markdown code blocks and other common patterns.
+        """
+        if not text:
+            return {"status": "FAIL", "issues": ["Empty response from model"], "score": 0}
+
+        # Attempt 1: Direct Parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+            
+        # Attempt 2: Extract from markdown code blocks ```json ... ```
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                pass
+        
+        # Attempt 3: Naive brace finding (First { to Last })
+        try:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                json_str = text[start:end]
+                return json.loads(json_str)
+        except:
+            pass
+            
+        # Failure - log truncated output for debugging
+        print(f"    ⚠️ Could not parse JSON. Raw output:\n{text[:300]}...")
+        return {"status": "FAIL", "issues": ["Output parsing failed (Invalid JSON)"], "score": 0}
+
+
+# GLOBAL SINGLETON - The Live Wire
+# This effectively wires the server to your existing CLI tools
+llm = CLIBasedLLM()
+
+def get_llm_client() -> CLIBasedLLM:
+    """Factory function returns global CLI-based LLM client."""
+    return llm
 
 
 # Gap #7 Fix: Secret Detection Regex
