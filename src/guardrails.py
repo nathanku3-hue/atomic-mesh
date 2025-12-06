@@ -264,6 +264,33 @@ If NO → Don't build it.
 
 
 # =============================================================================
+# v8.6 TDD 2.0 PROTOCOL (Vibe Coding Norm)
+# =============================================================================
+# Enforces Test-Driven Development: Tests FIRST, Code SECOND
+# This ensures quality isn't an afterthought.
+
+TDD_PROTOCOL = """
+[TDD 2.0 PROTOCOL - MANDATORY]
+You MUST follow this sequence for every logic task:
+
+1. **THINK:** Design the Unit Tests first (consider edge cases)
+2. **WRITE:** Create test file FIRST: tests/test_<feature>.py
+3. **WRITE:** Create implementation: src/<feature>.py
+4. **VERIFY:** Run tests to confirm implementation works
+
+TEST REQUIREMENTS:
+- Cover happy path + at least 2 edge cases
+- Include error cases (invalid input, missing data)
+- Mock external dependencies (API calls, DB)
+
+NEVER write implementation without a corresponding test file.
+If the task is "Add login" → First write tests/test_login.py
+
+Exception: Pure UI/styling tasks don't require unit tests.
+"""
+
+
+# =============================================================================
 # COMBINED GUARDRAILS
 # =============================================================================
 
@@ -271,7 +298,8 @@ def get_worker_guardrails(task_prompt: str = "") -> str:
     """
     Returns combined guardrails for Worker agents.
     
-    v8.4.1: Now includes SIMPLEX_RULE (YAGNI Protocol)
+    v8.4.1: Includes SIMPLEX_RULE (YAGNI Protocol)
+    v8.6: Includes TDD_PROTOCOL (Tests First)
     
     Args:
         task_prompt: Used to determine dynamic limits
@@ -284,7 +312,8 @@ def get_worker_guardrails(task_prompt: str = "") -> str:
     return (
         CONTEXT7_GUARDRAIL + "\n\n" + 
         get_efficiency_rule(limits.get("max_peeks", 3)) + "\n\n" +
-        SIMPLEX_RULE
+        SIMPLEX_RULE + "\n\n" +
+        TDD_PROTOCOL
     )
 
 def get_full_guardrails(task_prompt: str) -> Dict:

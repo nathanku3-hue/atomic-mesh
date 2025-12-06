@@ -21,6 +21,7 @@ import os
 import json
 import asyncio
 import subprocess
+import shutil
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -113,6 +114,8 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
     """
     Runs local test suite based on project profile.
     
+    v8.6: Now includes AUTO-FORMATTING before tests (Gap #2)
+    
     Args:
         project_profile: The project profile (e.g., "python_backend")
     
@@ -121,6 +124,34 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
     """
     if not project_profile:
         project_profile = detect_project_type()
+    
+    # =========================================================================
+    # v8.6 GAP #2: AUTO-FORMATTING (Runs BEFORE tests)
+    # =========================================================================
+    # Cost: 0 tokens, <1 second
+    # Saves: 500-1000 tokens on QA2 formatting complaints
+    # =========================================================================
+    print("🧹 Pre-Flight: Running Auto-Formatters...")
+    try:
+        if "python" in project_profile:
+            # Ruff: Fast Python formatter + linter
+            if shutil.which("ruff"):
+                subprocess.run("ruff format . --quiet", shell=True, capture_output=True, timeout=30)
+                subprocess.run("ruff check --fix --quiet .", shell=True, capture_output=True, timeout=30)
+                print("   ✅ Python formatted (ruff)")
+            else:
+                print("   ⚠️ ruff not installed (pip install ruff)")
+                
+        elif "typescript" in project_profile or "node" in project_profile:
+            # Prettier: Standard TS/JS formatter
+            if os.path.exists("package.json"):
+                subprocess.run("npx prettier --write . --log-level warn", shell=True, capture_output=True, timeout=60)
+                print("   ✅ TypeScript formatted (prettier)")
+    except subprocess.TimeoutExpired:
+        print("   ⚠️ Formatter timed out (continuing)")
+    except Exception as e:
+        print(f"   ⚠️ Formatter warning: {e}")
+    # =========================================================================
     
     config = load_preflight_config()
     test_commands = config.get("test_commands", {})

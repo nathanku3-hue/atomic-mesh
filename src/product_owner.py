@@ -170,6 +170,100 @@ def update_changelog(task_desc: str) -> Dict:
     return {"updated": True, "entry": entry}
 
 # =============================================================================
+# v8.6 CONVENTIONAL COMMITS (Vibe Coding Norm)
+# =============================================================================
+# Git log should read like a history book.
+# Format: type(scope): subject
+
+COMMIT_TYPE_PATTERNS = [
+    # (keywords, type, scope_guess)
+    (["feat", "feature", "add", "implement", "create", "build", "new"], "feat", None),
+    (["fix", "bug", "patch", "resolve", "correct"], "fix", None),
+    (["doc", "docs", "readme", "comment"], "docs", None),
+    (["style", "css", "ui", "format", "spacing"], "style", "ui"),
+    (["refactor", "restructure", "reorganize", "clean"], "refactor", None),
+    (["perf", "performance", "speed", "optimize"], "perf", None),
+    (["test", "spec", "coverage"], "test", None),
+    (["chore", "config", "setup", "upgrade", "version"], "chore", None),
+]
+
+def detect_commit_type(task_desc: str) -> tuple:
+    """
+    Detects the semantic commit type from task description.
+    Returns: (type, scope)
+    """
+    task_lower = task_desc.lower()
+    
+    for keywords, commit_type, scope_guess in COMMIT_TYPE_PATTERNS:
+        if any(kw in task_lower for kw in keywords):
+            # Try to extract scope from common patterns
+            scope = scope_guess
+            if "auth" in task_lower:
+                scope = "auth"
+            elif "api" in task_lower:
+                scope = "api"
+            elif "db" in task_lower or "database" in task_lower:
+                scope = "db"
+            elif "ui" in task_lower or "component" in task_lower:
+                scope = "ui"
+            return commit_type, scope
+    
+    return "chore", None
+
+def generate_conventional_commit(task_desc: str, files_changed: list = None) -> str:
+    """
+    Generates a Conventional Commit message from task description.
+    
+    Format: type(scope): subject
+    Types: feat, fix, docs, style, refactor, perf, test, chore
+    
+    Args:
+        task_desc: The task description
+        files_changed: Optional list of changed files (for scope detection)
+    
+    Returns:
+        Conventional commit message string
+    
+    Example:
+        "Add JWT login support" → "feat(auth): add jwt login support"
+    """
+    commit_type, scope = detect_commit_type(task_desc)
+    
+    # Try to infer scope from file paths if not detected
+    if not scope and files_changed:
+        for f in files_changed:
+            if "auth" in f.lower():
+                scope = "auth"
+                break
+            elif "api" in f.lower():
+                scope = "api"
+                break
+            elif "component" in f.lower() or "ui" in f.lower():
+                scope = "ui"
+                break
+    
+    # Clean up subject (lowercase, no period)
+    subject = task_desc.strip()
+    if subject.endswith('.'):
+        subject = subject[:-1]
+    
+    # Remove common prefixes that are redundant with type
+    for prefix in ["add", "fix", "implement", "create", "build", "update"]:
+        if subject.lower().startswith(prefix + " "):
+            subject = subject[len(prefix):].strip()
+            break
+    
+    # Lowercase subject per convention
+    subject = subject[0].lower() + subject[1:] if subject else ""
+    
+    # Format
+    if scope:
+        return f"{commit_type}({scope}): {subject}"
+    else:
+        return f"{commit_type}: {subject}"
+
+
+# =============================================================================
 # MAIN SYNC FUNCTION
 # =============================================================================
 
@@ -215,11 +309,19 @@ def run_product_sync(task_desc: str, qa_status: str, files_changed: List[str] = 
     else:
         print("   ⏭️ PO: No documentation updates needed")
     
+    # =========================================================================
+    # v8.6 GAP #3: CONVENTIONAL COMMIT SUGGESTION
+    # =========================================================================
+    commit_msg = generate_conventional_commit(task_desc, files_changed or [])
+    print(f"   📝 Suggested Commit: {commit_msg}")
+    # =========================================================================
+    
     return {
         "synced": True,
         "changes": changes,
         "spec_updated": spec_result.get("updated", False),
-        "changelog_updated": log_result.get("updated", False)
+        "changelog_updated": log_result.get("updated", False),
+        "suggested_commit": commit_msg
     }
 
 # =============================================================================
