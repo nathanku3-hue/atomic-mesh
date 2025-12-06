@@ -1,6 +1,7 @@
 # C:\Tools\atomic-mesh\librarian_tools.py
 # THE LIBRARIAN - File System Safety Tools
 # Features: Secret scanning, symlink protection, restore points, reference checking
+# v8.4: Path Traversal Guard
 
 import os
 import re
@@ -10,6 +11,70 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# =============================================================================
+# v8.4 SECURITY: PATH TRAVERSAL GUARD
+# =============================================================================
+# CRITICAL: Prevents Path Traversal (../) attacks.
+# Without this, a hallucinating agent could escape project_root and
+# delete C:\Windows, ~/.ssh, or other critical system files.
+
+def validate_path_safety(target_path: str, project_root: str = None) -> str:
+    """
+    SECURITY GUARD: Prevents Path Traversal (../) attacks.
+    
+    Args:
+        target_path: The path to validate (can be relative or absolute)
+        project_root: The allowed root directory (defaults to cwd)
+    
+    Returns:
+        Absolute path if safe
+        
+    Raises:
+        ValueError: If path escapes project_root (traversal attack detected)
+    """
+    if project_root is None:
+        project_root = os.getcwd()
+        
+    # Resolve absolute paths
+    abs_root = os.path.abspath(project_root)
+    
+    # Handle both relative and absolute target paths
+    if os.path.isabs(target_path):
+        abs_target = os.path.abspath(target_path)
+    else:
+        abs_target = os.path.abspath(os.path.join(abs_root, target_path))
+    
+    # Check if target is actually inside root
+    # os.path.commonpath is the safest cross-platform way
+    try:
+        common = os.path.commonpath([abs_root, abs_target])
+    except ValueError:
+        # Happens on Windows if drives are different (C: vs D:)
+        raise ValueError(f"🚨 SECURITY BLOCK: Target on different drive '{abs_target}'")
+
+    if common != abs_root:
+        raise ValueError(f"🚨 SECURITY BLOCK: Path traversal attempt detected '{target_path}' → '{abs_target}'")
+    
+    # Additional check: detect explicit .. in path
+    if '..' in target_path:
+        # Even if commonpath passes, we block explicit .. for safety
+        raise ValueError(f"🚨 SECURITY BLOCK: Explicit '..' in path is forbidden '{target_path}'")
+        
+    return abs_target
+
+
+def is_path_safe(target_path: str, project_root: str = None) -> bool:
+    """
+    Non-throwing version of validate_path_safety.
+    Returns True if path is safe, False otherwise.
+    """
+    try:
+        validate_path_safety(target_path, project_root)
+        return True
+    except ValueError:
+        return False
+
 
 # === CONFIGURATION ===
 
@@ -850,6 +915,8 @@ def execute_move_with_import_fix(from_path: str, to_path: str, project_root: str
     """
     Move file and fix BOTH external callers AND internal imports.
     Complete bi-directional path repair.
+    
+    v8.4: Added path traversal guard.
     """
     result = {
         "success": False,
@@ -858,6 +925,15 @@ def execute_move_with_import_fix(from_path: str, to_path: str, project_root: str
         "errors": [],
         "rollback_needed": False
     }
+    
+    # v8.4 SECURITY: Validate paths before any operation
+    try:
+        validate_path_safety(from_path, project_root)
+        validate_path_safety(to_path, project_root)
+    except ValueError as e:
+        result["errors"].append(str(e))
+        print(f"    {e}")
+        return result
     
     # 1. Check references (external callers)
     refs = check_file_references(from_path, project_root)
