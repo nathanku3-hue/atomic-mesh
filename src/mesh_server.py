@@ -1360,10 +1360,13 @@ def request_dual_qa(code_content: str, original_task: str = "", project_profile:
 @mcp.tool()
 def dispatch_to_worker(task: str, project_profile: str, worker_type: str = "backend") -> str:
     """
-    v8.0 Dispatch with Profile Injection (Patch 1).
+    v8.1 Dispatch with Dynamic Tiered Guardrails.
     
-    Dispatches task to Worker with EXPLICIT profile context.
-    Worker cannot claim "I didn't know the tech stack."
+    Features:
+      - Profile Injection (v8.0 Patch 1)
+      - Dynamic context limits based on complexity
+      - Context7 version guardrail
+      - Adaptive peek limits
     
     Args:
         task: The task description
@@ -1371,8 +1374,25 @@ def dispatch_to_worker(task: str, project_profile: str, worker_type: str = "back
         worker_type: Type of worker ("backend" or "frontend")
     
     Returns:
-        JSON with dispatch confirmation and context.
+        JSON with dispatch confirmation, guardrails, and dynamic limits.
     """
+    # Import guardrails module
+    try:
+        from guardrails import get_dynamic_limits, get_worker_guardrails, truncate_context
+        guardrails_available = True
+    except ImportError:
+        guardrails_available = False
+    
+    # Get dynamic limits based on task complexity
+    if guardrails_available:
+        limits = get_dynamic_limits(task)
+        complexity = limits.get("complexity", "normal")
+        guardrail_prompts = get_worker_guardrails(task)
+    else:
+        limits = {"max_spec_chars": 15000, "max_peeks": 3}
+        complexity = "normal"
+        guardrail_prompts = ""
+    
     # Load profile standards
     profile_path = os.path.join(LIBRARY_ROOT, "profiles", f"{project_profile}.json")
     standards = {}
@@ -1381,8 +1401,13 @@ def dispatch_to_worker(task: str, project_profile: str, worker_type: str = "back
         with open(profile_path, 'r') as f:
             standards = json.load(f)
     
-    # Determine model based on worker type
-    model = MODEL_LOGIC_MAX if worker_type == "backend" else MODEL_CREATIVE_FAST
+    # Determine model based on complexity and worker type
+    if complexity == "high":
+        model = MODEL_REASONING_ULTRA  # Use Opus for high complexity
+    elif worker_type == "backend":
+        model = MODEL_LOGIC_MAX
+    else:
+        model = MODEL_CREATIVE_FAST
     
     return json.dumps({
         "dispatched": True,
@@ -1391,12 +1416,28 @@ def dispatch_to_worker(task: str, project_profile: str, worker_type: str = "back
         "model": model,
         "project_profile": project_profile,
         "standards": list(standards.get("standards", {}).keys()),
+        
+        # v8.1 Dynamic Guardrails
+        "guardrails": {
+            "complexity": complexity,
+            "tier_description": limits.get("description", "Standard"),
+            "max_spec_chars": limits.get("max_spec_chars", 15000),
+            "max_standard_chars": limits.get("max_standard_chars", 10000),
+            "max_peeks": limits.get("max_peeks", 3),
+            "context7_guardrail": "ENABLED (style-not-syntax)",
+            "efficiency_rule": f"{limits.get('max_peeks', 3)}-PEEK LIMIT"
+        },
+        
         "instructions": [
             f"PROJECT PROFILE: {project_profile}",
+            f"COMPLEXITY TIER: {complexity.upper()} ({limits.get('description', 'Standard')})",
+            f"PEEK LIMIT: {limits.get('max_peeks', 3)} reference lookups max",
             "BEFORE CODING: Call consult_standard('architecture', profile)",
-            "BEFORE IMPORTING: Call get_tech_stack() to verify allowed libraries",
-            "AFTER CODING: Code will go through Dual QA with intent verification"
-        ]
+            "BEFORE IMPORTING: Call get_tech_stack() - adapt references to your versions",
+            "AFTER CODING: Code goes through Pre-Flight + Dual QA with intent verification"
+        ],
+        
+        "guardrail_prompts": guardrail_prompts
     }, indent=2)
 
 
@@ -1420,6 +1461,74 @@ def run_preflight_check(project_profile: str = "") -> str:
         "profile_used": project_profile or "auto-detected",
         "timestamp": datetime.now().isoformat()
     }, indent=2)
+
+
+@mcp.tool()
+def get_guardrails(task: str = "") -> str:
+    """
+    v8.1: Returns active guardrails and dynamic limits for a task.
+    
+    Shows:
+      - Complexity tier (low/normal/high)
+      - Context window limits
+      - Peek limits
+      - Context7 safety rules
+    
+    Args:
+        task: Task description (for dynamic tier calculation)
+    
+    Returns:
+        JSON with all active guardrails.
+    """
+    try:
+        from guardrails import get_full_guardrails
+        guardrails = get_full_guardrails(task or "sample task")
+    except ImportError:
+        guardrails = {
+            "error": "guardrails.py not found",
+            "fallback": {
+                "complexity": "normal",
+                "max_peeks": 3,
+                "max_spec_chars": 15000
+            }
+        }
+    
+    return json.dumps({
+        "version": "8.1",
+        "guardrails": guardrails,
+        "task_analyzed": task[:100] if task else "No task provided",
+        "features": [
+            "Dynamic Tiered Limits",
+            "Context7 Version Guardrail",
+            "Smart Context Truncation",
+            "Adaptive Peek Limits"
+        ]
+    }, indent=2)
+
+
+@mcp.tool()
+def truncate_content(content: str, max_chars: int = 10000) -> str:
+    """
+    v8.1: Smart content truncation to prevent context bombing.
+    
+    Uses Head+Tail strategy to keep most important parts.
+    
+    Args:
+        content: Content to truncate
+        max_chars: Maximum characters to keep
+    
+    Returns:
+        Truncated content with [SNIPPED] marker if needed.
+    """
+    try:
+        from guardrails import truncate_context
+        return truncate_context(content, max_chars)
+    except ImportError:
+        # Fallback implementation
+        if len(content) <= max_chars:
+            return content
+        half = max_chars // 2
+        return content[:half] + "\n...[SNIPPED]...\n" + content[-half:]
 
 
 def get_mode() -> str:
