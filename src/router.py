@@ -1,6 +1,7 @@
 # C:\Tools\atomic-mesh\router.py
 # SEMANTIC ROUTER - The Pre-Frontal Cortex of Atomic Mesh v7.4
 # Features: Fast Path regex, Smart Path LLM with Timeout, Pronoun Resolution
+# v8.5.1: Pre-compiled regex for O(1) pattern matching
 
 import os
 import re
@@ -21,6 +22,8 @@ SMART_PATH_TIMEOUT = float(os.getenv("ROUTER_TIMEOUT", "3.0"))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SemanticRouter")
 
+# v8.5.1: Pre-compile regex patterns at module load
+# This converts O(n) re.match() per route to O(1) compiled lookup
 # Fast Path Patterns (No LLM needed - instant response)
 # Format: (pattern, intent, action, param_extractor)
 FAST_PATH_PATTERNS = [
@@ -88,12 +91,21 @@ FAST_PATH_PATTERNS = [
     (r"^change it[,\s]+(.+)$", "AGENT_DIRECT", "hot_swap", lambda m: {"instruction": m.group(0)}),
 ]
 
+# v8.5.1: Pre-compile patterns at module load (O(1) vs O(n) per route)
+COMPILED_FAST_PATH_PATTERNS = [
+    (re.compile(pattern, re.IGNORECASE), intent, action, extractor)
+    for pattern, intent, action, extractor in FAST_PATH_PATTERNS
+]
+
 # Pronoun patterns for resolution
 PRONOUN_PATTERNS = [
     r"\b(it|that|this)\b",
     r"\b(the task|current task)\b",
     r"\b(last one|previous)\b",
 ]
+
+# Pre-compiled pronoun patterns
+COMPILED_PRONOUN_PATTERNS = [re.compile(p, re.IGNORECASE) for p in PRONOUN_PATTERNS]
 
 
 @dataclass
@@ -292,11 +304,19 @@ class SemanticRouter:
         return result
     
     def _fast_path(self, text: str) -> Optional[RouteResult]:
-        """Try to match input against Fast Path patterns."""
+        """
+        Try to match input against Fast Path patterns.
+        
+        v8.5.1: Uses pre-compiled patterns for O(1) matching.
+        """
         text_lower = text.lower()
         
-        for pattern, intent, action, param_extractor in FAST_PATH_PATTERNS:
-            match = re.match(pattern, text_lower if intent != "CONTEXT_SET" else text, re.IGNORECASE)
+        # v8.5.1: Use pre-compiled patterns (compiled_pattern.match() vs re.match())
+        for compiled_pattern, intent, action, param_extractor in COMPILED_FAST_PATH_PATTERNS:
+            # CONTEXT_SET needs original case, others use lowercase
+            target_text = text if intent == "CONTEXT_SET" else text_lower
+            match = compiled_pattern.match(target_text)
+            
             if match:
                 params = None
                 if param_extractor:
