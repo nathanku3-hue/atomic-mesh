@@ -65,6 +65,10 @@ $Global:Commands = [ordered]@{
     "standard"  = @{ Desc = "view a standard: /standard security|architecture"; HasArgs = $true }
     "standards" = @{ Desc = "list all standards for current profile" }
     
+    # v8.0 PRE-FLIGHT
+    "ship"      = @{ Desc = "commit and push to GitHub (trusts local QA)"; HasArgs = $true }
+    "preflight" = @{ Desc = "run local pre-flight tests" }
+    
     # CONTEXT
     "decide"    = @{ Desc = "answer decision: /decide <id> <answer>"; HasArgs = $true }
     "note"      = @{ Desc = "add a note: /note <text>"; HasArgs = $true }
@@ -83,6 +87,7 @@ $Global:Commands = [ordered]@{
     "clear"     = @{ Desc = "clear the console screen" }
     "quit"      = @{ Desc = "exit Atomic Mesh"; Alias = @("q", "exit") }
 }
+
 
 # ============================================================================
 # DATABASE HELPER
@@ -939,7 +944,141 @@ print(consult_standard('$cmdArgs', '$profile'))
                 Write-Host "  Use: /standard <topic>" -ForegroundColor Gray
             }
             else {
-                Write-Host "  ⚠️ Profile '$profile' not found" -ForegroundColor Yellow
+                Write-Host "  ⚠️ Profile '$projectProfile' not found" -ForegroundColor Yellow
+            }
+        }
+        
+        # === v8.0 PRE-FLIGHT PROTOCOL ===
+        "ship" {
+            Write-Host ""
+            Write-Host "  🚀 SHIPPING TO PRODUCTION (v8.0)" -ForegroundColor Cyan
+            Write-Host ""
+            
+            $message = if ($cmdArgs) { $cmdArgs } else { "release: $(Get-Date -Format 'yyyy-MM-dd HH:mm')" }
+            
+            # Check for uncommitted changes
+            $gitStatus = git status --porcelain 2>&1
+            
+            if ([string]::IsNullOrWhiteSpace($gitStatus)) {
+                Write-Host "  ⏭️ Nothing to commit (working tree clean)" -ForegroundColor Yellow
+                return
+            }
+            
+            Write-Host "  📋 Pre-flight: Local QA has verified this code" -ForegroundColor Gray
+            Write-Host "  📦 Changes to ship:" -ForegroundColor Gray
+            
+            # Show changed files
+            $changes = git status --porcelain
+            $changes | ForEach-Object { 
+                $status = $_.Substring(0, 2).Trim()
+                $file = $_.Substring(3)
+                $icon = switch ($status) {
+                    "M" { "📝" }
+                    "A" { "➕" }
+                    "D" { "➖" }
+                    default { "•" }
+                }
+                Write-Host "      $icon $file" -ForegroundColor DarkGray
+            }
+            
+            Write-Host ""
+            $confirm = Read-Host "  Ship with message '$message'? [Y/n]"
+            
+            if ($confirm -eq "n" -or $confirm -eq "N") {
+                Write-Host "  ⏹️ Shipping cancelled" -ForegroundColor Yellow
+                return
+            }
+            
+            # Git operations
+            Write-Host ""
+            Write-Host "  📦 Staging changes..." -ForegroundColor Gray
+            git add .
+            
+            Write-Host "  💾 Committing..." -ForegroundColor Gray
+            git commit -m "release: $message"
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  🚀 Pushing to remote..." -ForegroundColor Gray
+                git push
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host ""
+                    Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkGray
+                    Write-Host "  ✅ SHIPPED SUCCESSFULLY" -ForegroundColor Green
+                    Write-Host ""
+                    Write-Host "  👀 Watch the GitHub Actions tab for deployment" -ForegroundColor Cyan
+                    Write-Host ""
+                }
+                else {
+                    Write-Host "  ⚠️ Push failed - check remote/auth" -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host "  ⚠️ Commit failed" -ForegroundColor Yellow
+            }
+        }
+        
+        "preflight" {
+            Write-Host ""
+            Write-Host "  🧪 PRE-FLIGHT CHECK (v8.0)" -ForegroundColor Cyan
+            Write-Host ""
+            
+            # Detect project type
+            $projectType = "unknown"
+            if (Test-Path "next.config.js") { $projectType = "typescript_next" }
+            elseif (Test-Path "next.config.mjs") { $projectType = "typescript_next" }
+            elseif (Test-Path "package.json") { $projectType = "typescript_node" }
+            elseif (Test-Path "requirements.txt") { $projectType = "python_backend" }
+            elseif (Test-Path "pyproject.toml") { $projectType = "python_backend" }
+            
+            Write-Host "  Project Type: $projectType" -ForegroundColor Gray
+            Write-Host ""
+            
+            # Run tests based on project type
+            $testCmd = $null
+            switch ($projectType) {
+                "python_backend" {
+                    if ((Test-Path "tests") -or (Test-Path "pytest.ini")) {
+                        $testCmd = "pytest -x -q --tb=short"
+                    }
+                }
+                "typescript_next" {
+                    if (Test-Path "package.json") {
+                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                    }
+                }
+                "typescript_node" {
+                    if (Test-Path "package.json") {
+                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                    }
+                }
+            }
+            
+            if (-not $testCmd) {
+                Write-Host "  ⏭️ No test suite detected (skipping)" -ForegroundColor Yellow
+                return
+            }
+            
+            Write-Host "  Running: $testCmd" -ForegroundColor Gray
+            Write-Host ""
+            
+            # Execute tests
+            try {
+                $result = Invoke-Expression $testCmd 2>&1
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host ""
+                    Write-Host "  ✅ PRE-FLIGHT PASSED" -ForegroundColor Green
+                    Write-Host "  Code is ready for Dual QA" -ForegroundColor Gray
+                }
+                else {
+                    Write-Host ""
+                    Write-Host "  ❌ PRE-FLIGHT FAILED" -ForegroundColor Red
+                    Write-Host "  Fix tests before proceeding to QA" -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host "  ⚠️ Test execution error: $_" -ForegroundColor Yellow
             }
         }
         

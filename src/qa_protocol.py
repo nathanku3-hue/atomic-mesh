@@ -1,20 +1,46 @@
 """
-Atomic Mesh v7.8 - Dual QA Protocol
-The "Zero-Spaghetti" Code Quality System
+Atomic Mesh v8.0 - Dual QA Protocol
+The "Zero-Spaghetti" Code Quality System with Pre-Flight Tests
 
 This module implements the Double-Blind QA Protocol:
-  QA1 (The Compiler): Hard logic - security, types, architecture
+  QA1 (The Compiler): Hard logic - security, types, architecture + INTENT CHECK
   QA2 (The Critic): Soft logic - readability, style, spaghetti detection
 
-Code is only APPROVED when BOTH QA agents pass.
-This creates a "Swiss Cheese" defense - what one misses, the other catches.
+v8.0 ADDITIONS:
+  - Pre-Flight Tests: Run local tests before QA approval
+  - Intent Verification: QA checks if code fulfills ORIGINAL TASK (Patch 2)
+  - Profile Injection: Explicit project profile context
+
+Code is only APPROVED when:
+  1. Pre-flight tests pass
+  2. Both QA agents pass
+  3. Code fulfills the original task intent
 """
 
 import os
 import json
 import asyncio
+import subprocess
 from typing import Dict, List, Optional
 from datetime import datetime
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Load pre-flight config
+def load_preflight_config() -> Dict:
+    """Load pre-flight test configuration."""
+    config_path = os.path.join(os.path.dirname(__file__), "config", "preflight.json")
+    
+    # Try alternate paths
+    if not os.path.exists(config_path):
+        config_path = os.path.join(os.getcwd(), "atomic-mesh", "config", "preflight.json")
+    if not os.path.exists(config_path):
+        return {"test_commands": {}, "timeout_seconds": 120}
+    
+    with open(config_path, 'r') as f:
+        return json.load(f)
 
 # =============================================================================
 # QA CHECK DEFINITIONS
@@ -43,20 +69,151 @@ QA2_CHECKS = [
 ]
 
 # =============================================================================
-# QA AGENT DEFINITIONS
+# PRE-FLIGHT TESTS (v8.0)
 # =============================================================================
 
-def get_qa1_definition(model: str) -> Dict:
+def detect_project_type() -> str:
+    """Auto-detect project type based on files present."""
+    cwd = os.getcwd()
+    
+    if os.path.exists(os.path.join(cwd, "next.config.js")) or \
+       os.path.exists(os.path.join(cwd, "next.config.mjs")) or \
+       os.path.exists(os.path.join(cwd, "next.config.ts")):
+        return "typescript_next"
+    
+    if os.path.exists(os.path.join(cwd, "package.json")):
+        return "typescript_node"
+    
+    if os.path.exists(os.path.join(cwd, "requirements.txt")) or \
+       os.path.exists(os.path.join(cwd, "pyproject.toml")):
+        return "python_backend"
+    
+    if os.path.exists(os.path.join(cwd, "main.tf")):
+        return "infrastructure"
+    
+    return "general"
+
+def run_preflight_tests(project_profile: str = None) -> Dict:
     """
-    QA1: The Compiler
-    Uses GPT-5.1/GPT-4o for hard logic checks.
+    Runs local test suite based on project profile.
+    
+    Args:
+        project_profile: The project profile (e.g., "python_backend")
+    
+    Returns:
+        {"passed": bool, "message": str, "output": str}
     """
+    if not project_profile:
+        project_profile = detect_project_type()
+    
+    config = load_preflight_config()
+    test_commands = config.get("test_commands", {})
+    timeout = config.get("timeout_seconds", 120)
+    
+    profile_commands = test_commands.get(project_profile, {})
+    
+    # Skip if no tests configured or skip flag set
+    if not profile_commands or profile_commands.get("skip"):
+        return {"passed": True, "message": "No tests configured (skipped)", "output": ""}
+    
+    # Detect test command based on project files
+    cmd = None
+    
+    # Try unit tests first
+    if "unit" in profile_commands:
+        # Check if test files exist
+        if project_profile.startswith("python"):
+            if os.path.exists("tests") or os.path.exists("pytest.ini") or os.path.exists("conftest.py"):
+                cmd = profile_commands["unit"]
+        elif project_profile.startswith("typescript"):
+            if os.path.exists("package.json"):
+                # Check if test script exists
+                try:
+                    with open("package.json", 'r') as f:
+                        pkg = json.load(f)
+                        if "test" in pkg.get("scripts", {}):
+                            cmd = profile_commands["unit"]
+                except:
+                    pass
+    
+    if not cmd:
+        return {"passed": True, "message": "No test suite detected (skipped)", "output": ""}
+    
+    print(f"🧪 Pre-Flight: Running '{cmd}'...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=os.getcwd()
+        )
+        
+        if result.returncode == 0:
+            print("   ✅ Pre-Flight Tests Passed")
+            return {
+                "passed": True,
+                "message": "Tests Passed",
+                "output": result.stdout[:500] if result.stdout else ""
+            }
+        else:
+            error_output = result.stderr[:500] if result.stderr else result.stdout[:500]
+            print(f"   ❌ Pre-Flight Tests Failed")
+            return {
+                "passed": False,
+                "message": "Tests Failed",
+                "error": error_output,
+                "exit_code": result.returncode
+            }
+            
+    except subprocess.TimeoutExpired:
+        print(f"   ❌ Pre-Flight Tests Timed Out ({timeout}s)")
+        return {
+            "passed": False,
+            "message": f"Tests Timed Out ({timeout}s)",
+            "error": "Test execution exceeded timeout"
+        }
+    except Exception as e:
+        return {
+            "passed": False,
+            "message": f"Test execution error: {str(e)}",
+            "error": str(e)
+        }
+
+async def run_preflight_tests_async(project_profile: str = None) -> Dict:
+    """Async wrapper for run_preflight_tests."""
+    return run_preflight_tests(project_profile)
+
+# =============================================================================
+# QA AGENT DEFINITIONS (v8.0 - with Intent Check)
+# =============================================================================
+
+def get_qa1_definition(model: str, original_task_desc: str = None) -> Dict:
+    """
+    QA1: The Compiler + Intent Checker
+    
+    v8.0: Now includes INTENT VERIFICATION (Patch 2)
+    """
+    intent_check = ""
+    if original_task_desc:
+        intent_check = f"""
+CRITICAL FIRST CHECK - INTENT VERIFICATION:
+Before checking code quality, verify the code satisfies this User Request:
+"{original_task_desc}"
+
+If the code does NOT fulfill the request, FAIL immediately with issue:
+"Intent Mismatch: Code does not fulfill the original task."
+"""
+    
     return {
         "role": "QA1 (The Compiler)",
         "model": model,
         "personality": "Strict, unforgiving, security-focused. Like a compiler that rejects bad code.",
+        "intent_check": intent_check,
         "checks": QA1_CHECKS,
-        "fail_on": ["security vulnerability", "type error", "missing auth", "sql injection"]
+        "fail_on": ["security vulnerability", "type error", "missing auth", "sql injection", "intent mismatch"]
     }
 
 def get_qa2_definition(model: str) -> Dict:
@@ -79,18 +236,14 @@ def get_qa2_definition(model: str) -> Dict:
 async def run_qa_check(llm_client, prompt_def: Dict, code_content: str) -> Dict:
     """
     Executes a single QA pass using the specified model.
-    
-    Args:
-        llm_client: The LLM client with generate_json method
-        prompt_def: QA agent definition (role, model, checks)
-        code_content: The code to review
-    
-    Returns:
-        {"status": "PASS"|"FAIL", "issues": [...], "score": 0-100}
     """
+    intent_section = prompt_def.get('intent_check', '')
+    
     system_msg = f"""
 You are {prompt_def['role']}.
 {prompt_def.get('personality', '')}
+
+{intent_section}
 
 OBJECTIVE: Review the code below strictly against these criteria:
 {json.dumps(prompt_def['checks'], indent=2)}
@@ -113,8 +266,6 @@ Be thorough but fair. PASS means production-ready. FAIL means needs work.
 """
     
     try:
-        # This would call the actual LLM
-        # For now, return a mock response structure
         response = await llm_client.generate_json(
             model=prompt_def['model'],
             system=system_msg,
@@ -129,56 +280,90 @@ Be thorough but fair. PASS means production-ready. FAIL means needs work.
             "summary": f"QA execution error: {e}"
         }
 
+# =============================================================================
+# MAIN DUAL QA FUNCTION (v8.0)
+# =============================================================================
+
 async def perform_dual_qa(
     llm_client,
     code_content: str,
+    original_task_desc: str = None,  # v8.0: PATCH 2 - Intent injection
+    project_profile: str = None,      # v8.0: PATCH 1 - Profile injection
     context: str = "",
+    run_tests: bool = True,           # v8.0: Pre-flight control
     qa1_model: str = None,
     qa2_model: str = None
 ) -> Dict:
     """
-    The v7.8 Double-Blind QA Protocol.
+    v8.0 Double-Blind QA Protocol with Pre-Flight Tests + Intent Verification.
     
-    Runs code through both QA1 (hard logic) and QA2 (soft style) in parallel.
-    Code is APPROVED only if BOTH pass.
+    NEW in v8.0:
+      - Pre-flight tests run before QA
+      - Intent verification: QA checks if code fulfills original task
+      - Explicit project profile for context
     
     Args:
         llm_client: LLM client with generate_json method
         code_content: The code to review
-        context: Optional context (file type, purpose, etc.)
+        original_task_desc: The ORIGINAL task description (for intent check)
+        project_profile: Project profile (e.g., "python_backend")
+        context: Additional context
+        run_tests: Whether to run pre-flight tests
         qa1_model: Override model for QA1
         qa2_model: Override model for QA2
     
     Returns:
-        {
-            "status": "APPROVED"|"REJECTED",
-            "qa1_result": {...},
-            "qa2_result": {...},
-            "issues": [...],
-            "timestamp": "..."
-        }
+        {"status": "APPROVED"|"REJECTED", "issues": [...], ...}
     """
-    print("⚔️  Engaging Dual QA Protocol...")
+    
+    # =========================================================================
+    # PHASE 1: PRE-FLIGHT TESTS
+    # =========================================================================
+    
+    if run_tests:
+        print("🧪 Phase 1: Pre-Flight Tests...")
+        test_result = await run_preflight_tests_async(project_profile)
+        
+        if not test_result["passed"]:
+            return {
+                "status": "REJECTED",
+                "phase": "pre-flight",
+                "message": f"❌ Pre-Flight Tests Failed: {test_result.get('message')}",
+                "issues": [{
+                    "severity": "critical",
+                    "source": "Pre-Flight",
+                    "description": test_result.get("error", "Tests failed")
+                }],
+                "timestamp": datetime.now().isoformat()
+            }
+        print(f"   ✅ {test_result.get('message', 'Passed')}")
+    
+    # =========================================================================
+    # PHASE 2: DUAL QA (with Intent Check)
+    # =========================================================================
+    
+    print("⚔️  Phase 2: Engaging Dual QA Protocol...")
     
     # Get models from environment or use provided overrides
     if not qa1_model:
-        qa1_model = os.getenv("MODEL_LOGIC_MAX", "gpt-4o")
+        qa1_model = os.getenv("MODEL_LOGIC_MAX", "gpt-5.1-codex-max")
     if not qa2_model:
-        qa2_model = os.getenv("MODEL_CREATIVE_FAST", "claude-3-5-sonnet-20240620")
+        qa2_model = os.getenv("MODEL_CREATIVE_FAST", "claude-sonnet-4-5@20250929")
     
-    # Define the QA agents
-    qa1_def = get_qa1_definition(qa1_model)
+    # Define QA agents (v8.0: QA1 includes intent check)
+    qa1_def = get_qa1_definition(qa1_model, original_task_desc)
     qa2_def = get_qa2_definition(qa2_model)
     
     # Add context if provided
+    code_with_context = code_content
     if context:
         code_with_context = f"CONTEXT: {context}\n\n{code_content}"
-    else:
-        code_with_context = code_content
+    if project_profile:
+        code_with_context = f"PROJECT PROFILE: {project_profile}\n\n{code_with_context}"
     
     # Execute both QA checks in parallel
-    print(f"  → QA1 ({qa1_model}): Checking hard logic...")
-    print(f"  → QA2 ({qa2_model}): Checking style...")
+    print(f"   → QA1 ({qa1_model}): Logic + Intent...")
+    print(f"   → QA2 ({qa2_model}): Style...")
     
     results = await asyncio.gather(
         run_qa_check(llm_client, qa1_def, code_with_context),
@@ -201,17 +386,20 @@ async def perform_dual_qa(
     # Build response
     response = {
         "timestamp": datetime.now().isoformat(),
+        "phase": "dual-qa",
         "qa1_result": qa1_res,
         "qa2_result": qa2_res,
         "qa1_model": qa1_model,
         "qa2_model": qa2_model,
+        "original_task": original_task_desc,
+        "project_profile": project_profile,
     }
     
     if qa1_pass and qa2_pass:
         response["status"] = "APPROVED"
-        response["message"] = "✅ Logic & Style Verified by Dual QA"
+        response["message"] = "✅ Verified (Intent + Logic + Style)"
         response["issues"] = []
-        print("  ✅ CONSENSUS: APPROVED (Both QA passed)")
+        print("  ✅ CONSENSUS: APPROVED (Pre-Flight + Both QA passed)")
     else:
         response["status"] = "REJECTED"
         
@@ -247,15 +435,20 @@ async def perform_dual_qa(
     return response
 
 # =============================================================================
-# SYNCHRONOUS WRAPPER (for non-async contexts)
+# SYNCHRONOUS WRAPPER
 # =============================================================================
 
-def perform_dual_qa_sync(llm_client, code_content: str, context: str = "") -> Dict:
-    """
-    Synchronous wrapper for perform_dual_qa.
-    Use this in non-async contexts.
-    """
-    return asyncio.run(perform_dual_qa(llm_client, code_content, context))
+def perform_dual_qa_sync(
+    llm_client,
+    code_content: str,
+    original_task_desc: str = None,
+    project_profile: str = None,
+    context: str = ""
+) -> Dict:
+    """Synchronous wrapper for perform_dual_qa."""
+    return asyncio.run(perform_dual_qa(
+        llm_client, code_content, original_task_desc, project_profile, context
+    ))
 
 # =============================================================================
 # COMPLEXITY ANALYSIS
@@ -271,23 +464,16 @@ COMPLEXITY_TRIGGERS = [
 def analyze_complexity(user_input: str) -> str:
     """
     Heuristic to detect if task requires The Heavy (Opus).
-    
-    Returns:
-        "high" - Use Opus for complex architectural tasks
-        "normal" - Use standard model routing
     """
     input_lower = user_input.lower()
     
-    # Check for trigger phrases
     for trigger in COMPLEXITY_TRIGGERS:
         if trigger in input_lower:
             return "high"
     
-    # Word count heuristic (very long prompts often mean complex tasks)
     if len(user_input.split()) > 150:
         return "high"
     
-    # Multiple file mentions often mean complex refactoring
     file_mentions = sum(1 for ext in [".py", ".ts", ".tsx", ".js", ".jsx"] if ext in input_lower)
     if file_mentions >= 3:
         return "high"
@@ -295,39 +481,24 @@ def analyze_complexity(user_input: str) -> str:
     return "normal"
 
 # =============================================================================
-# MODEL ROUTING (Standalone version)
+# MODEL ROUTING
 # =============================================================================
 
 def get_model_for_role(role: str, complexity: str = "normal") -> str:
-    """
-    Routes to the optimal model based on role and complexity.
-    
-    Args:
-        role: Agent role (backend, frontend, qa1, qa2, etc.)
-        complexity: Task complexity ("normal" or "high")
-    
-    Returns:
-        Model identifier string
-    """
-    # Environment-based configuration - SOTA models only
+    """Routes to the optimal model based on role and complexity."""
     logic_max = os.getenv("MODEL_LOGIC_MAX", "gpt-5.1-codex-max")
     creative_fast = os.getenv("MODEL_CREATIVE_FAST", "claude-sonnet-4-5@20250929")
     reasoning_ultra = os.getenv("MODEL_REASONING_ULTRA", "claude-opus-4-5-20251101")
     
-    # The Heavy for complex tasks
     if complexity == "high":
         return reasoning_ultra
     
-    # Role-based routing
     role_lower = role.lower()
     
-    # Logic Cluster (GPT)
     if role_lower in ["backend", "librarian", "qa1", "commander", "orchestrator", "auditor"]:
         return logic_max
     
-    # Creative Cluster (Claude Sonnet)
     if role_lower in ["frontend", "qa2", "writer", "designer"]:
         return creative_fast
     
-    # Default fallback
     return logic_max

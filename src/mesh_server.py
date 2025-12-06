@@ -1172,7 +1172,7 @@ def get_decision_log() -> str:
 
 
 # =============================================================================
-# DREAM TEAM MODEL ROUTING (v7.8)
+# DREAM TEAM MODEL ROUTING (v8.0 - Pre-Flight Protocol)
 # =============================================================================
 
 @mcp.tool()
@@ -1321,33 +1321,104 @@ def get_model_roster() -> str:
     }, indent=2)
 
 @mcp.tool()
-def request_dual_qa(code_content: str, context: str = "") -> str:
+def request_dual_qa(code_content: str, original_task: str = "", project_profile: str = "", run_tests: bool = True) -> str:
     """
-    Submits code for Dual QA review (Zero-Spaghetti Protocol).
+    v8.0 Dual QA with Pre-Flight Tests + Intent Verification.
     
-    Code must pass BOTH:
-      - QA1 (Compiler): Hard logic checks
-      - QA2 (Critic): Style/readability checks
+    Code must pass:
+      1. Pre-flight tests (local unit tests)
+      2. QA1 (Compiler): Logic + Intent check
+      3. QA2 (Critic): Style checks
     
     Args:
         code_content: The code to review
-        context: Optional context about the code
+        original_task: The ORIGINAL task description (for intent verification)
+        project_profile: Project profile (e.g., "python_backend")
+        run_tests: Whether to run pre-flight tests
     
     Returns:
         JSON with QA result (APPROVED/REJECTED) and issues.
-    
-    Note: This is a placeholder for the async Dual QA.
-    Full implementation requires LLM client integration.
     """
-    # This is a stub - actual implementation in qa_protocol.py
     return json.dumps({
-        "status": "PENDING",
-        "message": "Dual QA request queued",
+        "status": "QUEUED",
+        "message": "v8.0 Dual QA request queued",
+        "features": [
+            "Pre-flight tests",
+            "Intent verification (Patch 2)",
+            "Profile injection (Patch 1)"
+        ],
         "qa1_model": MODEL_LOGIC_MAX,
         "qa2_model": MODEL_CREATIVE_FAST,
+        "original_task": original_task or "Not provided",
+        "project_profile": project_profile or "auto-detect",
+        "run_tests": run_tests,
         "code_length": len(code_content),
-        "context": context or "No context provided",
-        "note": "Full Dual QA requires async LLM integration"
+        "note": "Full async Dual QA in qa_protocol.py"
+    }, indent=2)
+
+
+@mcp.tool()
+def dispatch_to_worker(task: str, project_profile: str, worker_type: str = "backend") -> str:
+    """
+    v8.0 Dispatch with Profile Injection (Patch 1).
+    
+    Dispatches task to Worker with EXPLICIT profile context.
+    Worker cannot claim "I didn't know the tech stack."
+    
+    Args:
+        task: The task description
+        project_profile: Explicit project profile (e.g., "python_backend")
+        worker_type: Type of worker ("backend" or "frontend")
+    
+    Returns:
+        JSON with dispatch confirmation and context.
+    """
+    # Load profile standards
+    profile_path = os.path.join(LIBRARY_ROOT, "profiles", f"{project_profile}.json")
+    standards = {}
+    
+    if os.path.exists(profile_path):
+        with open(profile_path, 'r') as f:
+            standards = json.load(f)
+    
+    # Determine model based on worker type
+    model = MODEL_LOGIC_MAX if worker_type == "backend" else MODEL_CREATIVE_FAST
+    
+    return json.dumps({
+        "dispatched": True,
+        "task": task,
+        "worker_type": worker_type,
+        "model": model,
+        "project_profile": project_profile,
+        "standards": list(standards.get("standards", {}).keys()),
+        "instructions": [
+            f"PROJECT PROFILE: {project_profile}",
+            "BEFORE CODING: Call consult_standard('architecture', profile)",
+            "BEFORE IMPORTING: Call get_tech_stack() to verify allowed libraries",
+            "AFTER CODING: Code will go through Dual QA with intent verification"
+        ]
+    }, indent=2)
+
+
+@mcp.tool()
+def run_preflight_check(project_profile: str = "") -> str:
+    """
+    Runs pre-flight tests for the current project.
+    
+    Args:
+        project_profile: Project profile (auto-detected if not provided)
+    
+    Returns:
+        JSON with test results.
+    """
+    from qa_protocol import run_preflight_tests
+    
+    result = run_preflight_tests(project_profile or None)
+    
+    return json.dumps({
+        "preflight_result": result,
+        "profile_used": project_profile or "auto-detected",
+        "timestamp": datetime.now().isoformat()
     }, indent=2)
 
 

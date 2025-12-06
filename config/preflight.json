@@ -1,0 +1,59 @@
+{
+    "version": "8.0",
+    "description": "Pre-Flight test configuration for Atomic Mesh",
+    "test_commands": {
+        "python_backend": {
+            "unit": "pytest -x -q --tb=short",
+            "lint": "ruff check . --select=E,F",
+            "type": "mypy . --ignore-missing-imports"
+        },
+        "typescript_next": {
+            "unit": "npm test -- --passWithNoTests --watchAll=false",
+            "lint": "npm run lint",
+            "type": "npx tsc --noEmit"
+        },
+        "typescript_node": {
+            "unit": "npm test -- --passWithNoTests --watchAll=false",
+            "lint": "npm run lint",
+            "type": "npx tsc --noEmit"
+        },
+        "infrastructure": {
+            "validate": "terraform validate",
+            "lint": "terraform fmt -check"
+        },
+        "general": {
+            "skip": true
+        }
+    },
+    "detection": {
+        "python_backend": [
+            "requirements.txt",
+            "pyproject.toml",
+            "setup.py",
+            "main.py"
+        ],
+        "typescript_next": [
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.ts"
+        ],
+        "typescript_node": [
+            "package.json",
+            "tsconfig.json"
+        ],
+        "infrastructure": [
+            "main.tf",
+            "terraform.tf"
+        ]
+    },
+    "timeout_seconds": 120,
+    "fail_fast": true,
+    "skip_patterns": [
+        "*.md",
+        "*.json",
+        "*.yaml",
+        "*.yml",
+        "docs/*",
+        "*.txt"
+    ]
+}
