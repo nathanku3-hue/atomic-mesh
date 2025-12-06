@@ -683,10 +683,10 @@ function Invoke-SlashCommand {
             }
         }
         
-        # === LIBRARY (v7.6) ===
+        # === LIBRARY (v7.7 - Auto-Bootstrap) ===
         "init" {
             Write-Host ""
-            Write-Host "  📚 PROJECT INITIALIZATION" -ForegroundColor Cyan
+            Write-Host "  📚 PROJECT INITIALIZATION (v7.7)" -ForegroundColor Cyan
             Write-Host ""
             
             # Detect profile using Python
@@ -694,12 +694,13 @@ function Invoke-SlashCommand {
             try {
                 $pyScript = @"
 import sys
-sys.path.insert(0, r'$RepoRoot\src')
+sys.path.insert(0, r'$RepoRoot')
 from mesh_server import detect_project_profile
 print(detect_project_profile(r'$CurrentDir'))
 "@
                 $detectedProfile = $pyScript | python 2>$null
                 if (-not $detectedProfile) { $detectedProfile = "general" }
+                $detectedProfile = $detectedProfile.Trim()
             }
             catch {
                 Write-Host "  ⚠️ Detection failed, using 'general'" -ForegroundColor Yellow
@@ -754,7 +755,79 @@ print(detect_project_profile(r'$CurrentDir'))
             
             # Store profile in script context
             $script:CurrentProfile = $detectedProfile
-            Write-Host "  ✅ Initialization Complete" -ForegroundColor Green
+            
+            # === AUTO-BOOTSTRAP (v7.7) ===
+            Write-Host ""
+            Write-Host "  📦 BOOTSTRAPPING SEED PACKAGE..." -ForegroundColor Cyan
+            
+            $templatesDir = Join-Path $RepoRoot "library\templates"
+            $docsDir = Join-Path $CurrentDir "docs"
+            
+            # Create docs folder
+            if (-not (Test-Path $docsDir)) {
+                New-Item -ItemType Directory -Force -Path $docsDir | Out-Null
+            }
+            
+            # Template mapping
+            $templates = @{
+                "ACTIVE_SPEC.template.md"  = "docs\ACTIVE_SPEC.md"
+                "TECH_STACK.template.md"   = "docs\TECH_STACK.md"
+                "DECISION_LOG.template.md" = "docs\DECISION_LOG.md"
+                "env_template.txt"         = ".env.example"
+            }
+            
+            $created = @()
+            $skipped = @()
+            $projectName = Split-Path $CurrentDir -Leaf
+            $today = Get-Date -Format "yyyy-MM-dd"
+            
+            foreach ($src in $templates.Keys) {
+                $srcPath = Join-Path $templatesDir $src
+                $dstPath = Join-Path $CurrentDir $templates[$src]
+                
+                if (Test-Path $dstPath) {
+                    $skipped += $templates[$src]
+                    continue
+                }
+                
+                if (Test-Path $srcPath) {
+                    # Read template
+                    $content = Get-Content $srcPath -Raw -Encoding UTF8
+                    
+                    # Replace placeholders
+                    $content = $content -replace '\{\{PROJECT_NAME\}\}', $projectName
+                    $content = $content -replace '\{\{DATE\}\}', $today
+                    $content = $content -replace '\{\{AUTHOR\}\}', 'Atomic Mesh'
+                    
+                    # Ensure parent dir exists
+                    $parentDir = Split-Path $dstPath -Parent
+                    if (-not (Test-Path $parentDir)) {
+                        New-Item -ItemType Directory -Force -Path $parentDir | Out-Null
+                    }
+                    
+                    # Write file
+                    Set-Content -Path $dstPath -Value $content -Encoding UTF8
+                    $created += $templates[$src]
+                }
+            }
+            
+            # Report results
+            foreach ($file in $created) {
+                Write-Host "    ✅ Created $file" -ForegroundColor Green
+            }
+            foreach ($file in $skipped) {
+                Write-Host "    ⏭️ Skipped $file (exists)" -ForegroundColor Yellow
+            }
+            
+            Write-Host ""
+            Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkGray
+            Write-Host "  ✅ INITIALIZATION COMPLETE" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "  Next steps:" -ForegroundColor Cyan
+            Write-Host "    1. Edit docs/ACTIVE_SPEC.md with your requirements" -ForegroundColor White
+            Write-Host "    2. Edit docs/TECH_STACK.md with your tech choices" -ForegroundColor White
+            Write-Host "    3. Run /go to start building!" -ForegroundColor White
+            Write-Host ""
         }
         
         "profile" {

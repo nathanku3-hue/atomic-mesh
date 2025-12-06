@@ -961,6 +961,196 @@ def get_safe_librarian_files(files: str) -> str:
     }, indent=2)
 
 
+# =============================================================================
+# BOOTSTRAP SEED PACKAGE TOOLS (v7.7)
+# =============================================================================
+
+@mcp.tool()
+def get_active_spec() -> str:
+    """
+    Reads the ACTIVE_SPEC.md from the current project.
+    Essential for Commander to understand scope and for Auditor to validate.
+    
+    Returns:
+        The contents of docs/ACTIVE_SPEC.md
+    """
+    spec_path = os.path.join(os.getcwd(), "docs", "ACTIVE_SPEC.md")
+    
+    if not os.path.exists(spec_path):
+        return json.dumps({
+            "error": "ACTIVE_SPEC.md not found",
+            "hint": "Run /init to bootstrap seed documents"
+        })
+    
+    try:
+        with open(spec_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return f"[ACTIVE SPECIFICATION]\n\n{content}"
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+@mcp.tool()
+def get_tech_stack() -> str:
+    """
+    Reads the TECH_STACK.md from the current project.
+    Workers MUST consult this before importing any library.
+    
+    Returns:
+        The contents of docs/TECH_STACK.md
+    """
+    stack_path = os.path.join(os.getcwd(), "docs", "TECH_STACK.md")
+    
+    if not os.path.exists(stack_path):
+        return json.dumps({
+            "error": "TECH_STACK.md not found",
+            "hint": "Run /init to bootstrap seed documents"
+        })
+    
+    try:
+        with open(stack_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return f"[TECH STACK CONTRACT]\n\n{content}"
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+@mcp.tool()
+def append_decision(decision: str, context: str) -> str:
+    """
+    Logs a major decision to docs/DECISION_LOG.md.
+    Called by Router/Commander when significant choices are made.
+    Prevents re-litigation of past decisions.
+    
+    Args:
+        decision: What was decided (e.g., "Use FastAPI for backend")
+        context: Why it was decided (e.g., "Team familiar with Python async")
+    
+    Returns:
+        Confirmation of logged decision with ID.
+    """
+    log_path = os.path.join(os.getcwd(), "docs", "DECISION_LOG.md")
+    
+    if not os.path.exists(log_path):
+        return json.dumps({
+            "error": "DECISION_LOG.md not found",
+            "hint": "Run /init to bootstrap seed documents"
+        })
+    
+    try:
+        decision_id = int(time.time())
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        
+        # Escape pipe characters in decision/context
+        decision_clean = decision.replace("|", "\\|")
+        context_clean = context.replace("|", "\\|")
+        
+        entry = f"| {decision_id} | {date_str} | {decision_clean} | {context_clean} | ✅ |\n"
+        
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(entry)
+        
+        return json.dumps({
+            "logged": True,
+            "id": decision_id,
+            "decision": decision,
+            "date": date_str
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+@mcp.tool()
+def bootstrap_project(project_path: str = None) -> str:
+    """
+    Creates the Seed Package (ACTIVE_SPEC.md, TECH_STACK.md, DECISION_LOG.md)
+    in the specified project directory.
+    
+    Args:
+        project_path: Path to the project root. Defaults to current directory.
+    
+    Returns:
+        JSON with list of created files.
+    """
+    import shutil
+    
+    if not project_path:
+        project_path = os.getcwd()
+    
+    # Template mapping
+    templates = {
+        "ACTIVE_SPEC.template.md": "docs/ACTIVE_SPEC.md",
+        "TECH_STACK.template.md": "docs/TECH_STACK.md",
+        "DECISION_LOG.template.md": "docs/DECISION_LOG.md",
+        "env_template.txt": ".env.example"
+    }
+    
+    template_dir = os.path.join(LIBRARY_ROOT, "templates")
+    docs_dir = os.path.join(project_path, "docs")
+    
+    # Create docs folder
+    os.makedirs(docs_dir, exist_ok=True)
+    
+    created = []
+    skipped = []
+    
+    for src_name, dst_rel in templates.items():
+        src_path = os.path.join(template_dir, src_name)
+        dst_path = os.path.join(project_path, dst_rel)
+        
+        if os.path.exists(dst_path):
+            skipped.append(dst_rel)
+            continue
+        
+        if os.path.exists(src_path):
+            # Create parent dir if needed
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            
+            # Copy and replace placeholders
+            with open(src_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Replace common placeholders
+            project_name = os.path.basename(project_path)
+            content = content.replace("{{PROJECT_NAME}}", project_name)
+            content = content.replace("{{DATE}}", datetime.now().strftime("%Y-%m-%d"))
+            content = content.replace("{{AUTHOR}}", "Atomic Mesh")
+            
+            with open(dst_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            created.append(dst_rel)
+    
+    return json.dumps({
+        "success": True,
+        "project": project_path,
+        "created": created,
+        "skipped": skipped,
+        "message": f"Seed Package: {len(created)} files created, {len(skipped)} skipped (already exist)"
+    }, indent=2)
+
+@mcp.tool()
+def get_decision_log() -> str:
+    """
+    Reads the full DECISION_LOG.md from the current project.
+    Use this to check what has already been decided.
+    
+    Returns:
+        The contents of docs/DECISION_LOG.md
+    """
+    log_path = os.path.join(os.getcwd(), "docs", "DECISION_LOG.md")
+    
+    if not os.path.exists(log_path):
+        return json.dumps({
+            "error": "DECISION_LOG.md not found",
+            "hint": "Run /init to bootstrap seed documents"
+        })
+    
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return f"[DECISION LOG]\n\n{content}"
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 def get_mode() -> str:
     """Get current mode, with auto-detection based on milestone date."""
     # Check for milestone file
