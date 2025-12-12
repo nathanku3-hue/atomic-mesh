@@ -1,0 +1,38 @@
+{
+  "_meta": {
+    "version": "10.17-test",
+    "description": "Test Registry"
+  },
+  "sources": {
+    "HIPAA": {
+      "title": "HIPAA Compliance",
+      "tier": "domain",
+      "authority": "MANDATORY",
+      "id_pattern": "HIPAA-*"
+    },
+    "GDPR": {
+      "title": "GDPR Compliance",
+      "tier": "domain",
+      "authority": "MANDATORY",
+      "id_pattern": "GDPR-*"
+    },
+    "PRO": {
+      "title": "Professional Standards",
+      "tier": "professional",
+      "authority": "STRONG",
+      "id_pattern": "PRO-*"
+    },
+    "STD-ENG": {
+      "title": "Standard Engineering",
+      "tier": "standard",
+      "authority": "DEFAULT",
+      "id_pattern": "STD-*"
+    }
+  },
+  "curated_rules": {
+    "DOMAIN_RULES": {
+      "title": "Domain Rules",
+      "id_pattern": "DR-*"
+    }
+  }
+}

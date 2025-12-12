@@ -1,0 +1,67 @@
+# Atomic Mesh v7.4 - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+ENV/
+
+# Environment & Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Atomic Mesh Runtime Data
+mesh.db
+mesh.db-shm
+mesh.db-wal
+*.db-journal
+.system/restore_points/
+logs/
+*.log
+
+# Docs that are generated at runtime
+DECISION_LOG.md
+NOTES.md
+active_spec.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

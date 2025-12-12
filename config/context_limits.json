@@ -1,0 +1,67 @@
+{
+    "version": "8.1",
+    "description": "Dynamic context limits based on task complexity",
+    "tiers": {
+        "low": {
+            "description": "Express Lane - Quick Fixes, Typos, Simple Changes",
+            "model_hint": "sonnet",
+            "max_spec_chars": 2000,
+            "max_standard_chars": 2000,
+            "max_reference_chars": 1500,
+            "max_total_context_chars": 8000,
+            "max_peeks": 1,
+            "timeout_seconds": 30
+        },
+        "normal": {
+            "description": "Standard Features - New Components, API Endpoints",
+            "model_hint": "sonnet",
+            "max_spec_chars": 15000,
+            "max_standard_chars": 10000,
+            "max_reference_chars": 8000,
+            "max_total_context_chars": 50000,
+            "max_peeks": 3,
+            "timeout_seconds": 120
+        },
+        "high": {
+            "description": "Deep Refactors - Architecture Changes, Migrations (Opus)",
+            "model_hint": "opus",
+            "max_spec_chars": 50000,
+            "max_standard_chars": 30000,
+            "max_reference_chars": 25000,
+            "max_total_context_chars": 150000,
+            "max_peeks": 8,
+            "timeout_seconds": 300
+        }
+    },
+    "complexity_triggers": {
+        "low": [
+            "fix typo",
+            "rename",
+            "update text",
+            "change color",
+            "adjust spacing",
+            "minor change",
+            "quick fix"
+        ],
+        "high": [
+            "refactor",
+            "rewrite",
+            "migrate",
+            "architecture",
+            "redesign",
+            "microservices",
+            "overhaul",
+            "rebuild",
+            "from scratch",
+            "entire system"
+        ]
+    },
+    "context7_guardrail": {
+        "enabled": true,
+        "rules": [
+            "USE for: Naming conventions, folder structure, patterns",
+            "ADAPT for: Import syntax, method signatures (check versions)",
+            "NEVER blindly copy if conflicts with TECH_STACK.md"
+        ]
+    }
+}

@@ -1,0 +1,68 @@
+{
+  "sources": {
+    "STD-SEC-01": {
+      "status": "PLANNED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": [
+        "T-1765111399"
+      ]
+    },
+    "STD-CODE-01": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-CODE-02": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-ERR-01": {
+      "status": "PLANNED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": [
+        "T-1765111399"
+      ]
+    },
+    "STD-ERR-02": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-TEST-01": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-TEST-02": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-DOC-01": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-PERF-01": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    },
+    "STD-ARCH-01": {
+      "status": "UNMAPPED",
+      "file": "STD_ENGINEERING.md",
+      "linked_tasks": []
+    }
+  },
+  "orphans": [],
+  "summary": {
+    "total_sources": 10,
+    "total_ignored": 0,
+    "verified": 0,
+    "implemented": 0,
+    "coverage_pct": 0.0,
+    "orphans_count": 0
+  },
+  "last_updated": "2025-12-07T20:43:44.227630"
+}

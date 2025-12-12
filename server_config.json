@@ -1,0 +1,10 @@
+{
+    "mcpServers": {
+        "atomic-mesh": {
+            "command": "python",
+            "args": [
+                "mesh_server.py"
+            ]
+        }
+    }
+}

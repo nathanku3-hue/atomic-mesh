@@ -1,0 +1,57 @@
+# Environment Variables Template
+# Copy to .env and fill in values
+# NEVER commit .env to git!
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+# For SQLite dev: DATABASE_URL=sqlite:///./dev.db
+
+# =============================================================================
+# AUTHENTICATION
+# =============================================================================
+SECRET_KEY=your-super-secret-key-change-in-production
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+REFRESH_TOKEN_EXPIRE_DAYS=7
+
+# =============================================================================
+# API KEYS (External Services)
+# =============================================================================
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+
+# =============================================================================
+# ATOMIC MESH v7.8 - DREAM TEAM MODEL CONFIGURATION (SOTA ONLY)
+# =============================================================================
+
+# Logic Cluster: GPT-5.1-Codex-Max for Backend, Librarian, QA1, Commander
+# The best logic model for architecture, security, and hard reasoning
+MODEL_LOGIC_MAX=gpt-5.1-codex-max
+
+# Creative Cluster: Claude Sonnet 4.5 for Frontend, QA2
+# The best creative model for visuals, style, and readability
+MODEL_CREATIVE_FAST=claude-sonnet-4-5@20250929
+
+# The Heavy: Claude Opus 4.5 for complex refactoring tasks
+# Only triggered for high-complexity tasks (refactor, rewrite, migrate)
+MODEL_REASONING_ULTRA=claude-opus-4-5-20251101
+
+# =============================================================================
+# APPLICATION
+# =============================================================================
+APP_ENV=development
+DEBUG=true
+LOG_LEVEL=INFO
+
+# =============================================================================
+# CORS (Frontend URLs)
+# =============================================================================
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+
+# =============================================================================
+# OPTIONAL: Feature Flags
+# =============================================================================
+FEATURE_NEW_DASHBOARD=false
+FEATURE_BETA_API=false

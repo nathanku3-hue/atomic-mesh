@@ -1,0 +1,81 @@
+{
+    "version": "7.8",
+    "name": "Dream Team - SOTA Only",
+    "description": "State-of-the-art model roster for Zero-Spaghetti development",
+    "roster": {
+        "logic_max": {
+            "id": "gpt-5.1-codex-max",
+            "env_var": "MODEL_LOGIC_MAX",
+            "description": "The Logician - Rigid architecture, perfect syntax, security",
+            "roles": [
+                "backend",
+                "librarian",
+                "qa1",
+                "commander",
+                "orchestrator"
+            ]
+        },
+        "creative_fast": {
+            "id": "claude-sonnet-4-5@20250929",
+            "env_var": "MODEL_CREATIVE_FAST",
+            "description": "The Artist - Visuals, React, Tailwind, vibes",
+            "roles": [
+                "frontend",
+                "qa2",
+                "writer"
+            ]
+        },
+        "reasoning_ultra": {
+            "id": "claude-opus-4-5-20251101",
+            "env_var": "MODEL_REASONING_ULTRA",
+            "description": "The Heavy - Deep architectural planning, complex refactoring",
+            "roles": [
+                "heavy",
+                "architect"
+            ]
+        }
+    },
+    "complexity_triggers": [
+        "refactor",
+        "rewrite",
+        "migrate",
+        "architecture",
+        "redesign",
+        "microservices",
+        "overhaul",
+        "rebuild",
+        "from scratch",
+        "entire system",
+        "major change"
+    ],
+    "qa_protocol": {
+        "qa1": {
+            "name": "The Compiler",
+            "model_tier": "logic_max",
+            "checks": [
+                "Does code compile/parse?",
+                "Security vulnerabilities (OWASP)?",
+                "Type safety enforced?",
+                "Imports from approved TECH_STACK?",
+                "Matches API spec?",
+                "SQL injection prevention?",
+                "Auth checks present?",
+                "Error handling complete?"
+            ]
+        },
+        "qa2": {
+            "name": "The Critic",
+            "model_tier": "creative_fast",
+            "checks": [
+                "Variable naming descriptive?",
+                "Function length < 50 lines?",
+                "Code DRY (no duplication)?",
+                "Nested loops < 3 deep?",
+                "Readable by junior dev?",
+                "Magic numbers explained?",
+                "Comments where needed?",
+                "Overall code smell?"
+            ]
+        }
+    }
+}

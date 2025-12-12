@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "_meta": {
+    "created": "2025-12-11",
+    "purpose": "Minimal dev/CI placeholder registry for SOURCE_REGISTRY validation",
+    "status": "dev-placeholder",
+    "note": "This is a structural placeholder to satisfy CI checks. Real authority sources are governed via The Gavel system and documented in source-specific files."
+  },
+  "sources": {
+    "STD-ENG": {
+      "id": "STD-ENG",
+      "title": "Standard Engineering Practices",
+      "tier": "standard",
+      "authority": "DEFAULT",
+      "id_pattern": "STD-*",
+      "description": "Default engineering standards and best practices"
+    },
+    "DEV-PLACEHOLDER": {
+      "id": "DEV-PLACEHOLDER",
+      "title": "Development Placeholder",
+      "tier": "dev",
+      "authority": "NONE",
+      "id_pattern": "DEV-*",
+      "description": "Minimal placeholder entry for CI structural validation. Not used for production decisions."
+    }
+  }
+}

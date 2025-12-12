@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Atomic Mesh Runtime
+mesh.db
+mesh.db-shm
+mesh.db-wal
+control/state/_runtime/
+control/state/_migrations/
+control/snapshots/
+logs/
+*.log
+
+# Sensitive
+.env
+*.key
+*.pem
+credentials.json

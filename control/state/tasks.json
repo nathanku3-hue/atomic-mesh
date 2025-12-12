@@ -1,0 +1,124 @@
+{
+  "active_task_id": "T-1765111399",
+  "tasks": {
+    "T-1765111399": {
+      "description": "Encrypt patient data",
+      "status": "PENDING",
+      "rigor": "L2_BUILD",
+      "questions": [],
+      "source_ids": [
+        "STD-SEC-01",
+        "STD-ERR-01"
+      ],
+      "source_tier": "standard",
+      "target_file": null,
+      "created_at": 1765111399.4307437,
+      "updated_at": 1765111399.4307437
+    },
+    "T-B1": {
+      "id": "T-B1",
+      "type": "backend",
+      "desc": "API endpoint for user authentication",
+      "status": "pending",
+      "priority": 1,
+      "created_at": 1765535373,
+      "source": "draft_20251212_1829.md"
+    },
+    "T-B2": {
+      "id": "T-B2",
+      "type": "backend",
+      "desc": "Rate limiting middleware",
+      "status": "pending",
+      "priority": 1,
+      "created_at": 1765535373,
+      "source": "draft_20251212_1829.md"
+    },
+    "T-F1": {
+      "id": "T-F1",
+      "type": "frontend",
+      "desc": "Login form component",
+      "status": "pending",
+      "priority": 1,
+      "created_at": 1765535373,
+      "source": "draft_20251212_1829.md"
+    },
+    "T-F2": {
+      "id": "T-F2",
+      "type": "frontend",
+      "desc": "Dashboard layout",
+      "status": "pending",
+      "priority": 1,
+      "created_at": 1765535373,
+      "source": "draft_20251212_1829.md"
+    }
+  },
+  "_meta": {
+    "version": "10.4",
+    "description": "Task State Machine with Architect Planner Support",
+    "statuses": [
+      "PENDING",
+      "BLOCKING",
+      "CLARIFYING",
+      "WAITING",
+      "READY",
+      "IN_PROGRESS",
+      "TESTING",
+      "COMPLETE",
+      "FAILED"
+    ],
+    "archetypes": {
+      "DB": "Schema changes, migrations, SQL - Foundation (no deps)",
+      "API": "Endpoints, controllers - Depends on DB",
+      "LOGIC": "Services, algorithms, compliance checks - Depends on DB",
+      "UI": "Frontend components, views - Depends on API",
+      "SEC": "Encryption, auth, roles - Cross-cutting (IRONCLAD rigor)",
+      "TEST": "QA verification - Depends on implementation",
+      "CLARIFICATION": "Ambiguous requirement - BLOCKING status",
+      "GENERIC": "Unclassified task"
+    },
+    "v10.4_fields": {
+      "source_ids": {
+        "type": "array",
+        "description": "List of Source IDs from docs/sources/ that this task implements",
+        "examples": [
+          "STD-SEC-01",
+          "HIPAA-SEC-01"
+        ]
+      },
+      "source_tier": {
+        "type": "string",
+        "enum": [
+          "domain",
+          "standard"
+        ],
+        "description": "Domain (Tier A) requires IRONCLAD rigor. Standard (Tier B) uses BUILD rigor."
+      },
+      "archetype": {
+        "type": "string",
+        "enum": [
+          "DB",
+          "API",
+          "LOGIC",
+          "UI",
+          "SEC",
+          "TEST",
+          "CLARIFICATION",
+          "GENERIC"
+        ],
+        "description": "Task classification for dependency ordering"
+      },
+      "dependencies": {
+        "type": "array",
+        "description": "List of task IDs this task depends on",
+        "examples": [
+          "T-001",
+          "T-002"
+        ]
+      },
+      "reasoning": {
+        "type": "string",
+        "description": "Traceability - Why this task exists, derived from which source clause"
+      }
+    }
+  }
+}

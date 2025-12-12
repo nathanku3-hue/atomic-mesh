@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "atomic-mesh": {
+      "command": "python",
+      "args": [
+        "mesh_server.py"
+      ],
+      "env": {
+        "PYTHONWARNINGS": "ignore",
+        "LOG_LEVEL": "WARNING",
+        "CHUK_LOG_LEVEL": "WARNING",
+        "MCP_LOG_LEVEL": "WARNING"
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+# Atomic Mesh v7.4 - Python Dependencies
+
+# Core MCP Framework
+mcp>=1.0.0
+
+# LLM Integration (optional - for Smart Path routing)
+openai>=1.0.0
+
+# HTTP Requests
+requests>=2.28.0
+
+# Environment Management
+python-dotenv>=1.0.0
+
+# Development Dependencies (optional)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0

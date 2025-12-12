@@ -1,0 +1,31 @@
+{
+    "name": "Python Backend",
+    "description": "FastAPI, Django, Flask projects",
+    "detection": {
+        "files": [
+            "requirements.txt",
+            "pyproject.toml",
+            "setup.py",
+            "Pipfile"
+        ],
+        "content_hints": [
+            "fastapi",
+            "django",
+            "flask",
+            "uvicorn"
+        ]
+    },
+    "standards": {
+        "security": "universal/security.md",
+        "architecture": "python/architecture.md",
+        "testing": "python/testing.md",
+        "folder_structure": "python/folder_map.md",
+        "git": "universal/git_workflow.md",
+        "code_review": "universal/code_review.md"
+    },
+    "references": {
+        "api_route": "python/perfect_router.py",
+        "service": "python/perfect_service.py",
+        "test": "python/perfect_test.py"
+    }
+}
