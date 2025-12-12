@@ -10655,6 +10655,9 @@ MODE_DEFAULTS = {
     "SHIP": "/ship"
 }
 
+# Compile patterns at module load - import re first
+import re as _re_router
+
 # v14.0: READONLY patterns - Narrow, ops-like queries that must NEVER create tasks
 # These are checked FIRST before any other routing to prevent accidental /add
 READONLY_PATTERNS = [
@@ -10705,8 +10708,6 @@ INTENT_PATTERNS = [
     (r"\b(mode|switch mode|change mode)\b", "/mode", "LOW"),
 ]
 
-# Compile patterns at module load
-import re as _re_router
 COMPILED_INTENT_PATTERNS = [
     (_re_router.compile(pattern, _re_router.IGNORECASE), cmd, risk)
     for pattern, cmd, risk in INTENT_PATTERNS
