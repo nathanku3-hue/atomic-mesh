@@ -270,3 +270,53 @@ Warnings from `snippet_duplicate_check` suggest you may want to reuse an existin
 **Snippet location**: `library/snippets/{python,powershell,markdown}/`
 
 **Decision**: See `docs/DECISIONS/ENG-LIBRARIAN-SNIPPETS-001.md`
+
+### Librarian: Snippets (Optional)
+
+**Slash commands:**
+```
+/snippets <kw> [--lang ...] [--tags ...]
+/dupcheck <path>
+```
+
+Advisory only; no auto-insert; no shipping gates.
+
+---
+
+## Pipeline Snapshots (v16.0 Deblackbox)
+
+**Purpose**: Debug snapshots are written to help diagnose pipeline state issues.
+
+**Behavior**:
+- Snapshots are written to `logs/pipeline_snapshots.jsonl` (append-only JSONL format)
+- **Only Yellow/Red states are logged** - Green states produce no log output
+- Deduplication: Same content hash within 2 seconds is not re-logged
+
+**Location**: `logs/pipeline_snapshots.jsonl`
+
+**When written**:
+- Dashboard render (EXECUTION mode)
+- Dashboard render (BOOTSTRAP/navigation mode)
+- HistoryMode "D" hotkey (pipeline check)
+
+**Schema** (per line):
+```json
+{
+  "ts": "2025-12-13T22:31:05Z",
+  "mode": "EXECUTION|BOOTSTRAP|PRE_INIT",
+  "stages": {
+    "Context": {"state":"YELLOW","reason":"Context incomplete: PRD is STUB"},
+    "Plan": {"state":"GREEN"},
+    "Work": {"state":"RED","reason":"Blocked tasks present (T-123)"},
+    ...
+  },
+  "selected_task": "T-123",
+  "source": "readiness.py (live) / tasks DB / task: 123"
+}
+```
+
+**Log hygiene**:
+- File grows only when there's a problem (Yellow/Red)
+- No full file contents, diffs, or prompts are logged
+- Reason strings are kept short and deterministic
+

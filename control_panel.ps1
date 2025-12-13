@@ -18,7 +18,8 @@ $LogDir = "$CurrentDir\logs"
 $DocsDir = "$CurrentDir\docs"
 $MilestoneFile = "$CurrentDir\.milestone_date"
 $SpecFile = "$DocsDir\ACTIVE_SPEC.md"
-$RepoRoot = if ($PSScriptRoot) { Resolve-Path "$PSScriptRoot\.." } else { $CurrentDir }
+# v14.1: Fixed - $PSScriptRoot IS the repo root, no need to go up one level
+$RepoRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $CurrentDir }
 
 # Set environment for Python
 $env:ATOMIC_MESH_DB = $DB_FILE
@@ -52,7 +53,9 @@ $Global:Commands = [ordered]@{
     "audit"          = @{ Desc = "open auditor status and log"; Template = "/audit" }
     "lib"            = @{ Desc = "librarian: /lib scan|status|approve|execute"; HasArgs = $true; Template = "/lib <action>"; Placeholder = "<action>"; MiniGuide = "scan/status/approve"; Options = @("scan", "status", "approve") }
     "ingest"         = @{ Desc = "v9.1: compile raw PRDs from inbox to specs"; Template = "/ingest" }
-    
+    "snippets"       = @{ Desc = "Librarian: search reusable snippets"; HasArgs = $true; Template = "/snippets <query> [--lang python|powershell|markdown|any] [--tags a,b,c]"; MiniGuide = "search snippets" }
+    "dupcheck"       = @{ Desc = "Librarian: detect duplicate helpers (advisory)"; HasArgs = $true; Template = "/dupcheck <path> [--lang auto|python|powershell|markdown]"; MiniGuide = "duplicate check" }
+
     # v9.6 RIGOR (Status Only)
     "rigor"          = @{ Desc = "v9.6: show Phase x Risk matrix (auto-derived)"; Template = "/rigor" }
     
@@ -198,6 +201,81 @@ function Get-TaskStats {
         if ($s.status) { $result[$s.status] = $s.c }
     }
     return $result
+}
+
+function Resolve-HealthColor {
+    param([string]$Health)
+    switch ($Health) {
+        "GREEN"  { return "Green" }
+        "YELLOW" { return "Yellow" }
+        "RED"    { return "Red" }
+        default  { return "DarkGray" } # GRAY / unknown
+    }
+}
+
+function Convert-TaskStatusToBucket {
+    param([string]$Status)
+    if (-not $Status) { return "NEXT" }
+    $s = $Status.ToLowerInvariant()
+    $result = switch ($s) {
+        "pending"     { "NEXT" }
+        "next"        { "NEXT" }
+        "planned"     { "NEXT" }
+        "in_progress" { "RUNNING" }
+        "running"     { "RUNNING" }
+        "in_review"   { "REVIEWING" }
+        "reviewing"   { "REVIEWING" }
+        "blocked"     { "BLOCKED" }
+        "failed"      { "BLOCKED" }
+        "cancelled"   { "COMPLETED" }
+        "canceled"    { "COMPLETED" }
+        "completed"   { "COMPLETED" }
+        default       { "NEXT" }
+    }
+    return $result
+}
+
+# v15.5: Centralized task health derivation (used by History + Ship signals)
+# Returns semantic tokens (GREEN|YELLOW|RED|GRAY) and preserves a short reason.
+function Get-TaskHealth {
+    <#
+    .SYNOPSIS
+        Derives task health from existing truth sources only.
+    .PARAMETER Task
+        Task row (id, type, status, risk, qa_status, ...)
+    .RETURNS
+        @{ Health = "GREEN|YELLOW|RED|GRAY"; Bucket = "NEXT|RUNNING|REVIEWING|BLOCKED|COMPLETED"; Reason = "text" }
+    #>
+    param([object]$Task)
+
+    if (-not $Task) { return @{ Health = "GRAY"; Bucket = "NEXT"; Reason = "No task" } }
+
+    $bucket = Convert-TaskStatusToBucket -Status $Task.status
+    $risk = if ($Task.risk) { $Task.risk.ToUpperInvariant() } else { "" }
+    $qa = if ($Task.qa_status) { $Task.qa_status.ToUpperInvariant() } else { "" }
+
+    # RED: blocked task OR ship risk gate fail (HIGH not PASS)
+    if ($bucket -eq "BLOCKED") {
+        return @{ Health = "RED"; Bucket = $bucket; Reason = "Task BLOCKED" }
+    }
+    if ($risk -eq "HIGH" -and $qa -ne "PASS") {
+        return @{ Health = "RED"; Bucket = $bucket; Reason = "HIGH risk not PASS" }
+    }
+    if ($qa -eq "FAIL") {
+        return @{ Health = "RED"; Bucket = $bucket; Reason = "QA FAIL" }
+    }
+
+    # GREEN: completed/satisfied
+    if ($bucket -eq "COMPLETED") {
+        return @{ Health = "GREEN"; Bucket = $bucket; Reason = "Completed" }
+    }
+
+    # YELLOW: needs work (NEXT/RUNNING/REVIEWING)
+    if ($bucket -in @("NEXT", "RUNNING", "REVIEWING")) {
+        return @{ Health = "YELLOW"; Bucket = $bucket; Reason = "Needs work" }
+    }
+
+    return @{ Health = "GRAY"; Bucket = $bucket; Reason = "N/A" }
 }
 
 # ============================================================================
@@ -393,6 +471,32 @@ $Global:LastOptimized = $false    # bool
 $Global:LastConfidence = $null    # int 0-100 or $null
 $Global:LastTaskForSignals = $null # optional: "T-123"
 
+# v15.2: Auto-Ingest State (triggered on doc save, debounced)
+$Global:AutoIngestEnabled = if ($env:MESH_AUTO_INGEST -eq "0") { $false } else { $true }
+$Global:AutoIngestPending = $false
+$Global:AutoIngestLastChangeUtc = $null
+$Global:AutoIngestLastRunUtc = $null
+$Global:AutoIngestLastResult = $null   # "OK" | "ERROR" | "SKIPPED" | $null
+$Global:AutoIngestLastMessage = $null
+$Global:AutoIngestDebounceMs = 1200
+$Global:AutoIngestWatcher = $null      # FileSystemWatcher instance
+
+# v15.4.1: Ctrl-C double-press protection (TreatControlCAsInput)
+$Global:LastCtrlCUtc = $null
+$Global:CtrlCArmed = $false
+$Global:CtrlCWarningShownUtc = $null  # For auto-clearing warning after 2s
+
+# v15.5: History Mode (F2 toggle)
+$Global:HistoryMode = $false
+$Global:HistorySubview = "TASKS"       # TASKS | DOCS | SHIP
+$Global:HistorySelectedRow = 0         # Currently selected row index
+$Global:HistoryScrollOffset = 0        # Scroll offset for long lists
+$Global:HistoryData = @()              # Cached history data
+$Global:HistoryDetailsVisible = $false # Right panel details pane
+$Global:HistoryHintText = $null        # One-line hint shown in right panel
+$Global:HistoryHintColor = "DarkGray"
+$Global:HistoryHintUtc = $null         # Optional: for future auto-clear
+
 # Mode configuration (color, prompt, hint, default action)
 $Global:ModeConfig = @{
     "OPS"  = @{ Color = "Cyan"; Prompt = "[OPS]"; Hint = "Monitor health & drift"; MicroHint = "OPS: ask 'health', 'drift', or type /ops" }
@@ -402,6 +506,18 @@ $Global:ModeConfig = @{
 }
 # v13.2.1: Only OPS/PLAN in Tab toggle (RUN/SHIP via explicit commands)
 $Global:ModeRing = @("OPS", "PLAN")
+
+# v15.4.1: Normalize command key (strip /, lowercase, trim)
+function Normalize-CommandKey {
+    param([string]$s)
+    if (-not $s) { return "" }
+    $x = $s.Trim()
+    if ($x.StartsWith("/")) { $x = $x.Substring(1) }
+    # Also strip any args after space
+    $spaceIdx = $x.IndexOf(" ")
+    if ($spaceIdx -gt 0) { $x = $x.Substring(0, $spaceIdx) }
+    return $x.ToLowerInvariant()
+}
 
 function Get-FilteredCommands {
     param([string]$Filter)
@@ -725,7 +841,9 @@ function Invoke-SlashCommand {
 
     if ($StrategicCommands -contains $cmd) {
         try {
-            $readinessJson = python "tools\readiness.py" 2>&1
+            # v14.1: Use explicit path and pass project directory
+            $readinessScript = Join-Path $RepoRoot "tools\readiness.py"
+            $readinessJson = python "$readinessScript" "$CurrentDir" 2>&1
             $readiness = $readinessJson | ConvertFrom-Json -ErrorAction SilentlyContinue
 
             if ($readiness -and $readiness.status -eq "BOOTSTRAP") {
@@ -1110,7 +1228,156 @@ function Invoke-SlashCommand {
                 default { Write-Host "  Usage: /lib scan|status|mount|unmount|refs" -ForegroundColor Yellow }
             }
         }
-        
+
+        # === v15.x LIBRARIAN: SNIPPET SEARCH ===
+        "snippets" {
+            # Parse args: <query> [--lang <val>] [--tags <csv>]
+            $query = ""
+            $lang = "any"
+            $tags = ""
+
+            if ($cmdArgs) {
+                $tokens = $cmdArgs -split '\s+'
+                $i = 0
+                while ($i -lt $tokens.Count) {
+                    $tok = $tokens[$i]
+                    if ($tok -eq "--lang" -and ($i + 1) -lt $tokens.Count) {
+                        $lang = $tokens[$i + 1]
+                        $i += 2
+                    }
+                    elseif ($tok -eq "--tags" -and ($i + 1) -lt $tokens.Count) {
+                        $tags = $tokens[$i + 1]
+                        $i += 2
+                    }
+                    elseif (-not $tok.StartsWith("--")) {
+                        # First non-flag token is the query
+                        if (-not $query) { $query = $tok }
+                        $i++
+                    }
+                    else {
+                        $i++
+                    }
+                }
+            }
+
+            # If no query AND no tags: show help
+            if (-not $query -and -not $tags) {
+                Write-Host "  Usage: /snippets <query> [--lang python|powershell|markdown|any] [--tags a,b,c]" -ForegroundColor Yellow
+                return
+            }
+
+            Write-Host ""
+            Write-Host "  SNIPPETS (top 5)" -ForegroundColor Cyan
+            Write-Host ""
+
+            try {
+                # Escape strings for Python
+                $queryEsc = $query.Replace("'", "\'")
+                $tagsEsc = $tags.Replace("'", "\'")
+                $rootEsc = $CurrentDir.Replace("\", "\\")
+
+                $result = python -c "from mesh_server import snippet_search; print(snippet_search(query='$queryEsc', lang='$lang', tags='$tagsEsc', root_dir=r'$rootEsc'))" 2>&1
+                $response = $result | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+                if (-not $response) {
+                    Write-Host "  Librarian unavailable (fail-open)" -ForegroundColor Yellow
+                    return
+                }
+
+                if ($response.results.Count -eq 0) {
+                    Write-Host "  No matches." -ForegroundColor Gray
+                }
+                else {
+                    $shown = 0
+                    foreach ($snippet in $response.results) {
+                        if ($shown -ge 5) { break }
+                        $intent = if ($snippet.intent.Length -gt 45) { $snippet.intent.Substring(0, 42) + "..." } else { $snippet.intent }
+                        Write-Host "  • $($snippet.id) ($($snippet.lang)) — $intent" -ForegroundColor White
+                        $shown++
+                    }
+                }
+            }
+            catch {
+                Write-Host "  Librarian unavailable (fail-open)" -ForegroundColor Yellow
+            }
+            Write-Host ""
+        }
+
+        # === DUPCHECK ===
+        "dupcheck" {
+            # Parse args: <path> [--lang auto|python|powershell|markdown]
+            $targetPath = ""
+            $lang = "auto"
+
+            if ($cmdArgs) {
+                $tokens = $cmdArgs -split '\s+'
+                $i = 0
+                while ($i -lt $tokens.Count) {
+                    $tok = $tokens[$i]
+                    if ($tok -eq "--lang" -and ($i + 1) -lt $tokens.Count) {
+                        $lang = $tokens[$i + 1]
+                        $i += 2
+                    }
+                    elseif (-not $tok.StartsWith("--")) {
+                        # First non-flag token is the file path
+                        if (-not $targetPath) { $targetPath = $tok }
+                        $i++
+                    }
+                    else {
+                        $i++
+                    }
+                }
+            }
+
+            # If no path: show help
+            if (-not $targetPath) {
+                Write-Host "  Usage: /dupcheck <path> [--lang auto|python|powershell|markdown]" -ForegroundColor Yellow
+                return
+            }
+
+            Write-Host ""
+            Write-Host "  DUPLICATE CHECK (top 3)" -ForegroundColor Cyan
+            Write-Host ""
+
+            try {
+                # Escape strings for Python
+                $pathEsc = $targetPath.Replace("'", "\'")
+                $rootEsc = $CurrentDir.Replace("\", "\\")
+
+                $result = python -c "from mesh_server import snippet_duplicate_check; print(snippet_duplicate_check(file_path='$pathEsc', lang='$lang', root_dir=r'$rootEsc'))" 2>&1
+                $response = $result | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+                if (-not $response) {
+                    Write-Host "  Librarian unavailable (fail-open)" -ForegroundColor Yellow
+                    return
+                }
+
+                if ($response.status -eq "ERROR") {
+                    Write-Host "  $($response.message)" -ForegroundColor Yellow
+                }
+                elseif ($response.warnings.Count -eq 0) {
+                    $msg = if ($response.message) { $response.message } else { "No duplicates found." }
+                    Write-Host "  $msg" -ForegroundColor Gray
+                }
+                else {
+                    $shown = 0
+                    foreach ($warning in $response.warnings) {
+                        if ($shown -ge 3) { break }
+                        $sim = "$([int]($warning.similarity * 100))%"
+                        $id = $warning.snippet_id
+                        # Condense path: show just filename
+                        $pathShort = Split-Path $warning.path -Leaf
+                        Write-Host "  • $sim — $id ($pathShort)" -ForegroundColor White
+                        $shown++
+                    }
+                }
+            }
+            catch {
+                Write-Host "  Librarian unavailable (fail-open)" -ForegroundColor Yellow
+            }
+            Write-Host ""
+        }
+
         # === v9.1 AIR GAP INGESTION ===
         "ingest" {
             Write-Host ""
@@ -1634,21 +1901,30 @@ print(detect_project_profile(r'$CurrentDir'))
                 }
             }
             
+            # v14.1: Auto-link profile without Y/N prompt (keeps single-input-frame discipline)
+            # User can change later via /profile <name>
             Write-Host ""
-            $confirm = Read-Host "  Link this project to '$detectedProfile'? [Y/n]"
-            if ($confirm -eq "n" -or $confirm -eq "N") { return }
-            
+
             # Update projects.json
             $regPath = Join-Path $RepoRoot "config\projects.json"
             if (Test-Path $regPath) {
                 $projects = Get-Content $regPath | ConvertFrom-Json
-                
+
                 # Find existing or create new
                 $existing = $projects | Where-Object { $_.path -eq $CurrentDir }
-                
+
                 if ($existing) {
-                    $existing | ForEach-Object { $_.profile = $detectedProfile }
-                    Write-Host "  ✅ Updated existing project entry" -ForegroundColor Green
+                    # Check if already linked
+                    $currentProfile = $existing.profile
+                    if ($currentProfile -and $currentProfile -ne $detectedProfile) {
+                        Write-Host "  ℹ️  Profile already linked: $currentProfile" -ForegroundColor Cyan
+                        Write-Host "     (change via /profile <name>)" -ForegroundColor DarkGray
+                    }
+                    else {
+                        $existing | ForEach-Object { $_.profile = $detectedProfile }
+                        Write-Host "  ✅ Linked profile: $detectedProfile" -ForegroundColor Green
+                        Write-Host "     (change via /profile <name>)" -ForegroundColor DarkGray
+                    }
                 }
                 else {
                     $newId = ($projects | Measure-Object -Property id -Maximum).Maximum + 1
@@ -1660,12 +1936,13 @@ print(detect_project_profile(r'$CurrentDir'))
                         profile = $detectedProfile
                     }
                     $projects = @($projects) + $newEntry
-                    Write-Host "  ✅ Added new project (ID: $newId)" -ForegroundColor Green
+                    Write-Host "  ✅ Linked profile: $detectedProfile (new project ID: $newId)" -ForegroundColor Green
+                    Write-Host "     (change via /profile <name>)" -ForegroundColor DarkGray
                 }
-                
+
                 $projects | ConvertTo-Json -Depth 4 | Set-Content $regPath
             }
-            
+
             # Store profile in script context
             $script:CurrentProfile = $detectedProfile
             
@@ -1682,12 +1959,14 @@ print(detect_project_profile(r'$CurrentDir'))
             }
             
             # Template mapping (v13.6: Add PRD and SPEC for readiness gate)
+            # v15.1: Add INBOX.md for ephemeral capture
             $templates = @{
                 "PRD.template.md"          = "docs\PRD.md"
                 "SPEC.template.md"         = "docs\SPEC.md"
                 "DECISION_LOG.template.md" = "docs\DECISION_LOG.md"
                 "TECH_STACK.template.md"   = "docs\TECH_STACK.md"
                 "ACTIVE_SPEC.template.md"  = "docs\ACTIVE_SPEC.md"  # Keep for backward compat
+                "INBOX.template.md"        = "docs\INBOX.md"        # v15.1: Ephemeral capture
                 "env_template.txt"         = ".env.example"
             }
             
@@ -1752,8 +2031,11 @@ print(detect_project_profile(r'$CurrentDir'))
                 Write-Host "    • Or run /ops to check system status" -ForegroundColor Gray
                 Write-Host ""
             }
+
+            # v14.1: Force dashboard redraw to show BOOTSTRAP mode
+            return "refresh"
         }
-        
+
         "profile" {
             $regPath = Join-Path $RepoRoot "config\projects.json"
             
@@ -2110,6 +2392,95 @@ print(consult_standard('$cmdArgs', '$profile'))
             catch {
                 Write-Host "  ⚠️ Simplify check error: $_" -ForegroundColor Yellow
                 $Global:LastOptimized = $false
+            }
+            Write-Host ""
+        }
+
+        "dupcheck" {
+            Write-Host ""
+            Write-Host "  🔍 DUPLICATE CHECK (Librarian)" -ForegroundColor Cyan
+            Write-Host ""
+
+            if (-not $cmdArgs) {
+                Write-Host "  ❌ Usage: /dupcheck <path> [--lang auto|python|powershell|markdown]" -ForegroundColor Red
+                Write-Host "  Example: /dupcheck src/helpers.py" -ForegroundColor Gray
+                Write-Host ""
+                return
+            }
+
+            # Parse args: first token is file_path, optional --lang
+            $tokens = $cmdArgs -split '\s+'
+            $filePath = $tokens[0]
+            $lang = "auto"
+
+            for ($i = 1; $i -lt $tokens.Count; $i++) {
+                if ($tokens[$i] -eq "--lang" -and $i + 1 -lt $tokens.Count) {
+                    $lang = $tokens[$i + 1]
+                }
+            }
+
+            # Resolve relative paths against CurrentDir
+            if (-not [System.IO.Path]::IsPathRooted($filePath)) {
+                $filePath = Join-Path $CurrentDir $filePath
+            }
+
+            if (-not (Test-Path $filePath)) {
+                Write-Host "  ❌ File not found: $filePath" -ForegroundColor Red
+                Write-Host ""
+                return
+            }
+
+            try {
+                $escapedPath = $filePath -replace "'", "''"
+                $escapedDir = $CurrentDir -replace "'", "''"
+                $result = python -c "from mesh_server import snippet_duplicate_check; print(snippet_duplicate_check(r'$escapedPath', '$lang', r'$escapedDir'))" 2>&1
+                $resultStr = $result -join "`n"
+                $response = $resultStr | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+                if (-not $response) {
+                    Write-Host "  dupcheck failed (fail-open): could not parse response" -ForegroundColor Yellow
+                    Write-Host ""
+                    return
+                }
+
+                if ($response.status -eq "ERROR") {
+                    Write-Host "  dupcheck failed (fail-open): $($response.message)" -ForegroundColor Yellow
+                    Write-Host ""
+                    return
+                }
+
+                # Handle special messages
+                if ($response.message -eq "File too small for comparison") {
+                    Write-Host "  File too small for comparison" -ForegroundColor Gray
+                    Write-Host ""
+                    return
+                }
+
+                if ($response.message -eq "Unsupported file type") {
+                    Write-Host "  Unsupported file type" -ForegroundColor Yellow
+                    Write-Host ""
+                    return
+                }
+
+                # Render warnings
+                if (-not $response.warnings -or $response.warnings.Count -eq 0) {
+                    Write-Host "  No duplicates detected." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "  DUPLICATE WARNINGS (top 3)" -ForegroundColor Yellow
+                    Write-Host ""
+                    $top3 = $response.warnings | Select-Object -First 3
+                    foreach ($w in $top3) {
+                        $pct = [math]::Round($w.similarity * 100)
+                        Write-Host "  • $($w.snippet_id) — ~${pct}% similar" -ForegroundColor Gray
+                    }
+                    Write-Host ""
+                    $topSnippet = $response.warnings[0].snippet_id
+                    Write-Host "  Hint: consider reusing snippet: $topSnippet" -ForegroundColor Cyan
+                }
+            }
+            catch {
+                Write-Host "  dupcheck failed (fail-open): $_" -ForegroundColor Yellow
             }
             Write-Host ""
         }
@@ -2901,6 +3272,1120 @@ function Get-WorkerStatus {
     return $status
 }
 
+# ============================================================================
+# v15.5: RUNTIME SIGNALS (Stream C - Task C1)
+# ============================================================================
+# Normalizes existing truth sources into a small, stable signals object:
+# - readiness.py (docs readiness + blocking list)
+# - tasks DB aggregates (counts by status + stream)
+# - /ship risk gate semantics (HIGH risk tasks without QA PASS)
+#
+# Fail-open rule:
+# - If any sub-call fails, return partial signals.
+# - If readiness parsing fails, fail-safe to BOOTSTRAP (never show ready incorrectly).
+
+function Get-RuntimeSignals {
+    $signals = @{
+        readiness    = $null
+        task_summary = $null
+        risk_summary = $null
+        last         = @{
+            scope      = $Global:LastScope
+            optimized  = [bool]($Global:LastOptimized -eq $true)
+            confidence = $Global:LastConfidence
+        }
+    }
+
+    # --- readiness.py (Context readiness) ---
+    try {
+        $defaultThresholds = @{ PRD = 80; SPEC = 80; DECISION_LOG = 30 }
+        $readinessNorm = @{
+            status     = "BOOTSTRAP"
+            files      = @{}
+            thresholds = $defaultThresholds
+            overall    = @{ ready = $false; blocking_files = @("PRD", "SPEC", "DECISION_LOG") }
+            source     = "readiness.py (fail-safe)"
+        }
+
+        $readinessScript = Join-Path $RepoRoot "tools\readiness.py"
+        $readinessJson = python "$readinessScript" "$CurrentDir" 2>&1
+        $readiness = $readinessJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+        if ($readiness) {
+            $readinessNorm.source = "readiness.py (live)"
+
+            # thresholds
+            $thresholds = @{}
+            foreach ($k in @("PRD", "SPEC", "DECISION_LOG")) {
+                $v = $null
+                try { $v = $readiness.thresholds.$k } catch { $v = $null }
+                if ($null -ne $v) { $thresholds[$k] = [int]$v }
+            }
+            if ($thresholds.Count -gt 0) {
+                foreach ($k in $thresholds.Keys) { $readinessNorm.thresholds[$k] = $thresholds[$k] }
+            }
+
+            # files (PRD/SPEC/DECISION_LOG) -> normalize to include state
+            foreach ($docName in @("PRD", "SPEC", "DECISION_LOG")) {
+                $fileData = $null
+                try { $fileData = $readiness.files.$docName } catch { $fileData = $null }
+
+                $exists = $false
+                $score = 0
+                $missing = @()
+
+                if ($fileData) {
+                    if ($null -ne $fileData.exists) { $exists = [bool]$fileData.exists }
+                    if ($null -ne $fileData.score) { $score = [int]$fileData.score }
+                    if ($fileData.missing) { $missing = @($fileData.missing) }
+                }
+
+                $threshold = if ($readinessNorm.thresholds.ContainsKey($docName)) { [int]$readinessNorm.thresholds[$docName] } else { 0 }
+                $state = "NEED"
+                if (-not $exists) { $state = "MISS" }
+                elseif ($threshold -gt 0 -and $score -ge $threshold) { $state = "OK" }
+                elseif ($score -le 40) { $state = "STUB" }
+
+                $readinessNorm.files[$docName] = @{
+                    score   = $score
+                    exists  = $exists
+                    missing = $missing
+                    state   = $state
+                }
+            }
+
+            # overall
+            if ($readiness.overall) {
+                $ready = $false
+                $blocking = @()
+                try { $ready = [bool]$readiness.overall.ready } catch { $ready = $false }
+                try { if ($readiness.overall.blocking_files) { $blocking = @($readiness.overall.blocking_files) } } catch { $blocking = @() }
+                $readinessNorm.overall = @{ ready = $ready; blocking_files = $blocking }
+            }
+
+            # status (EXECUTION|BOOTSTRAP), then infer PRE_INIT if all golden docs missing
+            if ($readiness.status) { $readinessNorm.status = [string]$readiness.status }
+            $allMissing = $true
+            foreach ($docName in @("PRD", "SPEC", "DECISION_LOG")) {
+                if ($readinessNorm.files.ContainsKey($docName) -and $readinessNorm.files[$docName].exists) { $allMissing = $false; break }
+            }
+            if ($allMissing) { $readinessNorm.status = "PRE_INIT" }
+
+            # ACTIVE_SPEC (not emitted by readiness.py) - existence only by default
+            $activeSpecPath = Join-Path $CurrentDir "docs\ACTIVE_SPEC.md"
+            $activeSpecExists = Test-Path $activeSpecPath
+            $readinessNorm.files["ACTIVE_SPEC"] = @{
+                score   = 0
+                exists  = [bool]$activeSpecExists
+                missing = @()
+                state   = if ($activeSpecExists) { "OK" } else { "MISS" }
+            }
+
+            # INBOX (not emitted by readiness.py) - count meaningful lines
+            $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
+            $meaningful = 0
+            if (Test-Path $inboxPath) {
+                $inboxContent = Get-Content $inboxPath -Raw -ErrorAction SilentlyContinue
+                if ($inboxContent) {
+                    foreach ($line in ($inboxContent -split "`n")) {
+                        $trimmed = $line.Trim()
+                        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                        if ($trimmed -match "ATOMIC_MESH_TEMPLATE_STUB") { continue }
+                        if ($trimmed -match "^#") { continue }
+                        if ($trimmed.Length -lt 3) { continue }
+                        if ($trimmed.StartsWith("Drop clarifications")) { continue }
+                        if ($trimmed.StartsWith("Next: run")) { continue }
+                        $meaningful++
+                    }
+                }
+            }
+            $readinessNorm.files["INBOX"] = @{
+                meaningful_lines = $meaningful
+                exists           = [bool](Test-Path $inboxPath)
+                state            = if ($meaningful -gt 0) { "PENDING" } else { "EMPTY" }
+            }
+        }
+
+        $signals.readiness = $readinessNorm
+    }
+    catch {
+        # Keep defaults (fail-safe) and continue
+        if (-not $signals.readiness) {
+            $signals.readiness = @{
+                status     = "BOOTSTRAP"
+                files      = @{}
+                thresholds = @{ PRD = 80; SPEC = 80; DECISION_LOG = 30 }
+                overall    = @{ ready = $false; blocking_files = @("PRD", "SPEC", "DECISION_LOG") }
+                source     = "readiness.py (error)"
+            }
+        }
+    }
+
+    # --- task_summary (counts by stream + by status) ---
+    try {
+        $byStatus = @{ NEXT = 0; RUNNING = 0; REVIEWING = 0; BLOCKED = 0; COMPLETED = 0 }
+
+        $rows = Invoke-Query "SELECT LOWER(status) as s, COUNT(*) as c FROM tasks GROUP BY LOWER(status)" -Silent
+        foreach ($r in $rows) {
+            $s = if ($r.s) { [string]$r.s } else { "" }
+            $c = if ($r.c) { [int]$r.c } else { 0 }
+
+            $bucket = switch ($s) {
+                "pending"     { "NEXT" }
+                "next"        { "NEXT" }
+                "planned"     { "NEXT" }
+                "in_progress" { "RUNNING" }
+                "running"     { "RUNNING" }
+                "in_review"   { "REVIEWING" }
+                "reviewing"   { "REVIEWING" }
+                "blocked"     { "BLOCKED" }
+                "failed"      { "BLOCKED" }
+                "cancelled"   { "COMPLETED" }
+                "canceled"    { "COMPLETED" }
+                "completed"   { "COMPLETED" }
+                default       { "NEXT" }
+            }
+
+            if (-not $byStatus.ContainsKey($bucket)) { $byStatus[$bucket] = 0 }
+            $byStatus[$bucket] += $c
+        }
+
+        $knownStreams = @("backend", "frontend", "qa", "audits", "librarian")
+        $byStream = @{}
+        foreach ($k in $knownStreams) { $byStream[$k] = 0 }
+        $byStream["other"] = 0
+
+        $streamRows = Invoke-Query "SELECT LOWER(type) as t, COUNT(*) as c FROM tasks GROUP BY LOWER(type)" -Silent
+        foreach ($r in $streamRows) {
+            $t = if ($r.t) { [string]$r.t } else { "" }
+            $c = if ($r.c) { [int]$r.c } else { 0 }
+
+            if ([string]::IsNullOrWhiteSpace($t)) { $byStream["other"] += $c; continue }
+            if ($byStream.ContainsKey($t)) { $byStream[$t] += $c } else { $byStream["other"] += $c }
+        }
+
+        $total = 0
+        foreach ($k in $byStatus.Keys) { $total += [int]$byStatus[$k] }
+
+        $signals.task_summary = @{
+            total     = $total
+            by_status = $byStatus
+            by_stream = $byStream
+        }
+    }
+    catch {
+        if (-not $signals.task_summary) {
+            $signals.task_summary = @{
+                total     = 0
+                by_status = @{ NEXT = 0; RUNNING = 0; REVIEWING = 0; BLOCKED = 0; COMPLETED = 0 }
+                by_stream = @{ backend = 0; frontend = 0; qa = 0; audits = 0; librarian = 0; other = 0 }
+            }
+        }
+    }
+
+    # --- risk_summary (HIGH risk tasks without QA PASS) ---
+    try {
+        $q = "SELECT COUNT(*) as c FROM tasks WHERE risk='HIGH' AND (qa_status IS NULL OR qa_status != 'PASS')"
+        $r = Invoke-Query $q -Silent
+        $count = if ($r -and $r.Count -gt 0) { [int]$r[0].c } else { 0 }
+        $signals.risk_summary = @{ high_not_pass = $count }
+    }
+    catch {
+        if (-not $signals.risk_summary) { $signals.risk_summary = @{ high_not_pass = 0 } }
+    }
+
+    return $signals
+}
+
+# ============================================================================
+# v15.5: PIPELINE STATUS MODEL (Stream B - Task B1)
+# ============================================================================
+# Derives stage states from existing signals only:
+# - Context: readiness.py (PRD/SPEC/DECISION_LOG scores)
+# - Plan: task DB - queued states (PENDING|NEXT|PLANNED) vs exhausted
+# - Work: task DB - active states (RUNNING|IN_PROGRESS) vs ready vs blocked
+# - Optimize: task notes (Entropy Check markers) - task-sticky, not session-local
+# - Verify: qa_status from task DB (HIGH risk + QA PASS check)
+# - Ship: verify state + git working tree cleanliness
+
+function Build-PipelineStatus {
+    <#
+    .SYNOPSIS
+        Builds a pipeline status model from existing runtime signals.
+    .PARAMETER SelectedRow
+        Optional: Currently selected task row (for context-aware hints)
+    .PARAMETER RuntimeSignals
+        Optional: Pre-fetched signals hashtable (avoids re-querying)
+    .RETURNS
+        Hashtable with stages, immediate_next, critical_missing, recommended_actions, source
+    #>
+    param(
+        [object]$SelectedRow = $null,
+        [hashtable]$RuntimeSignals = $null
+    )
+
+    # === GATHER SIGNALS (use cached if provided) ===
+
+    # 1. Context readiness (from readiness.py)
+    $readiness = $null
+    $contextStatus = "UNKNOWN"
+    $readinessFailOpen = $false
+    try {
+        $readinessScript = Join-Path $RepoRoot "tools\readiness.py"
+        $readinessJson = python "$readinessScript" "$CurrentDir" 2>&1
+        $readiness = $readinessJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($readiness) {
+            $contextStatus = $readiness.status  # EXECUTION, BOOTSTRAP, or PRE_INIT (inferred)
+
+            # Detect PRE_INIT: all golden docs missing
+            $allMissing = $true
+            foreach ($docName in @("PRD", "SPEC", "DECISION_LOG")) {
+                $fileData = $readiness.files.$docName
+                if ($fileData -and $fileData.exists) {
+                    $allMissing = $false
+                    break
+                }
+            }
+            if ($allMissing) { $contextStatus = "PRE_INIT" }
+        }
+        else {
+            # Parse failed - fail-open to BOOTSTRAP
+            $readinessFailOpen = $true
+            $contextStatus = "BOOTSTRAP"
+        }
+    }
+    catch {
+        # Exception - fail-open to BOOTSTRAP
+        $readinessFailOpen = $true
+        $contextStatus = "BOOTSTRAP"
+    }
+
+    # v16.0: Derive worst doc for BOOTSTRAP reason (reuses already-fetched readiness data)
+    $worstDoc = $null
+    $worstDocStatus = $null
+    if ($contextStatus -eq "BOOTSTRAP" -and $readiness -and $readiness.files) {
+        $docPriority = @("PRD", "SPEC", "DECISION_LOG")
+        foreach ($docName in $docPriority) {
+            $fileData = $readiness.files.$docName
+            $threshold = if ($readiness.thresholds.$docName) { $readiness.thresholds.$docName } else { 80 }
+            if ($fileData) {
+                if (-not $fileData.exists) {
+                    $worstDoc = $docName
+                    $worstDocStatus = "MISS"
+                    break
+                }
+                elseif ($fileData.score -lt $threshold) {
+                    # Check if stub (score capped at 40 typically)
+                    if ($fileData.score -le 40) {
+                        $worstDoc = $docName
+                        $worstDocStatus = "STUB"
+                        break
+                    }
+                    else {
+                        $worstDoc = $docName
+                        $worstDocStatus = "NEED"
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    # 2. Task counts by state (orthogonal Plan vs Work signals)
+    # Plan states: PENDING, NEXT, PLANNED (queued work)
+    # Work states: RUNNING, IN_PROGRESS (active work)
+    # Terminal states: COMPLETED, CANCELLED (exhausted)
+    # Blocked state: BLOCKED (stalled)
+
+    $queuedTasks = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE status IN ('pending', 'next', 'planned', 'PENDING', 'NEXT', 'PLANNED')" -Silent
+    $queuedCount = if ($queuedTasks -and $queuedTasks.Count -gt 0) { $queuedTasks[0].c } else { 0 }
+
+    $activeTasks = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE status IN ('running', 'in_progress', 'RUNNING', 'IN_PROGRESS')" -Silent
+    $activeCount = if ($activeTasks -and $activeTasks.Count -gt 0) { $activeTasks[0].c } else { 0 }
+
+    $terminalTasks = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE status IN ('completed', 'cancelled', 'COMPLETED', 'CANCELLED')" -Silent
+    $terminalCount = if ($terminalTasks -and $terminalTasks.Count -gt 0) { $terminalTasks[0].c } else { 0 }
+
+    $blockedTasks = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE status IN ('blocked', 'BLOCKED')" -Silent
+    $blockedCount = if ($blockedTasks -and $blockedTasks.Count -gt 0) { $blockedTasks[0].c } else { 0 }
+
+    $totalTasks = $queuedCount + $activeCount + $terminalCount + $blockedCount
+
+    # 3. HIGH risk tasks without QA PASS (for Verify/Ship stages)
+    # Strict: risk='HIGH' AND (qa_status IS NULL OR qa_status != 'PASS')
+    $highRiskUnverified = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE risk='HIGH' AND (qa_status IS NULL OR qa_status != 'PASS')" -Silent
+    $highRiskUnverifiedCount = if ($highRiskUnverified -and $highRiskUnverified.Count -gt 0) { $highRiskUnverified[0].c } else { 0 }
+
+    # v16.0: First blocked task ID (for Work=RED reason)
+    $firstBlockedId = $null
+    if ($blockedCount -gt 0) {
+        $firstBlocked = Invoke-Query "SELECT id FROM tasks WHERE status IN ('blocked', 'BLOCKED') ORDER BY id LIMIT 1" -Silent
+        if ($firstBlocked -and $firstBlocked.Count -gt 0 -and $firstBlocked[0].id) {
+            $firstBlockedId = $firstBlocked[0].id
+        }
+    }
+
+    # v16.0: First HIGH risk unverified task ID (for Verify reason)
+    $firstHighRiskId = $null
+    if ($highRiskUnverifiedCount -gt 0) {
+        $firstHighRisk = Invoke-Query "SELECT id FROM tasks WHERE risk='HIGH' AND (qa_status IS NULL OR qa_status != 'PASS') ORDER BY id LIMIT 1" -Silent
+        if ($firstHighRisk -and $firstHighRisk.Count -gt 0 -and $firstHighRisk[0].id) {
+            $firstHighRiskId = $firstHighRisk[0].id
+        }
+    }
+
+    # 4. Deterministic task selection for Optimize/Verify stages
+    # Priority: SelectedRow > first RUNNING > first NEXT > most recent PENDING > null
+    $optimizeProof = $false
+    $optimizeTaskId = $null
+    $taskSelectionReason = $null
+
+    if ($SelectedRow -and $SelectedRow.id) {
+        # User explicitly selected a task
+        $optimizeTaskId = $SelectedRow.id
+        $taskSelectionReason = "selected"
+    }
+    else {
+        # Deterministic fallback: RUNNING > NEXT > PENDING (most recent)
+        $runningTask = Invoke-Query "SELECT id FROM tasks WHERE status IN ('running', 'in_progress', 'RUNNING', 'IN_PROGRESS') ORDER BY updated_at DESC LIMIT 1" -Silent
+        if ($runningTask -and $runningTask.Count -gt 0 -and $runningTask[0].id) {
+            $optimizeTaskId = $runningTask[0].id
+            $taskSelectionReason = "first RUNNING"
+        }
+        else {
+            $nextTask = Invoke-Query "SELECT id FROM tasks WHERE status IN ('next', 'NEXT') ORDER BY updated_at DESC LIMIT 1" -Silent
+            if ($nextTask -and $nextTask.Count -gt 0 -and $nextTask[0].id) {
+                $optimizeTaskId = $nextTask[0].id
+                $taskSelectionReason = "first NEXT"
+            }
+            else {
+                $pendingTask = Invoke-Query "SELECT id FROM tasks WHERE status IN ('pending', 'PENDING') ORDER BY created_at DESC LIMIT 1" -Silent
+                if ($pendingTask -and $pendingTask.Count -gt 0 -and $pendingTask[0].id) {
+                    $optimizeTaskId = $pendingTask[0].id
+                    $taskSelectionReason = "most recent PENDING"
+                }
+            }
+        }
+    }
+
+    # 5. Optimization status - task-sticky via notes (not session-local)
+    if ($optimizeTaskId) {
+        $taskNotes = Invoke-Query "SELECT notes FROM tasks WHERE id='$optimizeTaskId'" -Silent
+        if ($taskNotes -and $taskNotes.Count -gt 0 -and $taskNotes[0].notes) {
+            $notes = $taskNotes[0].notes
+            # Check for entropy markers in notes
+            if ($notes -match "Entropy Check:\s*Passed" -or
+                $notes -match "OPTIMIZATION WAIVED" -or
+                $notes -match "CAPTAIN_OVERRIDE:\s*ENTROPY") {
+                $optimizeProof = $true
+            }
+        }
+    }
+
+    # 6. Git status (lightweight - just working tree cleanliness)
+    $hasUncommitted = $false
+    try {
+        $gitStatus = git status --porcelain 2>&1
+        $hasUncommitted = -not [string]::IsNullOrWhiteSpace($gitStatus)
+    }
+    catch {}
+
+    # === DERIVE STAGE STATES ===
+
+    # Stage state colors: GREEN (ready), YELLOW (warning), RED (blocked), GRAY (inactive/N/A)
+
+    # CONTEXT stage
+    $contextState = switch ($contextStatus) {
+        "EXECUTION" { "GREEN" }
+        "BOOTSTRAP" { "YELLOW" }
+        "PRE_INIT"  { "RED" }
+        default     { "GRAY" }
+    }
+    $contextHint = switch ($contextStatus) {
+        "EXECUTION" { "Docs complete" }
+        "BOOTSTRAP" { "Fill PRD/SPEC/DECISION_LOG" }
+        "PRE_INIT"  { "Run /init to bootstrap" }
+        default     { "Unknown state" }
+    }
+    # v16.0: Context reason (only for non-GREEN)
+    $contextReason = ""
+    if ($contextState -eq "RED") {
+        $contextReason = "Docs missing: PRD/SPEC/DECISION_LOG"
+    }
+    elseif ($contextState -eq "YELLOW") {
+        if ($readinessFailOpen) {
+            $contextReason = "Readiness unavailable (fail-open)"
+        }
+        elseif ($worstDoc -and $worstDocStatus) {
+            $contextReason = "Context incomplete: $worstDoc is $worstDocStatus"
+        }
+        else {
+            $contextReason = "Context incomplete"
+        }
+    }
+
+    # PLAN stage - orthogonal: checks queued states only
+    # GREEN = tasks in queued states (PENDING|NEXT|PLANNED)
+    # YELLOW = tasks exist but all terminal (COMPLETED|CANCELLED) - exhausted
+    # RED = zero tasks exist
+    $planState = "GRAY"
+    $planHint = "Needs context first"
+    $planReason = ""
+    if ($contextState -in @("GREEN", "YELLOW")) {
+        if ($queuedCount -gt 0) {
+            $planState = "GREEN"
+            $planHint = "$queuedCount task(s) queued"
+        }
+        elseif ($totalTasks -gt 0) {
+            # Tasks exist but none queued - exhausted or all blocked/active
+            $planState = "YELLOW"
+            $planHint = "Plan exhausted - add tasks"
+            $planReason = "All tasks terminal (no queued NEXT/PLANNED)"
+        }
+        else {
+            $planState = "RED"
+            $planHint = "No plan - run /draft-plan"
+            $planReason = "No tasks exist yet"
+        }
+    }
+
+    # WORK stage - orthogonal: checks active states only
+    # GREEN = tasks in active states (RUNNING|IN_PROGRESS)
+    # YELLOW = tasks in ready states but none running (NEXT|PENDING)
+    # RED = tasks BLOCKED and none running/ready - stalled
+    $workState = "GRAY"
+    $workHint = "Needs plan first"
+    $workReason = ""
+    if ($planState -in @("GREEN", "YELLOW")) {
+        if ($activeCount -gt 0) {
+            $workState = "GREEN"
+            $workHint = "$activeCount task(s) active"
+        }
+        elseif ($queuedCount -gt 0) {
+            $workState = "YELLOW"
+            $workHint = "Ready - run /go"
+            $workReason = "Queued but none running"
+        }
+        elseif ($blockedCount -gt 0) {
+            $workState = "RED"
+            $workHint = "$blockedCount task(s) blocked - stalled"
+            if ($firstBlockedId) {
+                $workReason = "Blocked tasks present (T-$firstBlockedId)"
+            }
+            else {
+                $workReason = "Blocked tasks present"
+            }
+        }
+        else {
+            $workState = "YELLOW"
+            $workHint = "No active work"
+            $workReason = "Queued but none running"
+        }
+    }
+
+    # OPTIMIZE stage - task-sticky via notes
+    # GREEN = selected task has entropy proof in notes
+    # YELLOW = no proof on selected task but tasks exist
+    # GRAY = no task selected / no tasks
+    $optimizeState = "GRAY"
+    $optimizeHint = "No task selected"
+    $optimizeReason = ""
+    if ($optimizeTaskId) {
+        if ($optimizeProof) {
+            $optimizeState = "GREEN"
+            $optimizeHint = "Entropy check passed"
+        }
+        else {
+            $optimizeState = "YELLOW"
+            $optimizeHint = "Run /simplify $optimizeTaskId"
+            $optimizeReason = "Missing entropy proof for selected task"
+        }
+    }
+    elseif ($totalTasks -gt 0) {
+        $optimizeState = "YELLOW"
+        $optimizeHint = "Select task to verify entropy"
+        $optimizeReason = "No task selected"
+    }
+
+    # VERIFY stage - HIGH risk only, NULL treated as not-pass
+    # GREEN = no HIGH risk unverified
+    # RED = any HIGH risk unverified (blocks ship)
+    $verifyState = "GRAY"
+    $verifyHint = "No HIGH risk tasks"
+    $verifyReason = ""
+
+    # Check if any HIGH risk tasks exist at all
+    $highRiskTotal = Invoke-Query "SELECT COUNT(*) as c FROM tasks WHERE risk='HIGH'" -Silent
+    $highRiskTotalCount = if ($highRiskTotal -and $highRiskTotal.Count -gt 0) { $highRiskTotal[0].c } else { 0 }
+
+    if ($highRiskTotalCount -gt 0) {
+        if ($highRiskUnverifiedCount -gt 0) {
+            $verifyState = "RED"
+            $verifyHint = "$highRiskUnverifiedCount HIGH risk unverified"
+            if ($firstHighRiskId) {
+                $verifyReason = "HIGH risk unverified: $highRiskUnverifiedCount (first: T-$firstHighRiskId)"
+            }
+            else {
+                $verifyReason = "HIGH risk unverified: $highRiskUnverifiedCount"
+            }
+        }
+        else {
+            $verifyState = "GREEN"
+            $verifyHint = "All HIGH risk verified"
+        }
+    }
+    elseif ($totalTasks -gt 0) {
+        # No HIGH risk tasks - verification not required
+        $verifyState = "GREEN"
+        $verifyHint = "No HIGH risk (skip)"
+    }
+
+    # SHIP stage - verify state + git cleanliness
+    # GREEN = clean working tree AND verify green
+    # YELLOW = uncommitted changes
+    # RED = verify red (blockers)
+    $shipState = "GRAY"
+    $shipHint = "Needs verification"
+    $shipReason = ""
+    if ($verifyState -eq "RED") {
+        $shipState = "RED"
+        $shipHint = "HIGH risk blocks ship"
+        $shipReason = "Ship blocked (verify/risk)"
+    }
+    elseif ($verifyState -eq "GREEN") {
+        if ($hasUncommitted) {
+            $shipState = "YELLOW"
+            $shipHint = "Uncommitted changes"
+            $shipReason = "Working tree dirty (uncommitted changes)"
+        }
+        else {
+            $shipState = "GREEN"
+            $shipHint = "Ready to ship"
+        }
+    }
+
+    # === BUILD STAGES ARRAY (v16.0: includes reason field) ===
+    $stages = @(
+        @{ name = "Context";  state = $contextState;  hint = $contextHint;  reason = $contextReason }
+        @{ name = "Plan";     state = $planState;     hint = $planHint;     reason = $planReason }
+        @{ name = "Work";     state = $workState;     hint = $workHint;     reason = $workReason }
+        @{ name = "Optimize"; state = $optimizeState; hint = $optimizeHint; reason = $optimizeReason }
+        @{ name = "Verify";   state = $verifyState;   hint = $verifyHint;   reason = $verifyReason }
+        @{ name = "Ship";     state = $shipState;     hint = $shipHint;     reason = $shipReason }
+    )
+
+    # === DERIVE IMMEDIATE NEXT STEP ===
+    $immediateNext = "Unknown"
+    $firstNonGreen = $stages | Where-Object { $_.state -ne "GREEN" } | Select-Object -First 1
+    if ($firstNonGreen) {
+        $immediateNext = $firstNonGreen.hint
+    }
+    else {
+        $immediateNext = "All stages green - ship when ready"
+    }
+
+    # === DERIVE CRITICAL MISSING ===
+    $criticalMissing = @()
+    foreach ($stage in $stages) {
+        if ($stage.state -eq "RED") {
+            $criticalMissing += "$($stage.name): $($stage.hint)"
+        }
+    }
+
+    # === DERIVE SUGGESTED NEXT (purely suggest, not auto-execute) ===
+    # Format: { command = "/ingest", reason = "Context=BOOTSTRAP" }
+    $suggestedNext = @{ command = $null; reason = $null }
+
+    # Walk pipeline stages to find first non-GREEN and suggest appropriate action
+    if ($contextState -eq "RED") {
+        $suggestedNext.command = "/init"
+        $suggestedNext.reason = "Context=PRE_INIT"
+    }
+    elseif ($contextState -eq "YELLOW") {
+        # Check INBOX first
+        $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
+        $inboxHasContent = $false
+        if (Test-Path $inboxPath) {
+            $inboxContent = Get-Content $inboxPath -Raw -ErrorAction SilentlyContinue
+            if ($inboxContent -and $inboxContent.Length -gt 100) {
+                $inboxHasContent = $true
+            }
+        }
+        if ($inboxHasContent) {
+            $suggestedNext.command = "/ingest"
+            $suggestedNext.reason = "Context=BOOTSTRAP, INBOX pending"
+        }
+        else {
+            $suggestedNext.command = "edit PRD.md | SPEC.md"
+            $suggestedNext.reason = "Context=BOOTSTRAP"
+        }
+    }
+    elseif ($planState -eq "RED") {
+        $suggestedNext.command = "/draft-plan"
+        $suggestedNext.reason = "Plan=RED (no tasks)"
+    }
+    elseif ($planState -eq "YELLOW") {
+        $suggestedNext.command = "/refresh-plan"
+        $suggestedNext.reason = "Plan=YELLOW (exhausted)"
+    }
+    elseif ($workState -eq "YELLOW" -and $queuedCount -gt 0) {
+        $suggestedNext.command = "/go"
+        $suggestedNext.reason = "Work=YELLOW (ready to start)"
+    }
+    elseif ($workState -eq "RED") {
+        $suggestedNext.command = "/unblock"
+        $suggestedNext.reason = "Work=RED (tasks blocked)"
+    }
+    elseif ($optimizeState -eq "YELLOW" -and $optimizeTaskId) {
+        $suggestedNext.command = "/simplify $optimizeTaskId"
+        $suggestedNext.reason = "Optimize=YELLOW (no entropy proof)"
+    }
+    elseif ($verifyState -eq "RED") {
+        # Find first HIGH risk unverified task
+        $firstHighRisk = Invoke-Query "SELECT id FROM tasks WHERE risk='HIGH' AND (qa_status IS NULL OR qa_status != 'PASS') LIMIT 1" -Silent
+        if ($firstHighRisk -and $firstHighRisk.Count -gt 0 -and $firstHighRisk[0].id) {
+            $suggestedNext.command = "/verify $($firstHighRisk[0].id)"
+            $suggestedNext.reason = "Verify=RED (HIGH risk unverified)"
+        }
+        else {
+            $suggestedNext.command = "/verify <id>"
+            $suggestedNext.reason = "Verify=RED"
+        }
+    }
+    elseif ($shipState -eq "YELLOW") {
+        $suggestedNext.command = "git add . && git commit"
+        $suggestedNext.reason = "Ship=YELLOW (uncommitted changes)"
+    }
+    elseif ($shipState -eq "GREEN") {
+        $suggestedNext.command = "/ship"
+        $suggestedNext.reason = "all stages GREEN"
+    }
+
+    # === DERIVE RECOMMENDED ACTIONS (conditional and honest) ===
+    $actions = @()
+
+    # I = /init or edit docs (if Context is BOOTSTRAP/PRE_INIT)
+    if ($contextState -eq "RED") {
+        # PRE_INIT: need /init
+        $actions += @{ key = "I"; label = "/init"; enabled = $true }
+    }
+    elseif ($contextState -eq "YELLOW") {
+        # BOOTSTRAP: need to edit docs or /ingest
+        $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
+        $inboxHasContent = $false
+        if (Test-Path $inboxPath) {
+            $inboxContent = Get-Content $inboxPath -Raw -ErrorAction SilentlyContinue
+            if ($inboxContent -and $inboxContent.Length -gt 100) {
+                $inboxHasContent = $true
+            }
+        }
+        if ($inboxHasContent) {
+            $actions += @{ key = "I"; label = "/ingest"; enabled = $true }
+        }
+        else {
+            $actions += @{ key = "I"; label = "edit docs"; enabled = $true }
+        }
+    }
+
+    # S = /simplify (if Optimize is YELLOW - no proof on selected task)
+    if ($optimizeState -eq "YELLOW") {
+        $simplifyLabel = if ($optimizeTaskId) { "/simplify $optimizeTaskId" } else { "/simplify <id>" }
+        $actions += @{ key = "S"; label = $simplifyLabel; enabled = $true }
+    }
+
+    # V = /verify (if Verify is YELLOW or RED - HIGH risk unverified)
+    if ($verifyState -in @("YELLOW", "RED")) {
+        $actions += @{ key = "V"; label = "/verify <id>"; enabled = $true }
+    }
+
+    # === DETERMINE SOURCE (with fail-open indicator and task selection reason) ===
+    $source = "readiness.py"
+    if ($readinessFailOpen) {
+        $source += " (fail-open)"
+    }
+    else {
+        $source += " (live)"
+    }
+    $source += " / tasks DB"
+    if ($optimizeTaskId -and $taskSelectionReason) {
+        $source += " / task: $optimizeTaskId ($taskSelectionReason)"
+    }
+
+    # === RETURN MODEL ===
+    return @{
+        stages              = $stages
+        immediate_next      = $immediateNext
+        critical_missing    = $criticalMissing
+        recommended_actions = $actions
+        suggested_next      = $suggestedNext
+        source              = $source
+    }
+}
+
+# ============================================================================
+# v16.0: PIPELINE SNAPSHOT LOGGER (Deblackbox - Yellow/Red Snapshots Only)
+# ============================================================================
+# Persists minimal debug snapshot ONLY when any pipeline stage is YELLOW or RED.
+# Does NOT log when all stages are GREEN.
+# Path: logs/pipeline_snapshots.jsonl (append-only JSONL)
+
+# Global dedupe state
+if (-not (Test-Path variable:Global:LastPipelineSnapshotHash)) {
+    $Global:LastPipelineSnapshotHash = $null
+}
+if (-not (Test-Path variable:Global:LastPipelineSnapshotUtc)) {
+    $Global:LastPipelineSnapshotUtc = [datetime]::MinValue
+}
+
+function Write-PipelineSnapshotIfNeeded {
+    <#
+    .SYNOPSIS
+        Writes a pipeline snapshot to logs/pipeline_snapshots.jsonl if conditions are met.
+    .DESCRIPTION
+        Only writes when:
+        1. ANY stage is YELLOW or RED (not when all GREEN)
+        2. Hash changed (content differs from last snapshot)
+        3. At least 2 seconds since last write (debounce)
+    .PARAMETER PipelineData
+        The pipeline status model from Build-PipelineStatus
+    .PARAMETER SelectedTaskId
+        Optional: Currently selected task ID
+    #>
+    param(
+        [hashtable]$PipelineData,
+        [string]$SelectedTaskId = $null
+    )
+
+    # Guard: require valid pipeline data
+    if (-not $PipelineData -or -not $PipelineData.stages) {
+        return
+    }
+
+    # Check if any stage is YELLOW or RED
+    $hasNonGreen = $false
+    foreach ($s in $PipelineData.stages) {
+        if ($s.state -in @("RED", "YELLOW")) {
+            $hasNonGreen = $true
+            break
+        }
+    }
+
+    # Do NOT log when all stages are GREEN
+    if (-not $hasNonGreen) {
+        return
+    }
+
+    # Build snapshot object (minimal, stable fields)
+    $mode = "EXECUTION"
+    $ctxStage = $PipelineData.stages | Where-Object { $_.name -eq "Context" } | Select-Object -First 1
+    if ($ctxStage) {
+        if ($ctxStage.state -eq "RED") { $mode = "PRE_INIT" }
+        elseif ($ctxStage.state -eq "YELLOW") { $mode = "BOOTSTRAP" }
+    }
+
+    $stagesObj = @{}
+    foreach ($s in $PipelineData.stages) {
+        $stageEntry = @{ state = $s.state }
+        if ($s.reason -and $s.reason.Length -gt 0) {
+            $stageEntry.reason = $s.reason
+        }
+        $stagesObj[$s.name] = $stageEntry
+    }
+
+    $snapshot = @{
+        ts            = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        mode          = $mode
+        stages        = $stagesObj
+        selected_task = if ($SelectedTaskId) { $SelectedTaskId } else { $null }
+        source        = $PipelineData.source
+    }
+
+    # Convert to compact JSON for hashing and writing
+    $snapshotJson = $snapshot | ConvertTo-Json -Compress -Depth 4
+
+    # Compute hash for dedupe (simple string hash)
+    # Hash only the content-changing fields (exclude ts for hash comparison)
+    $hashContent = @{
+        mode          = $mode
+        stages        = $stagesObj
+        selected_task = $snapshot.selected_task
+        source        = $PipelineData.source
+    } | ConvertTo-Json -Compress -Depth 4
+    $currentHash = $hashContent.GetHashCode()
+
+    # Check dedupe conditions
+    $now = [datetime]::UtcNow
+    $timeSinceLast = ($now - $Global:LastPipelineSnapshotUtc).TotalSeconds
+
+    if ($currentHash -eq $Global:LastPipelineSnapshotHash -or $timeSinceLast -lt 2) {
+        # Dedupe: same content hash OR less than 2 seconds since last write
+        return
+    }
+
+    # Ensure logs/ directory exists
+    $logsDir = Join-Path $CurrentDir "logs"
+    if (-not (Test-Path $logsDir)) {
+        try {
+            New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+        }
+        catch {
+            # Silent fail if can't create directory
+            return
+        }
+    }
+
+    # Append to JSONL file
+    $snapshotPath = Join-Path $logsDir "pipeline_snapshots.jsonl"
+    try {
+        Add-Content -Path $snapshotPath -Value $snapshotJson -Encoding UTF8
+        # Update dedupe state
+        $Global:LastPipelineSnapshotHash = $currentHash
+        $Global:LastPipelineSnapshotUtc = $now
+    }
+    catch {
+        # Silent fail on write error
+    }
+}
+
+# ============================================================================
+# v15.5: PIPELINE PANEL RENDERER (Stream B - Task B2)
+# ============================================================================
+# Renders the dynamic arrow pipeline in the right panel:
+# [Context] → [Plan] → [Work] → [Optimize] → [Verify] → [Ship]
+# Each stage colored by state (GREEN/YELLOW/RED/GRAY)
+
+function Draw-PipelinePanel {
+    <#
+    .SYNOPSIS
+        Renders the pipeline status panel on the right side of the dashboard.
+    .PARAMETER StartRow
+        The row number to start drawing from
+    .PARAMETER HalfWidth
+        The width of the right panel (half of terminal width)
+    .PARAMETER PipelineData
+        The pipeline status model from Build-PipelineStatus
+    .RETURNS
+        The next row number after drawing
+    #>
+    param(
+        [int]$StartRow,
+        [int]$HalfWidth,
+        [hashtable]$PipelineData
+    )
+
+    $R = $StartRow
+    $RightWidth = $HalfWidth - 4  # Content width inside borders
+
+    # === STATE COLOR MAP ===
+    $stateColors = @{
+        "GREEN"  = "Green"
+        "YELLOW" = "Yellow"
+        "RED"    = "Red"
+        "GRAY"   = "DarkGray"
+    }
+
+    # === HEADER ===
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host "PIPELINE".PadRight($RightWidth) -NoNewline -ForegroundColor Cyan
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === SOURCE LINE ===
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    $sourceText = "Source: $($PipelineData.source)"
+    if ($sourceText.Length -gt $RightWidth) {
+        $sourceText = $sourceText.Substring(0, $RightWidth - 3) + "..."
+    }
+    Write-Host $sourceText.PadRight($RightWidth) -NoNewline -ForegroundColor DarkGray
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === BLANK LINE ===
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * $RightWidth) -NoNewline
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === ARROW PIPELINE ===
+    # Build the pipeline string: [Context] → [Plan] → ...
+    # Each stage is colored by its state
+
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+    $stages = $PipelineData.stages
+    $pipelineChars = 0
+
+    for ($i = 0; $i -lt $stages.Count; $i++) {
+        $stage = $stages[$i]
+        $color = $stateColors[$stage.state]
+        $stageName = $stage.name
+
+        # Abbreviate stage names to fit in panel
+        $shortName = switch ($stageName) {
+            "Context"  { "Ctx" }
+            "Plan"     { "Pln" }
+            "Work"     { "Wrk" }
+            "Optimize" { "Opt" }
+            "Verify"   { "Ver" }
+            "Ship"     { "Shp" }
+            default    { $stageName.Substring(0, 3) }
+        }
+
+        Write-Host "[$shortName]" -NoNewline -ForegroundColor $color
+        $pipelineChars += $shortName.Length + 2
+
+        # Add arrow between stages (except after last)
+        if ($i -lt $stages.Count - 1) {
+            Write-Host "→" -NoNewline -ForegroundColor DarkGray
+            $pipelineChars += 1
+        }
+    }
+
+    # Pad remaining space
+    $padLen = $RightWidth - $pipelineChars
+    if ($padLen -gt 0) {
+        Write-Host (" " * $padLen) -NoNewline
+    }
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === BLANK LINE ===
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * $RightWidth) -NoNewline
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === SUGGESTED NEXT (purely suggest, not auto-execute) ===
+    # Format: "Next: /ingest (because Context=BOOTSTRAP)"
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host "Next: " -NoNewline -ForegroundColor Yellow
+
+    $suggestedCmd = $PipelineData.suggested_next.command
+    $suggestedReason = $PipelineData.suggested_next.reason
+
+    if ($suggestedCmd -and $suggestedReason) {
+        $nextText = "$suggestedCmd (because $suggestedReason)"
+    }
+    elseif ($suggestedCmd) {
+        $nextText = $suggestedCmd
+    }
+    else {
+        $nextText = $PipelineData.immediate_next
+    }
+
+    $nextAvail = $RightWidth - 6  # "Next: " is 6 chars
+    if ($nextText.Length -gt $nextAvail) {
+        $nextText = $nextText.Substring(0, $nextAvail - 3) + "..."
+    }
+    Write-Host $nextText.PadRight($nextAvail) -NoNewline -ForegroundColor White
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === v16.0: REASON LINES (replaces Critical section) ===
+    # Collect non-GREEN stages with reasons, sorted by severity (RED first) then pipeline order
+    $nonGreenStages = @()
+    if ($PipelineData.stages) {
+        foreach ($s in $PipelineData.stages) {
+            if ($s.state -in @("RED", "YELLOW") -and $s.reason) {
+                $nonGreenStages += @{
+                    name = $s.name
+                    state = $s.state
+                    reason = $s.reason
+                    priority = if ($s.state -eq "RED") { 0 } else { 1 }
+                }
+            }
+        }
+    }
+
+    # Sort: RED first (priority 0), then YELLOW (priority 1), preserving pipeline order within
+    $sortedStages = $nonGreenStages | Sort-Object -Property priority
+
+    if ($sortedStages.Count -gt 0) {
+        # Blank line before reasons
+        Set-Pos $R $HalfWidth
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host (" " * $RightWidth) -NoNewline
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+
+        # Determine header: Critical if any RED, else Attention
+        $hasRed = ($sortedStages | Where-Object { $_.state -eq "RED" }).Count -gt 0
+        $headerText = if ($hasRed) { "Critical:" } else { "Attention:" }
+        $headerColor = if ($hasRed) { "Red" } else { "Yellow" }
+
+        Set-Pos $R $HalfWidth
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $headerText.PadRight($RightWidth) -NoNewline -ForegroundColor $headerColor
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+
+        # Show up to 2 reason lines (worst-first)
+        $reasonsToShow = $sortedStages | Select-Object -First 2
+        # Stage name abbreviations
+        $stageAbbrev = @{
+            "Context"  = "CTX"
+            "Plan"     = "PLN"
+            "Work"     = "WRK"
+            "Optimize" = "OPT"
+            "Verify"   = "VER"
+            "Ship"     = "SHP"
+        }
+
+        foreach ($rs in $reasonsToShow) {
+            Set-Pos $R $HalfWidth
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+            $abbrev = if ($stageAbbrev.ContainsKey($rs.name)) { $stageAbbrev[$rs.name] } else { $rs.name.Substring(0,3).ToUpper() }
+            $reasonLine = "($abbrev) $($rs.reason)"
+            $lineColor = if ($rs.state -eq "RED") { "Red" } else { "Yellow" }
+
+            if ($reasonLine.Length -gt $RightWidth) {
+                $reasonLine = $reasonLine.Substring(0, $RightWidth - 3) + "..."
+            }
+            Write-Host $reasonLine.PadRight($RightWidth) -NoNewline -ForegroundColor $lineColor
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+            $R++
+        }
+    }
+
+    # === BLANK LINE ===
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * $RightWidth) -NoNewline
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # === HOTKEYS (only enabled ones) ===
+    $actions = $PipelineData.recommended_actions | Where-Object { $_.enabled }
+    if ($actions -and $actions.Count -gt 0) {
+        Set-Pos $R $HalfWidth
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host "Hotkeys: " -NoNewline -ForegroundColor DarkGray
+
+        $hotkeyStr = ""
+        foreach ($action in $actions) {
+            if ($hotkeyStr.Length -gt 0) { $hotkeyStr += " " }
+            $hotkeyStr += "$($action.key)=$($action.label)"
+        }
+
+        $hotkeyAvail = $RightWidth - 9  # "Hotkeys: " is 9 chars
+        if ($hotkeyStr.Length -gt $hotkeyAvail) {
+            $hotkeyStr = $hotkeyStr.Substring(0, $hotkeyAvail - 3) + "..."
+        }
+        Write-Host $hotkeyStr.PadRight($hotkeyAvail) -NoNewline -ForegroundColor Cyan
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+    }
+
+    return $R
+}
+
 # --- PRINT ROW WITH ABSOLUTE POSITIONING ---
 function Print-Row {
     param(
@@ -2942,36 +4427,355 @@ function Draw-Border {
     Write-Host "+$line+" -NoNewline -ForegroundColor DarkGray
 }
 
-# --- v13.6: PROGRESS BAR RENDERER for BOOTSTRAP MODE ---
+# --- v14.1: PROGRESS BAR RENDERER for BOOTSTRAP MODE (Compact ASCII Style) ---
 function Format-ProgressBar {
     param(
         [int]$Score,
         [int]$Threshold,
-        [int]$Width = 15
+        [int]$Width = 10,
+        [bool]$Exists = $true
     )
 
     # Determine color based on score vs threshold
     $Color = if ($Score -ge $Threshold) { "Green" }
-    elseif ($Score -ge ($Threshold * 0.7)) { "Yellow" }
+    elseif ($Score -ge 50) { "Yellow" }
     else { "Red" }
 
-    # Calculate filled/empty portions
-    $Filled = [Math]::Floor($Score / 100 * $Width)
-    $Empty = $Width - $Filled
+    # Determine state label
+    $StateLabel = if (-not $Exists) { "MISS" }
+    elseif ($Score -ge $Threshold) { "OK" }
+    elseif ($Score -le 40) { "STUB" }  # Capped stub score
+    else { "NEED" }
 
-    # Unicode blocks: █ (full block) and ░ (light shade)
-    $Bar = ""
-    if ($Filled -gt 0) { $Bar += [string]([char]0x2588) * $Filled }
-    if ($Empty -gt 0) { $Bar += [string]([char]0x2591) * $Empty }
+    # Calculate filled/empty portions (compact microbar: ■□, max 5 chars)
+    $MicroWidth = 5
+    $Filled = [Math]::Floor($Score / 100 * $MicroWidth)
+    $Empty = $MicroWidth - $Filled
+
+    $MicroBar = ""
+    if ($Filled -gt 0) { $MicroBar += "■" * $Filled }
+    if ($Empty -gt 0) { $MicroBar += "□" * $Empty }
 
     return @{
-        Bar        = "[$Bar]"
+        MicroBar   = $MicroBar
         Percentage = "{0,3}%" -f $Score
         Color      = $Color
+        StateLabel = $StateLabel
     }
 }
 
-# --- v13.6: BOOTSTRAP PANEL RENDERER ---
+# --- v16.0: STREAM STATUS LINE HELPER for COMPACT DASHBOARD ---
+function Get-StreamStatusLine {
+    <#
+    .SYNOPSIS
+        Returns compact status info for a stream (BACKEND/FRONTEND/QA/LIBRARIAN).
+    .PARAMETER StreamName
+        One of: BACKEND, FRONTEND, QA, LIBRARIAN
+    .PARAMETER WorkerData
+        Worker status hashtable from Get-WorkerStatus
+    .RETURNS
+        @{ Bar; BarColor; State; Summary; SummaryColor }
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("BACKEND", "FRONTEND", "QA", "LIBRARIAN")]
+        [string]$StreamName,
+        [hashtable]$WorkerData
+    )
+
+    # Defaults (fail-open: show "—" + Gray microbar)
+    $result = @{
+        Bar          = "□□□□□"
+        BarColor     = "DarkGray"
+        State        = "—"
+        Summary      = "—"
+        SummaryColor = "DarkGray"
+    }
+
+    if (-not $WorkerData) { return $result }
+
+    switch ($StreamName) {
+        "BACKEND" {
+            # Get delegation count for NEXT state
+            $delegationCount = 0
+            if ($Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY") {
+                $beStream = $Global:StartupDelegation.streams | Where-Object { $_.id -match "^backend$" } | Select-Object -First 1
+                if ($beStream) { $delegationCount = $beStream.task_count }
+            }
+
+            $status = $WorkerData.backend_status
+            $task = $WorkerData.backend_task
+
+            # Determine state and colors
+            if ($status -eq "UP") {
+                $result.State = "RUNNING"
+                $result.Bar = "■■■■■"
+                $result.BarColor = "Green"
+                $result.SummaryColor = "White"
+            }
+            elseif ($delegationCount -gt 0) {
+                $result.State = "NEXT"
+                $result.Bar = "■■□□□"
+                $result.BarColor = "Cyan"
+                $result.SummaryColor = "Cyan"
+                $result.Summary = "$delegationCount task(s) queued"
+            }
+            else {
+                $result.State = "IDLE"
+                $result.Bar = "□□□□□"
+                $result.BarColor = "DarkGray"
+                $result.SummaryColor = "DarkGray"
+            }
+
+            # Format task summary: "[T-123] desc" -> "desc (T-123)"
+            if ($task -and $task -ne "(none)" -and $result.State -eq "RUNNING") {
+                if ($task -match "^\[([^\]]+)\]\s*(.*)$") {
+                    $taskId = $Matches[1]
+                    $taskDesc = $Matches[2].Trim()
+                    if ($taskDesc) {
+                        $result.Summary = "$taskDesc ($taskId)"
+                    } else {
+                        $result.Summary = "($taskId)"
+                    }
+                }
+                else {
+                    $result.Summary = $task
+                }
+            }
+        }
+
+        "FRONTEND" {
+            # Get delegation count for NEXT state
+            $delegationCount = 0
+            if ($Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY") {
+                $feStream = $Global:StartupDelegation.streams | Where-Object { $_.id -match "^frontend$" } | Select-Object -First 1
+                if ($feStream) { $delegationCount = $feStream.task_count }
+            }
+
+            $status = $WorkerData.frontend_status
+            $task = $WorkerData.frontend_task
+
+            # Determine state and colors
+            if ($status -eq "UP") {
+                $result.State = "RUNNING"
+                $result.Bar = "■■■■■"
+                $result.BarColor = "Green"
+                $result.SummaryColor = "White"
+            }
+            elseif ($delegationCount -gt 0) {
+                $result.State = "NEXT"
+                $result.Bar = "■■□□□"
+                $result.BarColor = "Cyan"
+                $result.SummaryColor = "Cyan"
+                $result.Summary = "$delegationCount task(s) queued"
+            }
+            else {
+                $result.State = "IDLE"
+                $result.Bar = "□□□□□"
+                $result.BarColor = "DarkGray"
+                $result.SummaryColor = "DarkGray"
+            }
+
+            # Format task summary: "[T-123] desc" -> "desc (T-123)"
+            if ($task -and $task -ne "(none)" -and $result.State -eq "RUNNING") {
+                if ($task -match "^\[([^\]]+)\]\s*(.*)$") {
+                    $taskId = $Matches[1]
+                    $taskDesc = $Matches[2].Trim()
+                    if ($taskDesc) {
+                        $result.Summary = "$taskDesc ($taskId)"
+                    } else {
+                        $result.Summary = "($taskId)"
+                    }
+                }
+                else {
+                    $result.Summary = $task
+                }
+            }
+        }
+
+        "QA" {
+            # Count HIGH risk tasks without PASS qa_status
+            try {
+                # First get the actual count
+                $countQuery = "SELECT COUNT(*) as cnt FROM tasks WHERE risk = 'HIGH' AND (qa_status IS NULL OR qa_status != 'PASS') AND status IN ('pending', 'in_review', 'completed')"
+                $countResult = Invoke-Query -Query $countQuery -Silent
+
+                if ($countResult -and $countResult[0].cnt -gt 0) {
+                    $count = [int]$countResult[0].cnt
+
+                    # Get first task for example
+                    $firstTaskQuery = "SELECT id FROM tasks WHERE risk = 'HIGH' AND (qa_status IS NULL OR qa_status != 'PASS') AND status IN ('pending', 'in_review', 'completed') LIMIT 1"
+                    $firstTask = Invoke-Query -Query $firstTaskQuery -Silent
+                    $firstId = if ($firstTask) { "T-$($firstTask[0].id)" } else { "T-?" }
+
+                    $result.State = "PENDING"
+                    $result.Bar = "■□□□□"
+                    $result.BarColor = "Yellow"
+                    $result.SummaryColor = "Yellow"
+                    $result.Summary = "$count HIGH unverified (e.g., $firstId)"
+                }
+                else {
+                    # Check for any pending QA sessions
+                    $qaPending = $WorkerData.qa_sessions
+                    if ($qaPending -and $qaPending -gt 0) {
+                        $result.State = "PENDING"
+                        $result.Bar = "■■□□□"
+                        $result.BarColor = "Yellow"
+                        $result.SummaryColor = "Yellow"
+                        $result.Summary = "$qaPending awaiting audit"
+                    }
+                    else {
+                        $result.State = "OK"
+                        $result.Bar = "■■■■■"
+                        $result.BarColor = "Green"
+                        $result.SummaryColor = "Green"
+                        $result.Summary = "All verified"
+                    }
+                }
+            }
+            catch {
+                # Fail-open: show unknown state
+                $result.State = "—"
+                $result.Summary = "—"
+            }
+        }
+
+        "LIBRARIAN" {
+            $libStatus = $WorkerData.lib_status_text
+
+            switch -Wildcard ($libStatus) {
+                "MESSY" {
+                    $result.State = "WARN"
+                    $result.Bar = "■□□□□"
+                    $result.BarColor = "Red"
+                    $result.SummaryColor = "Red"
+                    $result.Summary = "Root cluttered (>5 loose files)"
+                }
+                "CLUTTERED" {
+                    $result.State = "WARN"
+                    $result.Bar = "■■□□□"
+                    $result.BarColor = "Yellow"
+                    $result.SummaryColor = "Yellow"
+                    $result.Summary = "Some loose files detected"
+                }
+                "*Inbox*" {
+                    $result.State = "PENDING"
+                    $result.Bar = "■■□□□"
+                    $result.BarColor = "Yellow"
+                    $result.SummaryColor = "Yellow"
+                    $result.Summary = "Inbox items pending /ingest"
+                }
+                "CLEAN" {
+                    $result.State = "OK"
+                    $result.Bar = "■■■■■"
+                    $result.BarColor = "Green"
+                    $result.SummaryColor = "Green"
+                    $result.Summary = "Library clean"
+                }
+                default {
+                    $result.State = "OK"
+                    $result.Bar = "■■■□□"
+                    $result.BarColor = "Green"
+                    $result.SummaryColor = "DarkGray"
+                    $result.Summary = "—"
+                }
+            }
+        }
+    }
+
+    return $result
+}
+
+# --- v15.3: TEXT WRAPPING HELPER for BOOTSTRAP PANEL ---
+function Wrap-PanelText {
+    <#
+    .SYNOPSIS
+        Wraps text to fit within a given width, with optional indentation for continuation lines.
+    .PARAMETER Text
+        The text to wrap
+    .PARAMETER Width
+        Maximum width per line
+    .PARAMETER Indent
+        Number of spaces to indent continuation lines (default 0)
+    .RETURNS
+        Array of lines that fit within the width
+    #>
+    param(
+        [string]$Text,
+        [int]$Width,
+        [int]$Indent = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text) -or $Text.Length -le $Width) {
+        return @($Text)
+    }
+
+    $lines = @()
+    $words = $Text -split '\s+'
+    $currentLine = ""
+    $isFirst = $true
+
+    foreach ($word in $words) {
+        $effectiveWidth = if ($isFirst) { $Width } else { $Width - $Indent }
+        $testLine = if ($currentLine) { "$currentLine $word" } else { $word }
+
+        if ($testLine.Length -le $effectiveWidth) {
+            $currentLine = $testLine
+        }
+        else {
+            if ($currentLine) {
+                $lines += if ($isFirst) { $currentLine } else { (" " * $Indent) + $currentLine }
+                $isFirst = $false
+            }
+            $currentLine = $word
+        }
+    }
+
+    if ($currentLine) {
+        $lines += if ($isFirst) { $currentLine } else { (" " * $Indent) + $currentLine }
+    }
+
+    return $lines
+}
+
+# --- v14.1: PRE-INIT PANEL (Before /init - No docs exist) ---
+function Draw-PreInitPanel {
+    param(
+        [int]$StartRow,
+        [int]$HalfWidth,
+        [object]$WorkerData
+    )
+
+    $R = $StartRow
+
+    # Left: NEW PROJECT SETUP header
+    Print-Row $R "NEW PROJECT SETUP" "SETUP REQUIRED" $HalfWidth "Cyan" "Cyan"
+    $R++
+    Print-Row $R "" "" $HalfWidth "DarkGray" "DarkGray"
+    $R++
+
+    # Left: Instructions
+    Print-Row $R "  Run /init to scaffold docs" "Next focus: SETUP" $HalfWidth "Yellow" "Yellow"
+    $R++
+    Print-Row $R "  /profile <name> to set profile" "Action: /init" $HalfWidth "DarkGray" "Cyan"
+    $R++
+    Print-Row $R "" "" $HalfWidth "DarkGray" "DarkGray"
+    $R++
+
+    # Show worker status (IDLE state)
+    $BE_Color = if ($WorkerData.backend_status -eq "UP") { "Green" } else { "DarkGray" }
+    $FE_Color = if ($WorkerData.frontend_status -eq "UP") { "Green" } else { "DarkGray" }
+
+    Print-Row $R "BACKEND  [IDLE]" "FRONTEND  [IDLE]" $HalfWidth $BE_Color $FE_Color
+    $R++
+    Print-Row $R "QA/AUDIT [IDLE]" "" $HalfWidth "DarkGray" "DarkGray"
+    $R++
+
+    return $R
+}
+
+# --- v14.1: BOOTSTRAP PANEL RENDERER (Compact Inline Style) ---
+# v15.3: Refactored with line arrays for balanced left/right spacing
 function Draw-BootstrapPanel {
     param(
         [int]$StartRow,
@@ -2980,71 +4784,1321 @@ function Draw-BootstrapPanel {
     )
 
     $R = $StartRow
+    # Compute effective right panel width (leave some margin)
+    $RightWidth = $HalfWidth - 4
 
-    # Header
-    Print-Row $R "BOOTSTRAP MODE" "CONTEXT READINESS" $HalfWidth "Cyan" "Cyan"
-    $R++
-    Print-Row $R "" "" $HalfWidth "DarkGray" "DarkGray"
-    $R++
+    # === PHASE 1: Collect doc states and compute guidance ===
+    $docStates = @{}
+    $severityOrder = @{ "MISS" = 0; "STUB" = 1; "NEED" = 2; "OK" = 3 }
+    # Fixed priority order: PRD > SPEC > TECH_STACK > DECISION_LOG
+    $priorityOrder = @{ "PRD" = 0; "SPEC" = 1; "TECH_STACK" = 2; "DECISION_LOG" = 3 }
+    $worstDoc = $null
+    $worstSeverity = 999
+    $worstPriority = 999
+    $criticalBullets = @()
 
-    # File progress bars
+    # Process docs from readiness.py (PRD, SPEC, DECISION_LOG)
     foreach ($fileName in @("PRD", "SPEC", "DECISION_LOG")) {
         $fileData = $ReadinessData.files.$fileName
         $threshold = $ReadinessData.thresholds.$fileName
-        $progress = Format-ProgressBar -Score $fileData.score -Threshold $threshold -Width 15
+        $score = if ($fileData) { [int]$fileData.score } else { 0 }
+        $exists = if ($fileData) { $fileData.exists } else { $false }
 
-        # Left: File name + bar
-        $leftTxt = "$fileName $($progress.Bar) $($progress.Percentage)"
+        $progress = Format-ProgressBar -Score $score -Threshold $threshold -Width 10 -Exists $exists
+        $state = $progress.StateLabel
 
-        # Right: Status indicator
-        $rightTxt = if ($fileData.score -ge $threshold) {
-            "✅ Ready"
+        $docStates[$fileName] = @{
+            Score = $score
+            Threshold = $threshold
+            Exists = $exists
+            State = $state
+            Progress = $progress
         }
-        elseif ($fileData.exists) {
-            "⚠️ Needs content"
+    }
+
+    # Manually detect TECH_STACK.md (not in readiness.py contract)
+    $techStackPath = Join-Path $CurrentDir "docs\TECH_STACK.md"
+    $techStackExists = Test-Path $techStackPath
+    $techStackScore = 0
+    $techStackState = "MISS"
+
+    if ($techStackExists) {
+        $techStackContent = Get-Content $techStackPath -Raw -ErrorAction SilentlyContinue
+        $isStub = $techStackContent -match "ATOMIC_MESH_TEMPLATE_STUB"
+        $wordCount = if ($techStackContent) { ($techStackContent -split '\s+').Count } else { 0 }
+
+        if ($isStub -and $wordCount -lt 200) {
+            $techStackState = "STUB"
+            $techStackScore = 30
+        }
+        elseif ($wordCount -lt 100) {
+            $techStackState = "NEED"
+            $techStackScore = 50
         }
         else {
-            "❌ Missing file"
+            $techStackState = "OK"
+            $techStackScore = 80
+        }
+    }
+
+    $techStackProgress = Format-ProgressBar -Score $techStackScore -Threshold 60 -Width 10 -Exists $techStackExists
+    $docStates["TECH_STACK"] = @{
+        Score = $techStackScore
+        Threshold = 60
+        Exists = $techStackExists
+        State = $techStackState
+        Progress = $techStackProgress
+    }
+
+    # Determine worst doc using fixed priority (GATE DOCS ONLY: PRD > SPEC > DECISION_LOG)
+    # TECH_STACK is advisory - does not block planning
+    foreach ($fileName in @("PRD", "SPEC", "DECISION_LOG")) {
+        $docState = $docStates[$fileName]
+        $state = $docState.State
+        $sev = if ($severityOrder.ContainsKey($state)) { $severityOrder[$state] } else { 3 }
+        $pri = $priorityOrder[$fileName]
+
+        # Worst = lowest severity, then by fixed priority order
+        if ($sev -lt $worstSeverity -or ($sev -eq $worstSeverity -and $pri -lt $worstPriority)) {
+            $worstSeverity = $sev
+            $worstPriority = $pri
+            $worstDoc = $fileName
         }
 
-        Print-Row $R $leftTxt $rightTxt $HalfWidth $progress.Color "Gray"
+        # Build critical bullets for non-OK GATE docs (max 3)
+        if ($state -ne "OK" -and $criticalBullets.Count -lt 3) {
+            $bullet = switch ($fileName) {
+                "PRD"          { "PRD: fill Goals/Stories/Metrics" }
+                "SPEC"         { "SPEC: define Data Model/API/Security" }
+                "DECISION_LOG" { "DECISION_LOG: add real decision" }
+            }
+            $criticalBullets += $bullet
+        }
+    }
+
+    # Compute immediate next step based on worst GATE doc
+    $immediateStep = switch ($worstDoc) {
+        "PRD"          { "Fill Goals + User Stories + Success Metrics" }
+        "SPEC"         { "Define Data Model + API + Security sections" }
+        "DECISION_LOG" { "Add >=1 real decision in Records table" }
+        default        { "All gate docs ready - run /refresh-plan" }
+    }
+
+    # Check INBOX for pending hint
+    $inboxPending = 0
+    $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
+    if (Test-Path $inboxPath) {
+        $inboxContent = Get-Content $inboxPath -Raw -ErrorAction SilentlyContinue
+        if ($inboxContent) {
+            foreach ($line in ($inboxContent -split "`n")) {
+                $trimmed = $line.Trim()
+                if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                if ($trimmed -match "ATOMIC_MESH_TEMPLATE_STUB") { continue }
+                if ($trimmed -match "^#") { continue }
+                if ($trimmed -eq "-") { continue }
+                if ($trimmed.Length -lt 3) { continue }
+                if ($trimmed.StartsWith("Drop clarifications")) { continue }
+                if ($trimmed.StartsWith("Next: run")) { continue }
+                $inboxPending++
+            }
+        }
+    }
+
+    # Compute auto-ingest status
+    $autoIngestTxt = "Auto-ingest: "
+    $autoIngestColor = "DarkGray"
+    if (-not $Global:AutoIngestEnabled) {
+        $autoIngestTxt += "disabled"
+    }
+    elseif ($Global:AutoIngestPending) {
+        $autoIngestTxt += "pending"
+        $autoIngestColor = "Yellow"
+    }
+    elseif ($Global:AutoIngestLastResult -eq "OK") {
+        $timeStr = if ($Global:AutoIngestLastRunUtc) { $Global:AutoIngestLastRunUtc.ToLocalTime().ToString("HH:mm:ss") } else { "" }
+        $autoIngestTxt += "OK ($timeStr)"
+        $autoIngestColor = "Green"
+    }
+    elseif ($Global:AutoIngestLastResult -eq "ERROR") {
+        $autoIngestTxt += "ERROR"
+        $autoIngestColor = "Red"
+    }
+    else {
+        $autoIngestTxt += "armed"
+    }
+
+    # === PHASE 2: Build LEFT panel lines (scoreboard) ===
+    $leftLines = @()
+    $leftColors = @()
+
+    # Header
+    $leftLines += "BOOTSTRAP (context incomplete)"
+    $leftColors += "Cyan"
+
+    # Blank line
+    $leftLines += ""
+    $leftColors += "DarkGray"
+
+    # PRD
+    $prd = $docStates["PRD"]
+    $prdColor = switch ($prd.State) { "OK" { "Green" } "MISS" { "Red" } default { "Yellow" } }
+    $leftLines += "PRD".PadRight(12) + " [$($prd.State)] $($prd.Progress.MicroBar)"
+    $leftColors += $prdColor
+
+    # SPEC
+    $spec = $docStates["SPEC"]
+    $specColor = switch ($spec.State) { "OK" { "Green" } "MISS" { "Red" } default { "Yellow" } }
+    $leftLines += "SPEC".PadRight(12) + " [$($spec.State)] $($spec.Progress.MicroBar)"
+    $leftColors += $specColor
+
+    # TECH_STACK
+    $tech = $docStates["TECH_STACK"]
+    $techColor = switch ($tech.State) { "OK" { "Green" } "MISS" { "Red" } default { "Yellow" } }
+    $leftLines += "TECH_STACK".PadRight(12) + " [$($tech.State)] $($tech.Progress.MicroBar)"
+    $leftColors += $techColor
+
+    # DECISION_LOG
+    $dlog = $docStates["DECISION_LOG"]
+    $dlogColor = switch ($dlog.State) { "OK" { "Green" } "MISS" { "Red" } default { "Yellow" } }
+    $leftLines += "DECISION_LOG".PadRight(12) + " [$($dlog.State)] $($dlog.Progress.MicroBar)"
+    $leftColors += $dlogColor
+
+    # Blank line
+    $leftLines += ""
+    $leftColors += "DarkGray"
+
+    # INBOX
+    $inboxStatus = if ($inboxPending -gt 0) { "✎ pending ($inboxPending)" } else { "✓ empty" }
+    $inboxColor = if ($inboxPending -gt 0) { "Yellow" } else { "DarkGray" }
+    $leftLines += "INBOX".PadRight(12) + " [-] $inboxStatus"
+    $leftColors += $inboxColor
+
+    # Blank line (optional padding)
+    $leftLines += ""
+    $leftColors += "DarkGray"
+
+    # === PHASE 3: Build RIGHT panel lines (guidance) ===
+    $rightLines = @()
+    $rightColors = @()
+
+    # Header
+    $rightLines += "CONTEXT READINESS"
+    $rightColors += "Cyan"
+
+    # Source line
+    $rightLines += "Source: readiness.py (live)"
+    $rightColors += "DarkGray"
+
+    # Blank line
+    $rightLines += ""
+    $rightColors += "DarkGray"
+
+    # Next step (with wrapping) - GATE DOCS ONLY
+    $stepColor = if ($worstSeverity -le 1) { "Yellow" } else { "Green" }
+    $nextText = "Next (Gate): $immediateStep"
+    $wrappedNext = Wrap-PanelText -Text $nextText -Width $RightWidth -Indent 6
+    foreach ($wl in $wrappedNext) {
+        $rightLines += $wl
+        $rightColors += $stepColor
+    }
+
+    # Advisory: TECH_STACK (if not OK)
+    $techState = $docStates["TECH_STACK"].State
+    if ($techState -ne "OK") {
+        $rightLines += "Also: TECH_STACK recommended"
+        $rightColors += "DarkGray"
+    }
+
+    # Blank line
+    $rightLines += ""
+    $rightColors += "DarkGray"
+
+    # v16.0: Attention section (renamed from Critical for BOOTSTRAP consistency)
+    # BOOTSTRAP is YELLOW state, so use "Attention:" not "Critical:"
+    if ($criticalBullets.Count -gt 0) {
+        $rightLines += "Attention:"
+        $rightColors += "Yellow"
+
+        foreach ($bullet in $criticalBullets) {
+            $bulletText = "• $bullet"
+            $wrappedBullet = Wrap-PanelText -Text $bulletText -Width $RightWidth -Indent 4
+            foreach ($wl in $wrappedBullet) {
+                $rightLines += $wl
+                $rightColors += "Yellow"
+            }
+        }
+
+        # Blank line after attention
+        $rightLines += ""
+        $rightColors += "DarkGray"
+    }
+
+    # INBOX hint (if pending and not too many critical bullets)
+    if ($inboxPending -gt 0) {
+        $rightLines += "Note: INBOX pending - /ingest when ready"
+        $rightColors += "Gray"
+        $rightLines += ""
+        $rightColors += "DarkGray"
+    }
+
+    # Strategic commands locked
+    $rightLines += "Strategic commands LOCKED"
+    $rightColors += "Red"
+
+    # Edit hint
+    $rightLines += "Edit: PRD | SPEC | TECH_STACK | DECISION_LOG"
+    $rightColors += "DarkGray"
+
+    # Auto-ingest status
+    $rightLines += $autoIngestTxt
+    $rightColors += $autoIngestColor
+
+    # === PHASE 4: Render both panels row-by-row ===
+    $maxLines = [Math]::Max($leftLines.Count, $rightLines.Count)
+
+    for ($i = 0; $i -lt $maxLines; $i++) {
+        $leftText = if ($i -lt $leftLines.Count) { $leftLines[$i] } else { "" }
+        $leftColor = if ($i -lt $leftColors.Count) { $leftColors[$i] } else { "DarkGray" }
+        $rightText = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { "" }
+        $rightColor = if ($i -lt $rightColors.Count) { $rightColors[$i] } else { "DarkGray" }
+
+        Print-Row $R $leftText $rightText $HalfWidth $leftColor $rightColor
         $R++
     }
 
-    # Separator
-    Print-Row $R "" "" $HalfWidth "DarkGray" "DarkGray"
-    $R++
-
-    # Actions hint
-    $actionTxt = "Next: Edit docs\PRD.md, docs\SPEC.md, docs\DECISION_LOG.md"
-    Print-Row $R "" $actionTxt $HalfWidth "DarkGray" "DarkYellow"
-    $R++
-
-    # Locked commands notice
-    Print-Row $R "" "🔒 Strategic commands LOCKED" $HalfWidth "DarkGray" "Red"
-    $R++
-
     return $R
 }
+
+# ============================================================================
+#region HISTORY_MODE
+# v15.5: HISTORY MODE - Data Fetch + Renderer
+# Functions: Get-HistoryData, Get-HistoryDetailData, Draw-HistoryScreen
+# Keys: F3 (toggle), Tab (subview), Up/Down (nav), Enter (details)
+# ============================================================================
+
+# --- Get-HistoryData: Fetch data based on current subview ---
+function Get-HistoryData {
+    $subview = $Global:HistorySubview
+    $data = @()
+
+    # Centralized runtime signals (fail-open). Subviews may use partial data.
+    $signals = $null
+    try { $signals = Get-RuntimeSignals } catch { $signals = $null }
+
+    switch ($subview) {
+        "TASKS" {
+            # Primary: tasks table with derived health
+            # Sort order for triage: BLOCKED → HIGH risk unverified → RUNNING → PENDING → DONE
+            $sortQuery = @"
+SELECT id, type, desc, status, qa_status, risk, retry_count, review_notes, override_justification, trace_reasoning, output
+FROM tasks
+ORDER BY
+    CASE
+        WHEN status IN ('blocked', 'BLOCKED') THEN 1
+        WHEN risk = 'HIGH' AND (qa_status IS NULL OR qa_status != 'PASS') THEN 2
+        WHEN status IN ('in_progress', 'running', 'RUNNING', 'IN_PROGRESS') THEN 3
+        WHEN status IN ('pending', 'next', 'planned', 'PENDING', 'NEXT', 'PLANNED') THEN 4
+        WHEN status IN ('completed', 'COMPLETED') THEN 5
+        ELSE 6
+    END,
+    id DESC
+LIMIT 30
+"@
+            $tasks = Invoke-Query $sortQuery -Silent
+
+            foreach ($t in $tasks) {
+                # Derive worker label: use type if present, else stream if present, else "—"
+                # Only show deterministic values, never guess
+                $worker = "—"
+                if ($t.type -and $t.type.Trim() -ne "") {
+                    $worker = switch ($t.type.ToLower()) {
+                        "backend" { "BACKEND" }
+                        "frontend" { "FRONTEND" }
+                        "qa" { "QA" }
+                        "librarian" { "LIBRARIAN" }
+                        "system" { "SYSTEM" }
+                        default { $t.type.ToUpper().Substring(0, [Math]::Min(8, $t.type.Length)) }
+                    }
+                }
+                elseif ($t.stream -and $t.stream.Trim() -ne "") {
+                    $worker = $t.stream.ToUpper().Substring(0, [Math]::Min(8, $t.stream.Length))
+                }
+
+                # Rows correspond to tasks (id, stream, status, risk, qa_status, notes markers)
+                $healthResult = Get-TaskHealth -Task $t
+                $bucket = $healthResult.Bucket
+
+                $riskDisp = if ($t.risk) { $t.risk.ToUpperInvariant() } else { "—" }
+                $qaDisp = if ($t.qa_status) { $t.qa_status.ToUpperInvariant() } else { "—" }
+
+                # Notes markers (single-width): O=output, N=review notes, !=override, T=trace
+                $markers = @()
+                if ($t.output -and -not [string]::IsNullOrWhiteSpace([string]$t.output)) { $markers += "O" }
+                if ($t.review_notes -and -not [string]::IsNullOrWhiteSpace([string]$t.review_notes)) { $markers += "N" }
+                if ($t.override_justification -and -not [string]::IsNullOrWhiteSpace([string]$t.override_justification)) { $markers += "!" }
+                if ($t.trace_reasoning -and -not [string]::IsNullOrWhiteSpace([string]$t.trace_reasoning)) { $markers += "T" }
+                $markerText = if ($markers.Count -gt 0) { "[" + ($markers -join "") + "]" } else { "" }
+
+                $desc = if ($t.desc) { [string]$t.desc } else { "(no description)" }
+                $content = "[T-$($t.id)] $bucket $riskDisp QA:$qaDisp $markerText $desc"
+
+                $data += @{
+                    Id           = $t.id
+                    Worker       = $worker
+                    Content      = $content
+                    Health       = $healthResult.Health
+                    HealthColor  = Resolve-HealthColor -Health $healthResult.Health
+                    Type         = "task"
+                    Stream       = $t.type
+                    Status       = $bucket
+                    Risk         = $riskDisp
+                    QAStatus     = $qaDisp
+                    NotesMarkers = $markers
+                    Raw          = $t
+                }
+            }
+        }
+
+        "DOCS" {
+            # Rows correspond to PRD/SPEC/DECISION_LOG/ACTIVE_SPEC/INBOX with readiness info
+            # Uses centralized $signals.readiness (already called at top of function)
+            try {
+                $rd = if ($signals -and $signals.readiness) { $signals.readiness } else { $null }
+
+                foreach ($docName in @("PRD", "SPEC", "DECISION_LOG", "ACTIVE_SPEC", "INBOX")) {
+                    $fileData = $null
+                    if ($rd -and $rd.files -and $rd.files.ContainsKey($docName)) {
+                        $fileData = $rd.files[$docName]
+                    }
+
+                    $score = if ($fileData -and $null -ne $fileData.score) { [int]$fileData.score } else { 0 }
+                    $exists = if ($fileData -and $null -ne $fileData.exists) { [bool]$fileData.exists } else { $false }
+                    $state = if ($fileData -and $fileData.state) { [string]$fileData.state } else { "MISS" }
+
+                    # Get file mtime if exists
+                    $mtimeStr = "—"
+                    $docPath = Join-Path $CurrentDir "docs\$docName.md"
+                    if (Test-Path $docPath) {
+                        $mtime = (Get-Item $docPath).LastWriteTime
+                        $mtimeStr = $mtime.ToString("HH:mm")
+                    }
+
+                    # Map state -> semantic health token
+                    $health = switch ($state) {
+                        "OK"      { "GREEN" }
+                        "STUB"    { "YELLOW" }
+                        "NEED"    { "YELLOW" }
+                        "PENDING" { "YELLOW" }
+                        "MISS"    { "RED" }
+                        "EMPTY"   { "GREEN" }
+                        default   { "GRAY" }
+                    }
+
+                    # Content varies: INBOX shows meaningful_lines, others show score
+                    $content = if ($docName -eq "INBOX") {
+                        $ml = if ($fileData -and $null -ne $fileData.meaningful_lines) { [int]$fileData.meaningful_lines } else { 0 }
+                        "INBOX.md - $ml pending (last: $mtimeStr)"
+                    } else {
+                        "$docName.md - $score% [$state] (last: $mtimeStr)"
+                    }
+
+                    $data += @{
+                        Id          = $docName
+                        Worker      = "DOCS"
+                        Content     = $content
+                        Health      = $health
+                        HealthColor = Resolve-HealthColor -Health $health
+                        Type        = "doc"
+                        State       = $state
+                        Raw         = $fileData
+                    }
+                }
+
+                # Auto-ingest status (system signal, not from readiness.py)
+                $aiStatus = if ($Global:AutoIngestLastResult) { $Global:AutoIngestLastResult } else { "—" }
+                $aiHealth = switch ($aiStatus) {
+                    "OK"    { "GREEN" }
+                    "ERROR" { "RED" }
+                    default { "GRAY" }
+                }
+
+                $data += @{
+                    Id          = "AUTO-INGEST"
+                    Worker      = "SYSTEM"
+                    Content     = "Auto-ingest: $aiStatus"
+                    Health      = $aiHealth
+                    HealthColor = Resolve-HealthColor -Health $aiHealth
+                    Type        = "system"
+                    Raw         = @{ Status = $aiStatus }
+                }
+            }
+            catch {
+                $data += @{
+                    Id          = "ERROR"
+                    Worker      = "SYSTEM"
+                    Content     = "Failed to load readiness data"
+                    Health      = "RED"
+                    HealthColor = Resolve-HealthColor -Health "RED"
+                    Type        = "error"
+                    Raw         = $null
+                }
+            }
+        }
+
+        "SHIP" {
+            # One row showing shipping readiness (blocked reasons if any)
+            # Uses centralized $signals (risk_summary, task_summary)
+            try {
+                # 1. HIGH risk tasks without QA PASS (from signals.risk_summary)
+                $highRiskCount = 0
+                if ($signals -and $signals.risk_summary) {
+                    $highRiskCount = [int]$signals.risk_summary.high_not_pass
+                }
+
+                $hrHealth = if ($highRiskCount -gt 0) { "RED" } else { "GREEN" }
+
+                $data += @{
+                    Id          = "HIGH-RISK"
+                    Worker      = "SHIP"
+                    Content     = "HIGH risk unverified: $highRiskCount"
+                    Health      = $hrHealth
+                    HealthColor = Resolve-HealthColor -Health $hrHealth
+                    Type        = "ship"
+                    Raw         = @{ Count = $highRiskCount }
+                }
+
+                # 2. BLOCKED tasks count (from signals.task_summary)
+                $blockedCount = 0
+                if ($signals -and $signals.task_summary -and $signals.task_summary.by_status) {
+                    $blockedCount = [int]$signals.task_summary.by_status["BLOCKED"]
+                }
+
+                if ($blockedCount -gt 0) {
+                    $data += @{
+                        Id          = "BLOCKED"
+                        Worker      = "SHIP"
+                        Content     = "Blocked tasks: $blockedCount"
+                        Health      = "RED"
+                        HealthColor = Resolve-HealthColor -Health "RED"
+                        Type        = "ship"
+                        Raw         = @{ Count = $blockedCount }
+                    }
+                }
+
+                # 3. Context readiness blocking (from signals.readiness.overall)
+                $blocking = @()
+                if ($signals -and $signals.readiness -and $signals.readiness.overall) {
+                    $blocking = @($signals.readiness.overall.blocking_files)
+                }
+
+                if ($blocking.Count -gt 0) {
+                    $ctxHealth = "YELLOW"
+                    $data += @{
+                        Id          = "CONTEXT"
+                        Worker      = "SHIP"
+                        Content     = "Blocking docs: $($blocking -join ', ')"
+                        Health      = $ctxHealth
+                        HealthColor = Resolve-HealthColor -Health $ctxHealth
+                        Type        = "ship"
+                        Raw         = @{ Blocking = $blocking }
+                    }
+                }
+
+                # 4. Git working tree status (clean/dirty) - still direct call
+                $gitStatus = git status --porcelain 2>&1
+                $uncommittedCount = if ([string]::IsNullOrWhiteSpace($gitStatus)) { 0 } else { ($gitStatus -split "`n").Count }
+                $gitClean = ($uncommittedCount -eq 0)
+
+                $gitHealth = if ($gitClean) { "GREEN" } else { "YELLOW" }
+                $gitContent = if ($gitClean) { "Git: clean" } else { "Git: $uncommittedCount uncommitted" }
+
+                $data += @{
+                    Id          = "GIT"
+                    Worker      = "SHIP"
+                    Content     = $gitContent
+                    Health      = $gitHealth
+                    HealthColor = Resolve-HealthColor -Health $gitHealth
+                    Type        = "ship"
+                    Raw         = @{ Clean = $gitClean; Count = $uncommittedCount }
+                }
+
+                # 5. Last git tag (cheap, no new tables)
+                $lastTag = git describe --tags --abbrev=0 2>&1
+                $tagContent = "Last tag: —"
+                $tagHealth = "GRAY"
+                if (-not [string]::IsNullOrWhiteSpace($lastTag) -and $lastTag -notmatch "fatal:") {
+                    $tagContent = "Last tag: $($lastTag.Trim())"
+                    $headTag = git tag --points-at HEAD 2>&1
+                    if (-not [string]::IsNullOrWhiteSpace($headTag) -and $headTag -notmatch "fatal:") {
+                        $tagHealth = "GREEN"
+                        $tagContent = "At tag: $($headTag.Trim().Split("`n")[0])"
+                    }
+                }
+
+                $data += @{
+                    Id          = "TAG"
+                    Worker      = "SHIP"
+                    Content     = $tagContent
+                    Health      = $tagHealth
+                    HealthColor = Resolve-HealthColor -Health $tagHealth
+                    Type        = "ship"
+                    Raw         = @{ Tag = $lastTag }
+                }
+            }
+            catch {
+                $data += @{
+                    Id          = "ERROR"
+                    Worker      = "SYSTEM"
+                    Content     = "Failed to load ship data"
+                    Health      = "RED"
+                    HealthColor = Resolve-HealthColor -Health "RED"
+                    Type        = "error"
+                    Raw         = $null
+                }
+            }
+        }
+    }
+
+    return $data
+}
+
+# --- Get-HistoryDetailData: Fetch audit_log overlay for selected item ---
+function Get-HistoryDetailData {
+    param([object]$SelectedItem)
+
+    if (-not $SelectedItem -or $SelectedItem.Type -ne "task") {
+        return @()
+    }
+
+    $taskId = $SelectedItem.Id
+    $details = @()
+
+    # Fetch recent audit_log entries for this task
+    $auditLogs = Invoke-Query "SELECT action, reason, created_at FROM audit_log WHERE task_id = $taskId ORDER BY created_at DESC LIMIT 5" -Silent
+
+    foreach ($log in $auditLogs) {
+        $reason = $log.reason
+        if ($reason.Length -gt 35) { $reason = $reason.Substring(0, 32) + "..." }
+
+        $details += @{
+            Action = $log.action.ToUpper()
+            Reason = $reason
+            Time   = $log.created_at
+        }
+    }
+
+    return $details
+}
+
+# --- HistoryMode helpers: hints + selection + safe parsing ---
+function Set-HistoryHint {
+    param(
+        [string]$Text,
+        [string]$Color = "DarkGray"
+    )
+
+    $Global:HistoryHintText = $Text
+    $Global:HistoryHintColor = if ([string]::IsNullOrWhiteSpace($Color)) { "DarkGray" } else { $Color }
+    $Global:HistoryHintUtc = [DateTime]::UtcNow
+}
+
+function Get-HistorySelectedItem {
+    if (-not $Global:HistoryData -or $Global:HistoryData.Count -eq 0) { return $null }
+
+    $idx = 0
+    try { $idx = [int]$Global:HistorySelectedRow } catch { $idx = 0 }
+    if ($idx -lt 0 -or $idx -ge $Global:HistoryData.Count) { return $null }
+    return $Global:HistoryData[$idx]
+}
+
+function Get-TaskIdFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    # v15.5.1: Prefer T-<digits> format first (canonical task ID)
+    $mTask = [regex]::Match($Text, '\bT-(\d+)\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($mTask.Success) {
+        try { return [int]$mTask.Groups[1].Value } catch {}
+    }
+
+    # Fallback: first bare integer (avoids v15.5, 80%, timestamps)
+    $mInt = [regex]::Match($Text, '\b(\d+)\b')
+    if ($mInt.Success) {
+        try { return [int]$mInt.Groups[1].Value } catch {}
+    }
+
+    return $null
+}
+
+function Find-FirstNonGreenHistoryIndex {
+    param([object[]]$Data)
+
+    if (-not $Data -or $Data.Count -eq 0) { return 0 }
+    for ($i = 0; $i -lt $Data.Count; $i++) {
+        $row = $Data[$i]
+        if (-not $row) { continue }
+
+        $health = $row.Health
+        $healthColor = $row.HealthColor
+
+        if ($healthColor -and $healthColor -ne "Green") { return $i }
+        if ($health -and $health -ne "OK") { return $i }
+    }
+    return 0
+}
+
+function Find-HistoryIndexByTaskId {
+    param(
+        [object[]]$Data,
+        [int]$TaskId
+    )
+
+    if (-not $Data -or $Data.Count -eq 0) { return $null }
+    for ($i = 0; $i -lt $Data.Count; $i++) {
+        $row = $Data[$i]
+        if (-not $row) { continue }
+        if ($row.Type -ne "task") { continue }
+        try {
+            if ([int]$row.Id -eq $TaskId) { return $i }
+        }
+        catch {}
+    }
+    return $null
+}
+
+function Invoke-HistoryHotkey {
+    param([string]$Key)
+
+    if (-not $Global:HistoryMode) { return }
+
+    $k = if ($Key) { $Key.ToUpperInvariant() } else { "" }
+
+    switch ($k) {
+        "I" {
+            try {
+                $Global:AutoIngestPending = $false
+                $Global:AutoIngestLastRunUtc = [DateTime]::UtcNow
+                $result = Invoke-SilentIngest
+
+                if ($result.Ok) {
+                    $Global:AutoIngestLastResult = "OK"
+                    $Global:AutoIngestLastMessage = $null
+                    Set-HistoryHint -Text "Ingest: OK" -Color "Green"
+                }
+                else {
+                    $Global:AutoIngestLastResult = "ERROR"
+                    $Global:AutoIngestLastMessage = $result.Message
+                    $msg = if ($result.Message) { $result.Message } else { "unknown error" }
+                    Set-HistoryHint -Text "Ingest: ERROR ($msg)" -Color "Red"
+                }
+            }
+            catch {
+                $Global:AutoIngestLastResult = "ERROR"
+                $Global:AutoIngestLastMessage = $_.Exception.Message
+                Set-HistoryHint -Text "Ingest: ERROR" -Color "Red"
+            }
+            # Refresh current subview data after ingest
+            $Global:HistoryData = @(Get-HistoryData)
+        }
+
+        "S" {
+            $item = Get-HistorySelectedItem
+            if (-not $item -or $Global:HistorySubview -ne "TASKS" -or $item.Type -ne "task") {
+                Set-HistoryHint -Text "Simplify: select a TASK row" -Color "DarkGray"
+                return
+            }
+
+            $taskId = Get-TaskIdFromText -Text $item.Content
+            if (-not $taskId) {
+                Set-HistoryHint -Text "No task id on this row." -Color "Yellow"
+                return
+            }
+
+            try {
+                $result = python -c "print('No bloat detected. Task is clean.')" 2>&1
+                $resultStr = $result -join "`n"
+
+                if ($resultStr -match "(?i)(clean|no candidates|no bloat|nothing to simplify)") {
+                    $Global:LastOptimized = $true
+                    $Global:LastTaskForSignals = "T-$taskId"
+                    Set-HistoryHint -Text "Simplify ${taskId}: clean" -Color "Green"
+                }
+                else {
+                    $Global:LastOptimized = $false
+                    $Global:LastTaskForSignals = "T-$taskId"
+                    Set-HistoryHint -Text "Simplify ${taskId}: candidates found" -Color "Yellow"
+                }
+            }
+            catch {
+                $Global:LastOptimized = $false
+                Set-HistoryHint -Text "Simplify ${taskId}: error" -Color "Yellow"
+            }
+
+            # Refresh tasks view (ordering/health may change over time)
+            $Global:HistoryData = @(Get-HistoryData)
+        }
+
+        "V" {
+            $item = Get-HistorySelectedItem
+            if (-not $item -or $Global:HistorySubview -ne "TASKS" -or $item.Type -ne "task") {
+                Set-HistoryHint -Text "Verify: select a TASK row" -Color "DarkGray"
+                return
+            }
+
+            $taskId = Get-TaskIdFromText -Text $item.Content
+            if (-not $taskId) {
+                Set-HistoryHint -Text "No task id on this row." -Color "Yellow"
+                return
+            }
+
+            try {
+                $result = python -c "from mesh_server import verify_task; print(verify_task('$taskId'))" 2>&1
+                $resultStr = $result -join "`n"
+                $response = $resultStr | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+                if (-not $response) {
+                    Set-HistoryHint -Text "Verify ${taskId}: failed to parse response" -Color "Yellow"
+                }
+                elseif ($response.error) {
+                    Set-HistoryHint -Text "Verify ${taskId}: $($response.error)" -Color "Red"
+                }
+                else {
+                    $score = [int]$response.score
+                    $status = $response.status
+
+                    $Global:LastConfidence = $score
+                    $Global:LastTaskForSignals = "T-$taskId"
+
+                    $statusColor = switch ($status) {
+                        "PASS" { "Green" }
+                        "WARN" { "Yellow" }
+                        "FAIL" { "Red" }
+                        default { "Gray" }
+                    }
+
+                    Set-HistoryHint -Text "Verify ${taskId}: $status $score/100" -Color $statusColor
+                }
+            }
+            catch {
+                Set-HistoryHint -Text "Verify ${taskId}: error" -Color "Yellow"
+            }
+
+            # Refresh tasks view after verify (qa_status changes health)
+            $Global:HistoryData = @(Get-HistoryData)
+        }
+
+        "D" {
+            # Drive to the next safe action using pipeline signals.
+            $selectedItem = Get-HistorySelectedItem
+            $selectedForPipeline = $null
+            if ($selectedItem -and $selectedItem.Type -eq "task" -and $selectedItem.Raw) {
+                $selectedForPipeline = $selectedItem.Raw
+            }
+
+            $pipeline = $null
+            try { $pipeline = Build-PipelineStatus -SelectedRow $selectedForPipeline } catch { $pipeline = $null }
+            if (-not $pipeline -or -not $pipeline.stages) {
+                Set-HistoryHint -Text "Next: /refresh (pipeline unavailable)" -Color "Yellow"
+                return
+            }
+
+            # v16.0: Write snapshot if any stage is non-GREEN (dedupe via hash + debounce)
+            $selTaskId = if ($selectedForPipeline -and $selectedForPipeline.id) { $selectedForPipeline.id } else { $null }
+            Write-PipelineSnapshotIfNeeded -PipelineData $pipeline -SelectedTaskId $selTaskId
+
+            $stages = @($pipeline.stages)
+            $firstNonGreen = $stages | Where-Object { $_.state -ne "GREEN" } | Select-Object -First 1
+
+            if (-not $firstNonGreen) {
+                # All green: switch to SHIP subview, do not auto-run /ship
+                $Global:HistorySubview = "SHIP"
+                $Global:HistorySelectedRow = 0
+                $Global:HistoryScrollOffset = 0
+                $Global:HistoryDetailsVisible = $false
+                $Global:HistoryData = @(Get-HistoryData)
+                Set-HistoryHint -Text "All green. Next: /ship" -Color "Green"
+                return
+            }
+
+            $stageName = $firstNonGreen.name
+
+            switch ($stageName) {
+                "Context" {
+                    # Context not ready: switch to DOCS and suggest /ingest or edit docs (no auto actions)
+                    $Global:HistorySubview = "DOCS"
+                    $Global:HistorySelectedRow = 0
+                    $Global:HistoryScrollOffset = 0
+                    $Global:HistoryDetailsVisible = $false
+                    $Global:HistoryData = @(Get-HistoryData)
+
+                    $idx = Find-FirstNonGreenHistoryIndex -Data $Global:HistoryData
+                    $Global:HistorySelectedRow = $idx
+
+                    $suggested = $pipeline.suggested_next.command
+                    if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = "edit PRD.md | SPEC.md | DECISION_LOG.md" }
+                    Set-HistoryHint -Text "Context not ready. Next: $suggested" -Color "Yellow"
+                    return
+                }
+
+                "Plan" {
+                    # Context is ready: run /refresh-plan or /draft-plan (silent, no console growth)
+                    $cmd = $pipeline.suggested_next.command
+
+                    if ([string]::IsNullOrWhiteSpace($cmd)) {
+                        $cmd = if ($Global:Commands.Contains("refresh-plan")) { "/refresh-plan" } elseif ($Global:Commands.Contains("draft-plan")) { "/draft-plan" } else { $null }
+                    }
+
+                    if ($cmd -and $cmd.StartsWith("/refresh-plan")) {
+                        try {
+                            $result = python -c "from mesh_server import refresh_plan_preview; print(refresh_plan_preview())" 2>&1
+                            $plan = ($result -join "`n") | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            if ($plan -and $plan.status -eq "FRESH") {
+                                Set-HistoryHint -Text "Plan: refreshed" -Color "Green"
+                            }
+                            elseif ($plan -and $plan.reason) {
+                                Set-HistoryHint -Text "Plan: $($plan.reason)" -Color "Yellow"
+                            }
+                            else {
+                                Set-HistoryHint -Text "Plan: refreshed" -Color "Green"
+                            }
+                        }
+                        catch {
+                            Set-HistoryHint -Text "Plan: refresh failed" -Color "Yellow"
+                        }
+                    }
+                    elseif ($cmd -and $cmd.StartsWith("/draft-plan")) {
+                        try {
+                            $result = python -c "from mesh_server import draft_plan; print(draft_plan())" 2>&1
+                            $resp = ($result -join "`n") | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            if ($resp -and $resp.status -eq "OK" -and $resp.path) {
+                                $leaf = Split-Path $resp.path -Leaf
+                                Set-HistoryHint -Text "Draft plan: $leaf (edit then /accept-plan)" -Color "Green"
+                            }
+                            elseif ($resp -and $resp.message) {
+                                Set-HistoryHint -Text "Draft plan: $($resp.message)" -Color "Yellow"
+                            }
+                            else {
+                                Set-HistoryHint -Text "Draft plan: created" -Color "Green"
+                            }
+                        }
+                        catch {
+                            Set-HistoryHint -Text "Draft plan: failed" -Color "Yellow"
+                        }
+                    }
+                    else {
+                        Set-HistoryHint -Text "Plan: run /refresh-plan or /draft-plan" -Color "Yellow"
+                    }
+
+                    # Keep user on TASKS view for follow-up actions
+                    $Global:HistorySubview = "TASKS"
+                    $Global:HistoryDetailsVisible = $false
+                    $Global:HistoryData = @(Get-HistoryData)
+                    return
+                }
+
+                "Ship" {
+                    # Switch to SHIP view to address ship blockers (e.g., uncommitted changes)
+                    $Global:HistorySubview = "SHIP"
+                    $Global:HistorySelectedRow = 0
+                    $Global:HistoryScrollOffset = 0
+                    $Global:HistoryDetailsVisible = $false
+                    $Global:HistoryData = @(Get-HistoryData)
+
+                    $idx = Find-FirstNonGreenHistoryIndex -Data $Global:HistoryData
+                    $Global:HistorySelectedRow = $idx
+
+                    $suggested = $pipeline.suggested_next.command
+                    if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = "review ship blockers" }
+                    Set-HistoryHint -Text "Ship not ready. Next: $suggested" -Color "Yellow"
+                    return
+                }
+
+                default {
+                    # Work/Optimize/Verify: default to TASKS and highlight the first non-green row
+                    $Global:HistorySubview = "TASKS"
+                    $Global:HistorySelectedRow = 0
+                    $Global:HistoryScrollOffset = 0
+                    $Global:HistoryDetailsVisible = $false
+                    $Global:HistoryData = @(Get-HistoryData)
+
+                    # If pipeline suggested command includes a task id, jump to that row
+                    $suggested = $pipeline.suggested_next.command
+                    $jumpId = Get-TaskIdFromText -Text $suggested
+                    $idx = $null
+                    if ($jumpId) {
+                        $idx = Find-HistoryIndexByTaskId -Data $Global:HistoryData -TaskId $jumpId
+                    }
+                    if ($null -eq $idx) {
+                        $idx = Find-FirstNonGreenHistoryIndex -Data $Global:HistoryData
+                    }
+                    $Global:HistorySelectedRow = $idx
+
+                    if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = $firstNonGreen.hint }
+                    Set-HistoryHint -Text "Next: $suggested" -Color "Yellow"
+                    return
+                }
+            }
+        }
+    }
+}
+
+# --- Draw-HistoryScreen: Main history view renderer ---
+function Draw-HistoryScreen {
+    # Dimensions
+    $W = $Host.UI.RawUI.WindowSize.Width
+    $Half = [Math]::Floor($W / 2)
+    $R = $Global:RowDashStart
+
+    # Calculate visible rows (same as dashboard)
+    $BottomRow = $Global:RowInput - 1
+    $VisibleRows = $BottomRow - $R - 4  # Leave room for header/footer
+
+    # --- HEADER: HISTORY [TASKS|DOCS|SHIP] ---
+    Draw-Border $R $Half
+    $R++
+
+    # Build tab indicator: TASKS | DOCS | SHIP with current highlighted
+    $tabTasks = if ($Global:HistorySubview -eq "TASKS") { "[TASKS]" } else { " TASKS " }
+    $tabDocs = if ($Global:HistorySubview -eq "DOCS") { "[DOCS]" } else { " DOCS " }
+    $tabShip = if ($Global:HistorySubview -eq "SHIP") { "[SHIP]" } else { " SHIP " }
+    $tabLine = "$tabTasks | $tabDocs | $tabShip"
+
+    $leftHeader = "HISTORY VIEW (F2/Esc to exit)"
+    $rightHeader = "Tab: $tabLine"
+
+    Print-Row $R $leftHeader $rightHeader $Half "Cyan" "Yellow"
+    $R++
+
+    Draw-Border $R $Half
+    $R++
+
+    # --- COLUMN HEADERS ---
+    $colWorker = 12
+    $colHealth = 8
+    $colContent = $Half - $colWorker - $colHealth - 6
+
+    $headerLeft = "  " + "WORKER".PadRight($colWorker) + "CONTENT".PadRight($colContent) + "HEALTH"
+    Print-Row $R $headerLeft "" $Half "DarkCyan" "DarkGray"
+    $R++
+
+    # --- DATA ROWS (Left Panel) ---
+    $data = $Global:HistoryData
+    $selectedIdx = $Global:HistorySelectedRow
+    $scrollOffset = $Global:HistoryScrollOffset
+
+    # Clamp selection/scroll when subview data changes
+    if (-not $data -or $data.Count -eq 0) {
+        $Global:HistorySelectedRow = 0
+        $Global:HistoryScrollOffset = 0
+        $selectedIdx = 0
+        $scrollOffset = 0
+    }
+    else {
+        if ($selectedIdx -lt 0) { $selectedIdx = 0; $Global:HistorySelectedRow = 0 }
+        if ($selectedIdx -ge $data.Count) { $selectedIdx = $data.Count - 1; $Global:HistorySelectedRow = $selectedIdx }
+        if ($scrollOffset -lt 0) { $scrollOffset = 0; $Global:HistoryScrollOffset = 0 }
+        if ($scrollOffset -ge $data.Count) { $scrollOffset = 0; $Global:HistoryScrollOffset = 0 }
+    }
+
+    # Adjust scroll if selection is out of view
+    if ($data -and $data.Count -gt 0) {
+        if ($selectedIdx -lt $scrollOffset) {
+            $Global:HistoryScrollOffset = $selectedIdx
+            $scrollOffset = $selectedIdx
+        }
+        elseif ($selectedIdx -ge $scrollOffset + $VisibleRows) {
+            $Global:HistoryScrollOffset = $selectedIdx - $VisibleRows + 1
+            $scrollOffset = $Global:HistoryScrollOffset
+        }
+    }
+
+    # === RIGHT PANEL MODEL: pipeline + next step + hint ===
+    $RightWidth = $Half - 4
+    $stateColors = @{
+        "GREEN"  = "Green"
+        "YELLOW" = "Yellow"
+        "RED"    = "Red"
+        "GRAY"   = "DarkGray"
+    }
+
+    $selectedItem = $null
+    if ($data -and $data.Count -gt 0 -and $selectedIdx -ge 0 -and $selectedIdx -lt $data.Count) {
+        $selectedItem = $data[$selectedIdx]
+    }
+
+    $selectedForPipeline = $null
+    if ($selectedItem -and $selectedItem.Type -eq "task" -and $selectedItem.Raw) {
+        $selectedForPipeline = $selectedItem.Raw
+    }
+
+    $pipelineData = $null
+    try { $pipelineData = Build-PipelineStatus -SelectedRow $selectedForPipeline } catch { $pipelineData = $null }
+
+    # v16.0: Write snapshot if any stage is non-GREEN (dedupe via hash + debounce)
+    if ($pipelineData) {
+        $selTaskId = if ($selectedForPipeline -and $selectedForPipeline.id) { $selectedForPipeline.id } else { $null }
+        Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData -SelectedTaskId $selTaskId
+    }
+
+    $stages = @()
+    $nextCmd = "—"
+    $nextColor = "Yellow"
+
+    if ($pipelineData -and $pipelineData.stages) {
+        $stages = @($pipelineData.stages)
+
+        # BOOTSTRAP safety: lock downstream stages until Context is GREEN
+        $ctx = $stages | Where-Object { $_.name -eq "Context" } | Select-Object -First 1
+        if ($ctx -and $ctx.state -ne "GREEN") {
+            foreach ($s in $stages) {
+                if ($s.name -ne "Context") {
+                    $s.state = "GRAY"
+                    $s.hint = "Locked (context not green)"
+                }
+            }
+        }
+
+        $suggested = $pipelineData.suggested_next.command
+        if (-not [string]::IsNullOrWhiteSpace($suggested)) {
+            $nextCmd = $suggested
+        }
+        else {
+            $nextCmd = $pipelineData.immediate_next
+        }
+
+        $allGreen = -not ($stages | Where-Object { $_.state -ne "GREEN" })
+        $nextColor = if ($allGreen) { "Green" } else { "Yellow" }
+    }
+    else {
+        $stages = @(
+            @{ name = "Context";  state = "GRAY"; hint = "—" }
+            @{ name = "Plan";     state = "GRAY"; hint = "—" }
+            @{ name = "Work";     state = "GRAY"; hint = "—" }
+            @{ name = "Optimize"; state = "GRAY"; hint = "—" }
+            @{ name = "Verify";   state = "GRAY"; hint = "—" }
+            @{ name = "Ship";     state = "GRAY"; hint = "—" }
+        )
+        $nextCmd = "Pipeline unavailable"
+        $nextColor = "Yellow"
+    }
+
+    $rightLines = @()
+    $rightColors = @()
+
+    $rightLines += "PIPELINE"
+    $rightColors += "Cyan"
+
+    $rightLines += "Next: $nextCmd"
+    $rightColors += $nextColor
+
+    # One-line hotkey/result hint (set by D/I/S/V)
+    $rightLines += $(if ($Global:HistoryHintText) { $Global:HistoryHintText } else { "" })
+    $rightColors += $(if ($Global:HistoryHintText) { $Global:HistoryHintColor } else { "DarkGray" })
+
+    $rightLines += ""
+    $rightColors += "DarkGray"
+
+    foreach ($s in $stages) {
+        $name = if ($s.name) { $s.name } else { "—" }
+        $state = if ($s.state) { $s.state } else { "GRAY" }
+        $hint = if ($s.hint) { $s.hint } else { "" }
+
+        $label = $name.ToUpperInvariant().PadRight(8)
+        $line = "$label [$state] $hint"
+        $rightLines += $line
+        $rightColors += $(if ($stateColors.ContainsKey($state)) { $stateColors[$state] } else { "DarkGray" })
+    }
+
+    $rightLines += ""
+    $rightColors += "DarkGray"
+
+    # Selection summary (changes with Up/Down)
+    $rightLines += "SELECTION"
+    $rightColors += "DarkGray"
+
+    $selText = "—"
+    if ($selectedItem) {
+        if ($selectedItem.Type -eq "task" -and $selectedItem.Raw) {
+            $tid = $selectedItem.Id
+            $status = $selectedItem.Raw.status
+            $risk = $selectedItem.Raw.risk
+            $qa = $selectedItem.Raw.qa_status
+            $selText = "T-$tid | $status | risk=$risk | qa=$qa"
+        }
+        else {
+            $selText = $selectedItem.Content
+        }
+    }
+    $rightLines += $selText
+    $rightColors += "Gray"
+
+    # Optional details overlay (Enter toggles) - kept minimal
+    if ($Global:HistoryDetailsVisible -and $selectedItem -and $selectedItem.Type -eq "task") {
+        $details = Get-HistoryDetailData -SelectedItem $selectedItem
+        if ($details -and $details.Count -gt 0) {
+            $rightLines += "DETAILS"
+            $rightColors += "DarkGray"
+            foreach ($d in ($details | Select-Object -First 4)) {
+                $rightLines += "$($d.Action): $($d.Reason)"
+                $rightColors += "DarkGray"
+            }
+        }
+    }
+
+    $rightLines += ""
+    $rightColors += "DarkGray"
+
+    $rightLines += "Hotkeys: D next | I ingest | S simplify | V verify | Tab view | F2/Esc exit"
+    $rightColors += "Cyan"
+
+    # Fit right panel content to available rows
+    while ($rightLines.Count -lt $VisibleRows) {
+        $rightLines += ""
+        $rightColors += "DarkGray"
+    }
+    if ($rightLines.Count -gt $VisibleRows) {
+        $rightLines = $rightLines[0..($VisibleRows - 1)]
+        $rightColors = $rightColors[0..($VisibleRows - 1)]
+    }
+
+    # Empty data hint (left side)
+    $emptyHint = $null
+    if (-not $data -or $data.Count -eq 0) {
+        $emptyHint = switch ($Global:HistorySubview) {
+            "TASKS" { "No tasks yet. Try: /draft-plan or /add <desc>" }
+            "DOCS"  { "No docs found. Try: /init to bootstrap" }
+            "SHIP"  { "Nothing to ship yet." }
+            default { "No data available." }
+        }
+    }
+
+    for ($i = 0; $i -lt $VisibleRows; $i++) {
+        $idx = $scrollOffset + $i
+        $item = $null
+        $isSelected = $false
+        if ($data -and $idx -ge 0 -and $idx -lt $data.Count) {
+            $item = $data[$idx]
+            $isSelected = ($idx -eq $selectedIdx)
+        }
+
+        # Build row text
+        if ($item) {
+            $worker = $item.Worker.PadRight($colWorker)
+            $content = $item.Content
+            if ($content.Length -gt $colContent) { $content = $content.Substring(0, $colContent - 3) + "..." }
+            $content = $content.PadRight($colContent)
+            $health = $item.Health.PadRight($colHealth)
+
+            # Left panel: data row
+            Set-Pos $R 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            if ($isSelected) {
+                Write-Host ">" -NoNewline -ForegroundColor Cyan
+            }
+            else {
+                Write-Host " " -NoNewline
+            }
+
+            # Worker column
+            Write-Host $worker -NoNewline -ForegroundColor $(if ($isSelected) { "White" } else { "Gray" })
+            # Content column
+            Write-Host $content -NoNewline -ForegroundColor $(if ($isSelected) { "Cyan" } else { "Gray" })
+            # Health column with color
+            Write-Host $health -NoNewline -ForegroundColor $item.HealthColor
+
+            # Pad to half width
+            $usedWidth = 3 + $colWorker + $colContent + $colHealth
+            $padNeeded = $Half - $usedWidth - 2
+            if ($padNeeded -gt 0) { Write-Host (" " * $padNeeded) -NoNewline }
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        }
+        else {
+            # Blank left row (keep borders stable); show empty hint once if needed
+            Set-Pos $R 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+            if ($emptyHint -and $i -eq 2) {
+                $padLeft = [Math]::Max(0, [Math]::Floor(($Half - 4 - $emptyHint.Length) / 2))
+                $padRight = $Half - 4 - $padLeft - $emptyHint.Length
+                Write-Host (" " * $padLeft) -NoNewline
+                Write-Host $emptyHint -NoNewline -ForegroundColor Yellow
+                if ($padRight -gt 0) { Write-Host (" " * $padRight) -NoNewline }
+            }
+            else {
+                Write-Host (" " * ($Half - 4)) -NoNewline
+            }
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        }
+
+        # Right panel: pipeline/next step/hint (stable, no scroll growth)
+        $rt = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { "" }
+        $rc = if ($i -lt $rightColors.Count) { $rightColors[$i] } else { "DarkGray" }
+        if ($rt.Length -gt $RightWidth) {
+            $rt = $rt.Substring(0, $RightWidth - 3) + "..."
+        }
+
+        Set-Pos $R $Half
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $rt.PadRight($RightWidth) -NoNewline -ForegroundColor $rc
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+
+        $R++
+    }
+
+    # Bottom Border
+    Set-Pos $R 0
+    Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
+    Set-Pos $R $Half
+    Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
+}
+#endregion HISTORY_MODE
 
 # --- v9.3 DASHBOARD: EXECUTION RESOURCES vs COGNITIVE STATE (with Actionable Hints) ---
 function Draw-Dashboard {
     # 1. Fetch Data
     $Data = Get-WorkerStatus
 
-    # v13.6: Get context readiness (fast, lightweight script)
+    # v14.1: Get context readiness (fast, lightweight script)
+    # Use explicit path from $RepoRoot and pass project directory for correct file resolution
     $Readiness = $null
-    $IsBootstrap = $false
+    $IsBootstrap = $true  # v14.1: Fail-safe to BOOTSTRAP (not EXECUTION) on fresh projects
+    $IsPreInit = $false   # v14.1: NEW - Uninitialized state (before /init)
     try {
-        $readinessJson = python "tools\readiness.py" 2>&1
+        $readinessScript = Join-Path $RepoRoot "tools\readiness.py"
+        # Pass $CurrentDir as argument so readiness checks the right project
+        $readinessJson = python "$readinessScript" "$CurrentDir" 2>&1
         $Readiness = $readinessJson | ConvertFrom-Json -ErrorAction SilentlyContinue
         if ($Readiness) {
             $IsBootstrap = ($Readiness.status -eq "BOOTSTRAP")
+
+            # v14.1: Detect PRE_INIT - ALL golden docs missing
+            $allMissing = $true
+            foreach ($docName in @("PRD", "SPEC", "DECISION_LOG")) {
+                $fileData = $Readiness.files.$docName
+                if ($fileData -and $fileData.exists) {
+                    $allMissing = $false
+                    break
+                }
+            }
+            $IsPreInit = $allMissing
+        }
+        else {
+            # Parse failed - check files directly for PRE_INIT detection
+            $IsBootstrap = $true
+            $prdPath = Join-Path $CurrentDir "docs\PRD.md"
+            $specPath = Join-Path $CurrentDir "docs\SPEC.md"
+            $decPath = Join-Path $CurrentDir "docs\DECISION_LOG.md"
+            $IsPreInit = (-not (Test-Path $prdPath)) -and (-not (Test-Path $specPath)) -and (-not (Test-Path $decPath))
         }
     }
     catch {
-        # Fail-open: assume EXECUTION if check fails
-        $IsBootstrap = $false
+        # v14.1: Fail-safe - check files directly
+        $IsBootstrap = $true
+        $prdPath = Join-Path $CurrentDir "docs\PRD.md"
+        $specPath = Join-Path $CurrentDir "docs\SPEC.md"
+        $decPath = Join-Path $CurrentDir "docs\DECISION_LOG.md"
+        $IsPreInit = (-not (Test-Path $prdPath)) -and (-not (Test-Path $specPath)) -and (-not (Test-Path $decPath))
     }
 
     # Get decisions
@@ -3133,195 +6187,199 @@ function Draw-Dashboard {
     Set-Pos $R $Half; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
     $R++
 
-    # v13.6: CONDITIONAL RENDERING - BOOTSTRAP vs EXECUTION
-    if ($IsBootstrap) {
-        # === BOOTSTRAP MODE: Show readiness panel ===
-        $R = Draw-BootstrapPanel -StartRow $R -HalfWidth $Half -ReadinessData $Readiness
+    # v14.1: CONDITIONAL RENDERING - PRE_INIT vs BOOTSTRAP vs EXECUTION
+    if ($IsPreInit) {
+        # === PRE_INIT: No docs exist yet, show setup instructions ===
+        $R = Draw-PreInitPanel -StartRow $R -HalfWidth $Half -WorkerData $Data
 
-        # Add separator
-        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
-        $R++
-
-        # Show minimal worker status
-        $BE_Color = if ($Data.backend_status -eq "UP") { "Green" } else { "Gray" }
-        $FE_Color = if ($Data.frontend_status -eq "UP") { "Green" } else { "Gray" }
-
-        Print-Row $R "BACKEND: [$($Data.backend_status)]" "FRONTEND: [$($Data.frontend_status)]" $Half $BE_Color $FE_Color
-        $R++
-        Print-Row $R "QA/AUDIT: Ready" "" $Half "Gray" "Gray"
-        $R++
-
-        # Separator
+        # Fill remaining space to maintain layout consistency
         Print-Row $R "" "" $Half "DarkGray" "DarkGray"
         $R++
     }
+    elseif ($IsBootstrap) {
+        # === BOOTSTRAP MODE: Show readiness panel (docs exist but incomplete) ===
+        $R = Draw-BootstrapPanel -StartRow $R -HalfWidth $Half -ReadinessData $Readiness
+    }
     else {
-        # === EXECUTION MODE: Show full dashboard ===
+        # === EXECUTION MODE: Show compact stream dashboard (v16.0) ===
 
-        # --- ROW: BACKEND & PO ---
-        # v13.5.5: Show [NEXT] with count if delegation data exists
-        $BE_DelegationCount = 0
-        if ($Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY") {
-            $beStream = $Global:StartupDelegation.streams | Where-Object { $_.id -eq "backend" -or $_.id -eq "Backend" } | Select-Object -First 1
-            if ($beStream) { $BE_DelegationCount = $beStream.task_count }
-        }
-    
-        if ($BE_DelegationCount -gt 0 -and $Data.backend_status -eq "IDLE") {
-            # Show [NEXT] instead of [IDLE] when there's delegated work
-            $BE_Color = "Cyan"
-            $BE_Txt = "BACKEND  [NEXT] ($BE_DelegationCount)"
-        }
-        else {
-            $BE_Color = if ($Data.backend_status -eq "UP") { "Green" } elseif ($Data.backend_status -eq "IDLE") { "Yellow" } else { "Red" }
-            $BE_Txt = "BACKEND  [$($Data.backend_status)]"
-            if ($Data.backend_streams -and $Data.backend_streams -gt 0) { $BE_Txt += " | Str: #$($Data.backend_streams)" }
-        }
-    
-        $PO_Txt = "PRODUCT OWNER  [$($Data.po_next_decision)]"
-    
-        # HINT LOGIC: PO
-        if ($Data.po_status_color -ne "Green") {
-            Print-Row-With-Hint $R $BE_Txt $PO_Txt $Half $BE_Color $Data.po_status_color "-> /decide"
-        }
-        else {
-            Print-Row $R $BE_Txt $PO_Txt $Half $BE_Color $Data.po_status_color
-        }
-        $R++
+        # --- v16.0: COMPACT STREAM LINES (Left Panel) ---
+        # Get stream status for all 4 streams
+        $BE_Status = Get-StreamStatusLine -StreamName "BACKEND" -WorkerData $Data
+        $FE_Status = Get-StreamStatusLine -StreamName "FRONTEND" -WorkerData $Data
+        $QA_Status = Get-StreamStatusLine -StreamName "QA" -WorkerData $Data
+        $LIB_Status = Get-StreamStatusLine -StreamName "LIBRARIAN" -WorkerData $Data
 
-        # --- ROW: BACKEND TASK ---
-        $BE_Task = "  Task: " + $(if ($Data.backend_task) { $Data.backend_task } else { "(none)" })
-        Print-Row $R $BE_Task "  Status: $($Data.po_next_decision)" $Half "Gray" $Data.po_status_color
-        $R++
-    
-        # === SEPARATOR ===
-        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+        # Calculate widths for compact stream line
+        $ContentWidth = $Half - 4
+        $StreamCol = 10   # "BACKEND  " etc
+        $BarCol = 6       # "■■■■■ "
+        $StateCol = 8     # "RUNNING "
+        $SummaryCol = $ContentWidth - $StreamCol - $BarCol - $StateCol - 3  # remaining for " | summary"
+
+        # --- v16.0: Helper to draw compact stream line ---
+        function Draw-StreamLine {
+            param(
+                [int]$Row,
+                [string]$StreamName,
+                [hashtable]$Status,
+                [int]$Half
+            )
+
+            $ContentWidth = $Half - 4
+
+            # Left panel: Stream line
+            Set-Pos $Row 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+            # Stream name (padded to 10 chars)
+            Write-Host $StreamName.PadRight(10) -NoNewline -ForegroundColor White
+
+            # Microbar (5 chars + space)
+            Write-Host "$($Status.Bar) " -NoNewline -ForegroundColor $Status.BarColor
+
+            # State (padded to 8 chars)
+            Write-Host $Status.State.PadRight(8) -NoNewline -ForegroundColor $Status.BarColor
+
+            # Separator and summary
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+            # Summary (fill remaining space)
+            $summaryMaxLen = $ContentWidth - 10 - 6 - 8 - 2
+            $summary = $Status.Summary
+            if ($summary.Length -gt $summaryMaxLen) {
+                $summary = $summary.Substring(0, $summaryMaxLen - 3) + "..."
+            }
+            Write-Host $summary.PadRight($summaryMaxLen) -NoNewline -ForegroundColor $Status.SummaryColor
+
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        }
+
+        # --- ROW: BACKEND ---
+        Draw-StreamLine -Row $R -StreamName "BACKEND" -Status $BE_Status -Half $Half
+        # Right panel: NEXT FOCUS header
+        $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
+        $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
+                        elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
+                        else { "Context Ready" }
+        $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
+        Set-Pos $R $Half
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $nextFocusTxt.PadRight($Half - 4) -NoNewline -ForegroundColor $nextFocusColor
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
 
         # --- ROW: FRONTEND ---
-        # v13.5.5: Show [NEXT] with count if delegation data exists
-        $FE_DelegationCount = 0
-        if ($Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY") {
-            $feStream = $Global:StartupDelegation.streams | Where-Object { $_.id -eq "frontend" -or $_.id -eq "Frontend" } | Select-Object -First 1
-            if ($feStream) { $FE_DelegationCount = $feStream.task_count }
-        }
-    
-        if ($FE_DelegationCount -gt 0 -and $Data.frontend_status -eq "IDLE") {
-            # Show [NEXT] instead of [IDLE] when there's delegated work
-            $FE_Color = "Cyan"
-            $FE_Txt = "FRONTEND [NEXT] ($FE_DelegationCount)"
-        }
-        else {
-            $FE_Color = if ($Data.frontend_status -eq "UP") { "Green" } elseif ($Data.frontend_status -eq "IDLE") { "Yellow" } else { "Red" }
-            $FE_Txt = "FRONTEND [$($Data.frontend_status)]"
-        }
-        Print-Row $R $FE_Txt "RECENT DECISIONS" $Half $FE_Color "Yellow"
+        Draw-StreamLine -Row $R -StreamName "FRONTEND" -Status $FE_Status -Half $Half
+        # Right panel: Action hints
+        $actionRow = if ($hasDelegation) { "  /ingest | /draft-plan | /accept-plan" }
+                     elseif ($IsBootstrap) { "  Edit PRD/SPEC | /add (tactical open)" }
+                     else { "  /refresh-plan | /draft-plan" }
+        Set-Pos $R $Half
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $actionRow.PadRight($Half - 4) -NoNewline -ForegroundColor DarkGray
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
-    
-        # --- ROW: FRONTEND TASK & DECISION 1 ---
-        $FE_Task = "  Task: " + $(if ($Data.frontend_task) { $Data.frontend_task } else { "(none)" })
-        $D1 = if ($Decisions.Count -ge 1) { "  " + ($Decisions[-1] -replace "\|", "").Trim() } else { "  (none)" }
-        Print-Row $R $FE_Task $D1 $Half "Gray" "Gray"
+
+        # --- ROW: QA/AUDIT ---
+        Draw-StreamLine -Row $R -StreamName "QA/AUDIT" -Status $QA_Status -Half $Half
+        # Right panel: Separator
+        Set-Pos $R $Half
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host (" " * ($Half - 4)) -NoNewline
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
-    
-        # --- ROW: DECISION 2 ---
-        $D2 = if ($Decisions.Count -ge 2) { "  " + ($Decisions[-2] -replace "\|", "").Trim() } else { "" }
-        Print-Row $R "" $D2 $Half "Gray" "Gray"
+
+        # --- ROW: LIBRARIAN ---
+        Draw-StreamLine -Row $R -StreamName "LIBRARIAN" -Status $LIB_Status -Half $Half
+        # Right panel: Recent decision (if any)
+        $D1 = if ($Decisions.Count -ge 1) { "  " + ($Decisions[-1] -replace "\|", "").Trim() } else { "" }
+        if ($D1.Length -gt ($Half - 4)) { $D1 = $D1.Substring(0, $Half - 7) + "..." }
+        Set-Pos $R $Half
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $D1.PadRight($Half - 4) -NoNewline -ForegroundColor DarkGray
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
-    
+
         # === SEPARATOR ===
         Print-Row $R "" "" $Half "DarkGray" "DarkGray"
         $R++
 
-        # --- ROW: QA ---
-        # v13.5.5: Show [NEXT] with count if delegation data exists
-        $QA_DelegationCount = 0
-        if ($Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY") {
-            # Sum QA-like streams (qa, audit, test)
-            $qaStreams = $Global:StartupDelegation.streams | Where-Object { $_.id -match "qa|audit|test" }
-            foreach ($s in $qaStreams) { $QA_DelegationCount += $s.task_count }
+        # --- v15.1: INBOX indicator ---
+        $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
+        $inboxStatus = "—"
+        $inboxColor = "DarkGray"
+        if (Test-Path $inboxPath) {
+            $inboxContent = Get-Content $inboxPath -Raw -ErrorAction SilentlyContinue
+            if ($inboxContent) {
+                $meaningfulCount = 0
+                foreach ($line in ($inboxContent -split "`n")) {
+                    $trimmed = $line.Trim()
+                    if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                    if ($trimmed -match "ATOMIC_MESH_TEMPLATE_STUB") { continue }
+                    if ($trimmed -match "^#") { continue }
+                    if ($trimmed -eq "-") { continue }
+                    if ($trimmed.Length -lt 3) { continue }
+                    if ($trimmed.StartsWith("Drop clarifications")) { continue }
+                    if ($trimmed.StartsWith("Next: run")) { continue }
+                    $meaningfulCount++
+                }
+                if ($meaningfulCount -gt 0) {
+                    $inboxStatus = "pending ($meaningfulCount)"
+                    $inboxColor = "Yellow"
+                } else {
+                    $inboxStatus = "empty"
+                }
+            } else {
+                $inboxStatus = "empty"
+            }
         }
-    
-        if ($QA_DelegationCount -gt 0 -and (-not $Data.qa_sessions -or $Data.qa_sessions -eq 0)) {
-            # Show [NEXT] instead of Pending: 0 when there's delegated work
-            $QA_Txt = "QA/AUDIT  [NEXT] Pending: $QA_DelegationCount"
-            $QA_Color = "Cyan"
-        }
-        else {
-            $QA_Txt = "QA/AUDIT  Pending: " + $(if ($Data.qa_sessions) { $Data.qa_sessions } else { "0" })
-            $QA_Color = "White"
-        }
-    
-        # HINT LOGIC: QA
-        if ($Data.qa_sessions -and $Data.qa_sessions -gt 0) {
-            Print-Row-With-Hint-Left $R $QA_Txt "WORKER COT" $Half $QA_Color "Yellow" "-> /audit"
-        }
-        else {
-            Print-Row $R $QA_Txt "WORKER COT" $Half $QA_Color "Yellow"
-        }
+        Print-Row $R "INBOX     [$inboxStatus]" "" $Half $inboxColor "DarkGray"
         $R++
 
-        # --- ROW: LIBRARIAN & COT CONTENT ---
-        $Lib_Txt = "LIBRARIAN [$($Data.lib_status_text)]"
-        $COT = "  > " + $(if ($Data.worker_cot) { $Data.worker_cot } else { "Idling..." })
-    
-        # HINT LOGIC: LIBRARIAN
-        $Hint = ""
-        if ($Data.lib_status_text -match "MESSY") { $Hint = "-> /lib clean" }
-        elseif ($Data.lib_status_text -match "CLUTTERED") { $Hint = "-> /lib scan" }
-        elseif ($Data.lib_status_text -match "Inbox") { $Hint = "-> /ingest" }
-    
-        if ($Hint) {
-            Print-Row-With-Hint-Left $R $Lib_Txt $COT $Half $Data.lib_status_color "Cyan" $Hint
-        }
-        else {
-            Print-Row $R $Lib_Txt $COT $Half $Data.lib_status_color "Cyan"
-        }
-        $R++
-    
         # === SEPARATOR ===
         Print-Row $R "" "" $Half "DarkGray" "DarkGray"
         $R++
 
-        # --- v13.5.5 + v13.6: NEXT FOCUS (with Bootstrap awareness) ---
-        # Show compact "Next focus" line with context-aware hints
-        $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
-
-        if ($hasDelegation) {
-            # Has delegated work
-            Print-Row $R "" "Next focus: CONTENT" $Half "DarkGray" "Cyan"
-            $actionRow = "  /ingest | /draft-plan | /accept-plan"
+        # === v15.2: AUTO-INGEST STATUS LINE (compact) ===
+        $autoIngestTxt = "Auto-ingest: "
+        $autoIngestColor = "DarkGray"
+        if (-not $Global:AutoIngestEnabled) {
+            $autoIngestTxt += "disabled"
         }
-        elseif ($IsBootstrap) {
-            # BOOTSTRAP mode: Context incomplete
-            Print-Row $R "" "Next focus: CONTEXT (Strategic Locked)" $Half "DarkGray" "Yellow"
-            $actionRow = "  Edit PRD/SPEC | /add (tactical open)"
+        elseif ($Global:AutoIngestPending) {
+            $autoIngestTxt += "pending"
+            $autoIngestColor = "Yellow"
+        }
+        elseif ($Global:AutoIngestLastResult -eq "OK") {
+            $timeStr = if ($Global:AutoIngestLastRunUtc) { $Global:AutoIngestLastRunUtc.ToLocalTime().ToString("HH:mm:ss") } else { "" }
+            $autoIngestTxt += "OK ($timeStr)"
+            $autoIngestColor = "Green"
+        }
+        elseif ($Global:AutoIngestLastResult -eq "ERROR") {
+            $autoIngestTxt += "ERROR"
+            $autoIngestColor = "Red"
+        }
+        elseif ($Global:AutoIngestLastResult -eq "SKIPPED") {
+            $autoIngestTxt += "skipped"
         }
         else {
-            # EXECUTION mode but no plan yet (unlock handoff)
-            Print-Row $R "" "Context Ready. Run /refresh-plan" $Half "DarkGray" "Green"
-            $actionRow = "  /refresh-plan | /draft-plan | /ingest"
+            $autoIngestTxt += "armed"
         }
-        $R++
 
-        # --- Action hints row ---
-        Print-Row $R "" $actionRow $Half "DarkGray" "DarkGray"
-        $R++
-
-        # === v14.1: TRANSPARENCY LINE ===
-        # Build transparency status line
+        # === v14.1: TRANSPARENCY LINE (compact, merged with auto-ingest) ===
         $scopeTxt = if ($Global:LastScope) { $Global:LastScope } else { "—" }
-        $optimizedIcon = if ($Global:LastOptimized) { "✓" } else { "✗" }
-        $optimizedColor = if ($Global:LastOptimized) { "Green" } else { "DarkGray" }
+        $optimizedIcon = if ($Global:LastOptimized) { "OK" } else { "—" }
+        $transparencyTxt = "Scope: $scopeTxt | Opt: $optimizedIcon"
 
-        # Only show confidence when optimized is ✓
-        $confidenceTxt = ""
-        if ($Global:LastOptimized) {
-            $confidenceTxt = if ($Global:LastConfidence -ne $null) { " | Confidence: $($Global:LastConfidence)/100" } else { " | Confidence: —" }
-        }
-
-        $transparencyLine = "  Last scope: $scopeTxt | Optimized: $optimizedIcon$confidenceTxt"
-        Print-Row $R "" $transparencyLine $Half "DarkGray" "Gray"
+        Print-Row $R $autoIngestTxt $transparencyTxt $Half $autoIngestColor "DarkGray"
         $R++
+
+        # === v15.5: PIPELINE PANEL (right side) ===
+        $pipelineData = Build-PipelineStatus
+        # v16.0: Write snapshot if any stage is non-GREEN (dedupe via hash + debounce)
+        Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
+        $R = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData
 
         # === SEPARATOR ===
         Print-Row $R "" "" $Half "DarkGray" "DarkGray"
@@ -3331,7 +6389,7 @@ function Draw-Dashboard {
         Print-Row $R "" "LIVE AUDIT LOG" $Half "DarkGray" "Yellow"
         $R++
 
-        # --- ROW: LOGS ---
+        # --- ROW: LOGS (single line) ---
         $L1 = if ($AuditLog.Count -ge 1) { "  " + $AuditLog[-1] } else { "  (no logs)" }
         Print-Row $R "" $L1 $Half "Gray" "DarkGray"
         $R++
@@ -4112,10 +7170,48 @@ function Read-StableInput {
     $cursorCol = $cursorStart
 
     while ($true) {
-        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        # v15.4.1: AllowCtrlC lets us intercept Ctrl+C instead of immediate termination
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown,AllowCtrlC")
 
-        # Enter - submit OR apply lookup selection
+        # v15.4.1: Auto-clear Ctrl+C warning after 2 seconds
+        if ($Global:CtrlCWarningShownUtc) {
+            $elapsed = ([DateTime]::UtcNow - $Global:CtrlCWarningShownUtc).TotalSeconds
+            if ($elapsed -ge 2.0) {
+                # Clear the warning line (below input bar, right side)
+                Set-Pos ($Global:RowInput + 2) ($width - 25)
+                Write-Host (" " * 25) -NoNewline
+                Set-Pos $Global:RowInput $cursorCol
+                $Global:CtrlCWarningShownUtc = $null
+            }
+        }
+
+        # v15.4.1: Ctrl-C double-press protection (inline check)
+        if ($key.VirtualKeyCode -eq 3 -or
+            ($key.VirtualKeyCode -eq 67 -and ($key.ControlKeyState -band [System.Management.Automation.Host.ControlKeyStates]::LeftCtrlPressed -or
+             $key.ControlKeyState -band [System.Management.Automation.Host.ControlKeyStates]::RightCtrlPressed))) {
+            $now = [DateTime]::UtcNow
+            if ($Global:LastCtrlCUtc -and ($now - $Global:LastCtrlCUtc).TotalSeconds -le 1.0) {
+                Write-Host "`nExiting..." -ForegroundColor DarkGray
+                exit 130
+            }
+            $Global:LastCtrlCUtc = $now
+            $Global:CtrlCWarningShownUtc = $now
+            # Show subtle warning below input bar, right-aligned
+            $warnMsg = "Ctrl+C again to exit"
+            Set-Pos ($Global:RowInput + 2) ($width - $warnMsg.Length - 2)
+            Write-Host $warnMsg -ForegroundColor DarkGray -NoNewline
+            Set-Pos $Global:RowInput $cursorCol
+            continue
+        }
+
+        # Enter - submit OR apply lookup selection OR toggle history details
         if ($key.VirtualKeyCode -eq 13) {
+            # v15.5: In History Mode, Enter toggles details pane
+            if ($Global:HistoryMode) {
+                $Global:HistoryDetailsVisible = -not $Global:HistoryDetailsVisible
+                return "__REFRESH_HISTORY__"
+            }
+
             # v13.4.6: If lookup is active and has candidates, apply selection
             if ($Global:PlaceholderInfo -and $Global:PlaceholderInfo.Lookup -and $Global:LookupCandidates -and $Global:LookupCandidates.Count -gt 0) {
                 $ph = $Global:PlaceholderInfo
@@ -4198,6 +7294,10 @@ function Read-StableInput {
         # v13.5.5: ESC now does an in-place redraw and continues in the input loop
         #          This prevents the window from extending or jumping
         if ($key.VirtualKeyCode -eq 27) {
+            # v15.5: In History Mode, Esc exits History Mode (only when not typing)
+            if ($Global:HistoryMode -and [string]::IsNullOrEmpty($buffer) -and (-not $Global:PlaceholderInfo)) {
+                return "__TOGGLE_HISTORY__"
+            }
             # Reset logical state
             $buffer = ""
             $cursorCol = $cursorStart
@@ -4209,8 +7309,24 @@ function Read-StableInput {
             continue
         }
 
-        # Tab - advance to next placeholder (v13.4.5) OR toggle mode when no placeholder
+        # Tab - advance to next placeholder (v13.4.5) OR toggle mode when no placeholder OR cycle history subview
         if ($key.VirtualKeyCode -eq 9) {
+            # v15.5: In History Mode, Tab cycles subviews: TASKS → DOCS → SHIP → TASKS
+            if ($Global:HistoryMode) {
+                $Global:HistorySubview = switch ($Global:HistorySubview) {
+                    "TASKS" { "DOCS" }
+                    "DOCS" { "SHIP" }
+                    "SHIP" { "TASKS" }
+                    default { "TASKS" }
+                }
+                # Reset selection and scroll when changing subview
+                $Global:HistorySelectedRow = 0
+                $Global:HistoryScrollOffset = 0
+                $Global:HistoryDetailsVisible = $false
+                $Global:HistoryData = @(Get-HistoryData)
+                return "__REFRESH_HISTORY__"
+            }
+
             # v13.4.5: If placeholder is active, Tab advances to next placeholder
             if ($Global:PlaceholderInfo) {
                 $ph = $Global:PlaceholderInfo
@@ -4278,14 +7394,33 @@ function Read-StableInput {
             continue
         }
 
-        # F2 - toggle placeholder options (v13.4.3)
+        # F2 - History Mode toggle OR toggle placeholder options (v13.4.3 + v15.5)
         if ($key.VirtualKeyCode -eq 113) {
-            Invoke-TogglePlaceholder -Buffer ([ref]$buffer) -CursorCol ([ref]$cursorCol) -CursorStart $cursorStart -Width $width -RowInput $Global:RowInput
-            continue
+            # If a placeholder toggle is active, keep legacy behavior
+            if (-not $Global:HistoryMode -and $Global:PlaceholderInfo) {
+                Invoke-TogglePlaceholder -Buffer ([ref]$buffer) -CursorCol ([ref]$cursorCol) -CursorStart $cursorStart -Width $width -RowInput $Global:RowInput
+                continue
+            }
+
+            # Otherwise, F2 toggles History Mode (enter/exit)
+            return "__TOGGLE_HISTORY__"
         }
 
-        # Up Arrow - navigate lookup candidates (v13.4.6)
+        # F3 - legacy History Mode toggle (v15.5)
+        if ($key.VirtualKeyCode -eq 114) {
+            return "__TOGGLE_HISTORY__"
+        }
+
+        # Up Arrow - navigate lookup candidates (v13.4.6) OR history rows (v15.5)
         if ($key.VirtualKeyCode -eq 38) {
+            # v15.5: In History Mode, Up moves selection up
+            if ($Global:HistoryMode) {
+                if ($Global:HistorySelectedRow -gt 0) {
+                    $Global:HistorySelectedRow--
+                }
+                return "__REFRESH_HISTORY__"
+            }
+
             if ($Global:PlaceholderInfo -and $Global:PlaceholderInfo.Lookup -and $Global:LookupCandidates -and $Global:LookupCandidates.Count -gt 0) {
                 $ph = $Global:PlaceholderInfo
                 $count = $Global:LookupCandidates.Count
@@ -4300,8 +7435,17 @@ function Read-StableInput {
             continue
         }
 
-        # Down Arrow - navigate lookup candidates (v13.4.6)
+        # Down Arrow - navigate lookup candidates (v13.4.6) OR history rows (v15.5)
         if ($key.VirtualKeyCode -eq 40) {
+            # v15.5: In History Mode, Down moves selection down
+            if ($Global:HistoryMode) {
+                $maxIdx = $Global:HistoryData.Count - 1
+                if ($maxIdx -ge 0 -and $Global:HistorySelectedRow -lt $maxIdx) {
+                    $Global:HistorySelectedRow++
+                }
+                return "__REFRESH_HISTORY__"
+            }
+
             if ($Global:PlaceholderInfo -and $Global:PlaceholderInfo.Lookup -and $Global:LookupCandidates -and $Global:LookupCandidates.Count -gt 0) {
                 $ph = $Global:PlaceholderInfo
                 $count = $Global:LookupCandidates.Count
@@ -4464,7 +7608,18 @@ function Read-StableInput {
         # Get character
         $char = $key.Character
 
-        # Slash as FIRST character - show command picker
+        # v15.5: History Mode hotkeys (only when not typing)
+        if ($Global:HistoryMode -and [string]::IsNullOrEmpty($buffer) -and $char) {
+            $upper = $char.ToString().ToUpperInvariant()
+            switch ($upper) {
+                "D" { return "__HISTORY_HOTKEY_D__" }
+                "I" { return "__HISTORY_HOTKEY_I__" }
+                "S" { return "__HISTORY_HOTKEY_S__" }
+                "V" { return "__HISTORY_HOTKEY_V__" }
+            }
+        }
+
+        # Slash as FIRST character - show command picker (with exact-match support)
         if ($buffer.Length -eq 0 -and $char -eq '/') {
             Write-Host "/" -NoNewline -ForegroundColor Yellow
             $pickerResult = Show-CommandPicker
@@ -4475,16 +7630,16 @@ function Read-StableInput {
             if ($pickerResult.Kind -eq "template") {
                 $template = $pickerResult.Command
                 $buffer = $template
-                
+
                 # Clear and redraw input with template
                 Clear-InputContent -width $width -rowInput $Global:RowInput
                 Set-Pos $Global:RowInput $cursorStart
-                
+
                 # Draw template with placeholder highlighting
                 if ($Global:PlaceholderInfo) {
                     $phStart = $Global:PlaceholderInfo.Start
                     $phLen = $Global:PlaceholderInfo.Length
-                    
+
                     # Text before placeholder
                     if ($phStart -gt 0) {
                         Write-Host $template.Substring(0, $phStart) -NoNewline -ForegroundColor Cyan
@@ -4495,7 +7650,7 @@ function Read-StableInput {
                     if ($phStart + $phLen -lt $template.Length) {
                         Write-Host $template.Substring($phStart + $phLen) -NoNewline -ForegroundColor Cyan
                     }
-                    
+
                     # v13.4.6: Show lookup panel immediately if Lookup is set
                     if ($Global:PlaceholderInfo.Lookup) {
                         Draw-LookupPanel -Width $width -RowInput $Global:RowInput -CursorStart $cursorStart
@@ -4504,7 +7659,7 @@ function Read-StableInput {
                         # Draw toggle options or mini guide on right side (v13.4.3)
                         Draw-ToggleOptions -Width $width -RowInput $Global:RowInput
                     }
-                    
+
                     # Position cursor at placeholder start
                     $cursorCol = $cursorStart + $phStart
                     Set-Pos $Global:RowInput $cursorCol
@@ -4517,7 +7672,7 @@ function Read-StableInput {
                 continue
             }
             # Cancelled - clear input content preserving borders
-            $Global:PlaceholderInfo = $null  # v13.4: Clear placeholder on cancel
+            $Global:PlaceholderInfo = $null
             Clear-InputContent -width $width -rowInput $Global:RowInput
             $buffer = ""
             $cursorCol = $cursorStart
@@ -4660,11 +7815,16 @@ function Read-StableInput {
 
 # --- COMMAND PICKER (Arrow key navigation + type-ahead filter) ---
 # v13.3.5: Dropdown starts below bottom border (RowInput+2)
+# v15.4.1: Added InitialFilter parameter for pre-typed command text
 function Show-CommandPicker {
-    # Get Golden Path commands (default view)
-    $goldenCmds = Get-PickerCommands -Filter ""
+    param(
+        [string]$InitialFilter = ""
+    )
 
-    if ($goldenCmds.Count -eq 0) { return @{ Kind = "cancel" } }
+    # Get Golden Path commands (default view)
+    $goldenCmds = Get-PickerCommands -Filter $InitialFilter
+
+    if ($goldenCmds.Count -eq 0 -and $InitialFilter -eq "") { return @{ Kind = "cancel" } }
 
     # v13.3.5: Get fresh layout values
     $layout = Get-PromptLayout
@@ -4673,7 +7833,7 @@ function Show-CommandPicker {
     $width = $layout.Width
     $maxVisible = $layout.MaxVisible
 
-    $script:pickerFilter = ""
+    $script:pickerFilter = $InitialFilter
     $script:pickerSelectedIdx = 0
     $script:pickerScrollOffset = 0
 
@@ -4751,14 +7911,62 @@ function Show-CommandPicker {
         return $cmdList
     }
 
-    $filteredCmds = DrawPickerDropdown
+    $filteredCmds = @(DrawPickerDropdown)
 
     while ($true) {
-        $keyPress = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-        $filteredCmds = Get-PickerCommands -Filter $script:pickerFilter
+        # v15.4.1: AllowCtrlC lets us intercept Ctrl+C instead of immediate termination
+        $keyPress = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown,AllowCtrlC")
+        $filteredCmds = @(Get-PickerCommands -Filter $script:pickerFilter)
 
-        # Enter - select command
+        # v15.4.1: Auto-clear Ctrl+C warning after 2 seconds
+        if ($Global:CtrlCWarningShownUtc) {
+            $elapsed = ([DateTime]::UtcNow - $Global:CtrlCWarningShownUtc).TotalSeconds
+            if ($elapsed -ge 2.0) {
+                # Clear the warning line (below input bar, right side)
+                Set-Pos ($rowInput + 2) ($width - 25)
+                Write-Host (" " * 25) -NoNewline
+                Set-Pos $rowInput ($Global:InputLeft + 5 + $script:pickerFilter.Length)
+                $Global:CtrlCWarningShownUtc = $null
+            }
+        }
+
+        # v15.4.1: Ctrl-C double-press protection (inline check)
+        if ($keyPress.VirtualKeyCode -eq 3 -or
+            ($keyPress.VirtualKeyCode -eq 67 -and ($keyPress.ControlKeyState -band [System.Management.Automation.Host.ControlKeyStates]::LeftCtrlPressed -or
+             $keyPress.ControlKeyState -band [System.Management.Automation.Host.ControlKeyStates]::RightCtrlPressed))) {
+            $now = [DateTime]::UtcNow
+            if ($Global:LastCtrlCUtc -and ($now - $Global:LastCtrlCUtc).TotalSeconds -le 1.0) {
+                Write-Host "`nExiting..." -ForegroundColor DarkGray
+                exit 130
+            }
+            $Global:LastCtrlCUtc = $now
+            $Global:CtrlCWarningShownUtc = $now
+            # Show subtle warning below input bar, right-aligned
+            $warnMsg = "Ctrl+C again to exit"
+            Set-Pos ($rowInput + 2) ($width - $warnMsg.Length - 2)
+            Write-Host $warnMsg -ForegroundColor DarkGray -NoNewline
+            Set-Pos $rowInput ($Global:InputLeft + 5 + $script:pickerFilter.Length)
+            continue
+        }
+
+        # v15.4: Enter - select command (with auto-expand for unique/exact match)
         if ($keyPress.VirtualKeyCode -eq 13) {
+            if ($filteredCmds.Count -ge 1) {
+                # Check for exact match first
+                $exactMatch = $filteredCmds | Where-Object { $_.Name -eq $script:pickerFilter }
+                if ($exactMatch) {
+                    ClearDropdownOnly
+                    return @{ Kind = "select"; Command = "/" + $exactMatch.Name }
+                }
+                # Otherwise use highlighted selection
+                ClearDropdownOnly
+                return @{ Kind = "select"; Command = "/" + $filteredCmds[$script:pickerSelectedIdx].Name }
+            }
+            continue
+        }
+
+        # v15.4: TAB - accept highlighted suggestion (same as Enter for selection)
+        if ($keyPress.VirtualKeyCode -eq 9) {
             if ($filteredCmds.Count -gt 0) {
                 ClearDropdownOnly
                 return @{ Kind = "select"; Command = "/" + $filteredCmds[$script:pickerSelectedIdx].Name }
@@ -4899,6 +8107,127 @@ function Show-ScenarioHint {
 }
 
 # ============================================================================
+# v15.2: AUTO-INGEST (File Watcher + Debounced Trigger)
+# ============================================================================
+
+# Silent ingest function (no UI output, returns result)
+function Invoke-SilentIngest {
+    <#
+    .SYNOPSIS
+        Runs ingest silently, returns @{ Ok = $bool; Message = "..." }
+    #>
+    try {
+        # Call mesh_server's trigger_ingestion via Python
+        $result = python -c "from mesh_server import trigger_ingestion; print(trigger_ingestion())" 2>&1
+        $resultStr = $result -join "`n"
+
+        if ($resultStr -match "❌") {
+            return @{ Ok = $false; Message = ($resultStr -replace "❌\s*", "").Trim().Substring(0, [Math]::Min(50, $resultStr.Length)) }
+        }
+        return @{ Ok = $true; Message = "OK" }
+    }
+    catch {
+        return @{ Ok = $false; Message = $_.Exception.Message.Substring(0, [Math]::Min(50, $_.Exception.Message.Length)) }
+    }
+}
+
+# Set up FileSystemWatcher for docs/*.md
+function Initialize-AutoIngestWatcher {
+    if (-not $Global:AutoIngestEnabled) { return }
+
+    $docsPath = Join-Path $CurrentDir "docs"
+    if (-not (Test-Path $docsPath)) { return }
+
+    # Allowed files for auto-ingest
+    $script:AutoIngestAllowlist = @("PRD.md", "SPEC.md", "DECISION_LOG.md", "ACTIVE_SPEC.md", "INBOX.md", "TECH_STACK.md")
+
+    try {
+        $watcher = New-Object System.IO.FileSystemWatcher
+        $watcher.Path = $docsPath
+        $watcher.Filter = "*.md"
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite -bor [System.IO.NotifyFilters]::FileName
+        $watcher.EnableRaisingEvents = $true
+
+        # Event handler - just marks pending (debounce happens in main loop)
+        $action = {
+            $fileName = $Event.SourceEventArgs.Name
+            if ($script:AutoIngestAllowlist -contains $fileName) {
+                $Global:AutoIngestPending = $true
+                $Global:AutoIngestLastChangeUtc = [DateTime]::UtcNow
+            }
+        }
+
+        Register-ObjectEvent -InputObject $watcher -EventName Changed -Action $action | Out-Null
+        Register-ObjectEvent -InputObject $watcher -EventName Created -Action $action | Out-Null
+        Register-ObjectEvent -InputObject $watcher -EventName Renamed -Action $action | Out-Null
+
+        $Global:AutoIngestWatcher = $watcher
+    }
+    catch {
+        # Silently fail - auto-ingest is optional
+        $Global:AutoIngestEnabled = $false
+    }
+}
+
+# Process pending auto-ingest (called from main loop)
+function Invoke-AutoIngestIfPending {
+    if (-not $Global:AutoIngestEnabled) { return $false }
+    if (-not $Global:AutoIngestPending) { return $false }
+
+    # Check debounce window
+    if ($Global:AutoIngestLastChangeUtc) {
+        $elapsed = ([DateTime]::UtcNow - $Global:AutoIngestLastChangeUtc).TotalMilliseconds
+        if ($elapsed -lt $Global:AutoIngestDebounceMs) {
+            return $false  # Still settling
+        }
+    }
+
+    # Clear pending flag
+    $Global:AutoIngestPending = $false
+    $Global:AutoIngestLastRunUtc = [DateTime]::UtcNow
+
+    # Check if we're in PRE_INIT (no docs exist)
+    $docsPath = Join-Path $CurrentDir "docs"
+    $prdExists = Test-Path (Join-Path $docsPath "PRD.md")
+    $specExists = Test-Path (Join-Path $docsPath "SPEC.md")
+
+    if (-not $prdExists -and -not $specExists) {
+        $Global:AutoIngestLastResult = "SKIPPED"
+        $Global:AutoIngestLastMessage = "No docs yet"
+        return $false
+    }
+
+    # Run silent ingest
+    $result = Invoke-SilentIngest
+
+    if ($result.Ok) {
+        $Global:AutoIngestLastResult = "OK"
+        $Global:AutoIngestLastMessage = $null
+    }
+    else {
+        $Global:AutoIngestLastResult = "ERROR"
+        $Global:AutoIngestLastMessage = $result.Message
+    }
+
+    return $true  # Ingest was attempted, caller should refresh
+}
+
+# ============================================================================
+# v15.4.1: CTRL-C DOUBLE-PRESS PROTECTION (TreatControlCAsInput)
+# ============================================================================
+
+function Initialize-CtrlCHandler {
+    <#
+    .SYNOPSIS
+        Sets up Ctrl-C interception by treating it as input.
+        The actual double-press logic is handled in ReadKey loops.
+    #>
+    if ($Global:CtrlCArmed) { return }
+    $Global:CtrlCArmed = $true
+    [Console]::TreatControlCAsInput = $true
+}
+
+# ============================================================================
 # MAIN LOOP
 # ============================================================================
 
@@ -4952,16 +8281,75 @@ function Initialize-Screen {
     Set-Pos $Global:RowHeader 0
     Show-Header
 
-    # Draw dashboard starting at row 4 (original layout unchanged)
-    Draw-Dashboard
+    # v15.5: Conditional rendering - History Mode vs Dashboard
+    if ($Global:HistoryMode) {
+        Draw-HistoryScreen
+    }
+    else {
+        # Draw dashboard starting at row 4 (original layout unchanged)
+        Draw-Dashboard
+    }
 }
 
 # Initial setup
 Initialize-Screen
 
+# v15.2: Start auto-ingest file watcher
+Initialize-AutoIngestWatcher
+
+# v15.4: Enable Ctrl-C handling
+Initialize-CtrlCHandler
+
 # Main loop
 while ($true) {
     $userInput = Read-StableInput
+
+    # v15.5: Handle History Mode toggle (F2)
+    if ($userInput -eq "__TOGGLE_HISTORY__") {
+        $Global:HistoryMode = -not $Global:HistoryMode
+        if ($Global:HistoryMode) {
+            # Entering history mode - reset state
+            $Global:HistorySelectedRow = 0
+            $Global:HistoryScrollOffset = 0
+            $Global:HistoryDetailsVisible = $false
+            $Global:HistoryData = @(Get-HistoryData)
+        }
+        Initialize-Screen
+        continue
+    }
+
+    # v15.5: Handle History Mode refresh (navigation keys)
+    if ($userInput -eq "__REFRESH_HISTORY__") {
+        if ($Global:HistoryMode) {
+            Draw-HistoryScreen
+        }
+        continue
+    }
+
+    # v15.5: Handle History Mode hotkeys (silent actions + redraw)
+    if ($userInput -in @("__HISTORY_HOTKEY_D__", "__HISTORY_HOTKEY_I__", "__HISTORY_HOTKEY_S__", "__HISTORY_HOTKEY_V__")) {
+        if ($Global:HistoryMode) {
+            $key = switch ($userInput) {
+                "__HISTORY_HOTKEY_D__" { "D" }
+                "__HISTORY_HOTKEY_I__" { "I" }
+                "__HISTORY_HOTKEY_S__" { "S" }
+                "__HISTORY_HOTKEY_V__" { "V" }
+                default { "" }
+            }
+
+            if ($key) {
+                Invoke-HistoryHotkey -Key $key
+                Initialize-Screen
+            }
+        }
+        continue
+    }
+
+    # v15.2: Check for pending auto-ingest (debounced, on next interaction)
+    $ingestRan = Invoke-AutoIngestIfPending
+    if ($ingestRan) {
+        Initialize-Screen  # Refresh dashboard after ingest
+    }
 
     # Output appears at row 16 (just before input)
     Set-Pos ($Global:RowInput - 1) 0
