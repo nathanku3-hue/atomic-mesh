@@ -8,6 +8,23 @@
 4.  **Build:** `/run` (Execute worker loop.)
 5.  **Release:** `/ship` (Health + Drift + CI preflight -> Human sign-off.)
 
+**Auto-Flight Note (v15.0):**
+After `/refresh-plan`, `docs/ACTIVE_SPEC.md` is automatically regenerated from `PRD.md` + `SPEC.md`.
+Workers follow ACTIVE_SPEC first (execution snapshot). Planners follow SPEC first (governance).
+
+**INBOX (v15.1):**
+`docs/INBOX.md` is an ephemeral scratchpad for capturing clarifications and notes on-the-fly.
+- **Usage**: Write notes directly in INBOX.md → run `/ingest` → notes are merged and INBOX is cleared.
+- **Dashboard**: Shows `INBOX: ✓ empty` or `INBOX: ✎ pending (N)` indicator.
+- **Warning**: INBOX does NOT affect the readiness gate. It's a scratchpad only, not a golden doc.
+
+**Auto-Ingest (v15.2):**
+Auto-ingest watches for doc saves and runs `/ingest` automatically (debounced).
+- **Trigger**: On next terminal interaction after a doc save (v1 behavior).
+- **Watched files**: `PRD.md`, `SPEC.md`, `DECISION_LOG.md`, `ACTIVE_SPEC.md`, `INBOX.md`
+- **Dashboard**: Shows `Auto-ingest: armed | pending | OK (time) | ERROR`
+- **Disable**: Set environment variable `MESH_AUTO_INGEST=0` before running the panel.
+
 **Emergency Recovery**
 1.  List Backups: `/snapshots`
 2.  Stage Restore: `/restore <snapshot_name>.zip`
@@ -15,7 +32,7 @@
 
 ---
 
-**Version:** v13.0.0 | **Last Updated:** 2025-12-09
+**Version:** v14.1.0 | **Last Updated:** 2025-12-13
 **Role:** Operator Guide | **Scope:** Production & Maintenance
 
 ---
@@ -60,6 +77,19 @@ Before submitting work for review, verify:
 - Returns the task to the Planner with status `blocked`
 - Creates a **mandatory** audit entry in `DECISION_LOG.md`
 - Signals spec quality issues for later analysis
+
+### v14.1: Pre-Review Checklist (Captain/Reviewer)
+
+Before approving MEDIUM/HIGH risk tasks, verify:
+
+- [ ] **DONE-DONE PACKET** present in task/review notes
+- [ ] **Verify score** meets threshold:
+  - MEDIUM risk: ≥ 90/100, OR `CAPTAIN_OVERRIDE: CONFIDENCE` present
+  - HIGH risk: ≥ 95/100, OR `CAPTAIN_OVERRIDE: CONFIDENCE` present
+- [ ] **Entropy proof** present (`Entropy Check: Passed`) OR waiver documented
+- [ ] **Tests** named and PASS
+
+**Note:** LOW risk tasks require only Tests + Entropy. Confidence verification is optional.
 
 ### Evening: Release (`/ship`)
 The `/ship` command is a **Fused Safety Interlock**. It runs:
@@ -208,3 +238,35 @@ The `/ship` command is a **Fused Safety Interlock**. It runs:
 ### Compliance Note
 
 **Static Safety Check:** Test fixtures or scripts that require literal status fields (e.g., `{"status": "REVIEWING"}`) must annotate the line with `# SAFETY-ALLOW: status-write` to pass the Static Safety Check. Treat linter failures as P0 incidents.
+
+---
+
+## Librarian v15.0: Snippet Search & Duplicate Detection
+
+**Purpose**: Clipboard manager for common code patterns. Advisory only - no auto-insert.
+
+### Usage
+
+**Search snippets by keyword or tag:**
+```python
+# Via MCP tool (if using programmatically)
+snippet_search(query="retry", lang="python")
+snippet_search(query="", tags="http,resilience", lang="any")
+```
+
+**Check for duplicates before writing new helpers:**
+```python
+# Via MCP tool (if using programmatically)
+snippet_duplicate_check(file_path="src/new_helper.py", lang="auto")
+```
+
+**Important**: Both tools are **advisory only**. They never:
+- Block builds or CI
+- Auto-insert code
+- Modify files
+
+Warnings from `snippet_duplicate_check` suggest you may want to reuse an existing snippet from `library/snippets/` instead of writing a new one.
+
+**Snippet location**: `library/snippets/{python,powershell,markdown}/`
+
+**Decision**: See `docs/DECISIONS/ENG-LIBRARIAN-SNIPPETS-001.md`

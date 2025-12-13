@@ -567,6 +567,8 @@ def update_task_state(task_id: int, new_status: str, *, via_gavel: bool = False)
 
 # Setup logging for server (Issue #1, #8)
 import logging
+from tools.readiness import get_context_readiness as _get_readiness_impl
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 server_logger = logging.getLogger("MeshServer")
 
@@ -986,6 +988,336 @@ def get_cached_plan_preview() -> str:
         })
 
 
+# ============================================================================
+# AUTO-FLIGHT: ACTIVE_SPEC HYDRATION (v15.0)
+# ============================================================================
+
+def write_active_spec_snapshot(base_dir: str = None) -> dict:
+    """
+    Deterministically hydrates docs/ACTIVE_SPEC.md from PRD.md + SPEC.md.
+    Called after plan generation. Fail-open: errors logged but don't block.
+
+    Args:
+        base_dir: Project root directory. Defaults to BASE_DIR.
+
+    Returns:
+        dict: {"ok": bool, "path": str, "reason": str}
+    """
+    import re
+    from datetime import datetime
+
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    docs_dir = os.path.join(base_dir, "docs")
+    prd_path = os.path.join(docs_dir, "PRD.md")
+    spec_path = os.path.join(docs_dir, "SPEC.md")
+    active_spec_path = os.path.join(docs_dir, "ACTIVE_SPEC.md")
+    decision_log_path = os.path.join(docs_dir, "DECISION_LOG.md")
+
+    # Helper: extract bullet lines from a section
+    def extract_bullets(content: str, section_pattern: str, max_items: int = 10) -> list:
+        """Extract bullet/checkbox lines from a markdown section."""
+        # Find section
+        match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            return []
+
+        start = match.end()
+        # Find next ## header or end of file
+        next_section = re.search(r'^##\s', content[start:], re.MULTILINE)
+        end = start + next_section.start() if next_section else len(content)
+        section_text = content[start:end]
+
+        # Extract bullet lines (-, *, - [ ], - [x], 1., etc.)
+        bullets = []
+        for line in section_text.split('\n'):
+            line = line.strip()
+            # Match bullet patterns
+            if re.match(r'^[-*]\s+\[[ xX]\]\s+', line):  # Checkbox
+                # Remove checkbox prefix, keep content
+                text = re.sub(r'^[-*]\s+\[[ xX]\]\s+', '', line).strip()
+                if text and not text.startswith('{{'):
+                    bullets.append(text)
+            elif re.match(r'^[-*]\s+', line):  # Regular bullet
+                text = re.sub(r'^[-*]\s+', '', line).strip()
+                if text and not text.startswith('{{'):
+                    bullets.append(text)
+            elif re.match(r'^\d+\.\s+', line):  # Numbered list
+                text = re.sub(r'^\d+\.\s+', '', line).strip()
+                if text and not text.startswith('{{'):
+                    bullets.append(text)
+
+            if len(bullets) >= max_items:
+                break
+
+        return bullets
+
+    # Helper: extract constraint value
+    def extract_constraint(content: str, pattern: str) -> str:
+        """Extract a constraint value like 'Database: PostgreSQL'."""
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return "—"
+
+    # Helper: extract table rows
+    def extract_table_targets(content: str, section_pattern: str) -> dict:
+        """Extract NFR targets from a markdown table."""
+        targets = {"latency": "—", "uptime": "—", "coverage": "—"}
+        match = re.search(section_pattern, content, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            return targets
+
+        start = match.end()
+        next_section = re.search(r'^##\s', content[start:], re.MULTILINE)
+        end = start + next_section.start() if next_section else len(content)
+        section_text = content[start:end]
+
+        # Parse table rows
+        for line in section_text.split('\n'):
+            line_lower = line.lower()
+            if 'latency' in line_lower or 'response' in line_lower:
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if len(parts) >= 2:
+                    targets["latency"] = parts[1] if len(parts) > 1 else "—"
+            elif 'uptime' in line_lower or 'reliability' in line_lower:
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if len(parts) >= 2:
+                    targets["uptime"] = parts[1] if len(parts) > 1 else "—"
+            elif 'coverage' in line_lower or 'test' in line_lower:
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if len(parts) >= 2:
+                    targets["coverage"] = parts[1] if len(parts) > 1 else "—"
+
+        return targets
+
+    try:
+        project_name = os.path.basename(base_dir)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Initialize extracted data
+        goals = []
+        stories = []
+        out_of_scope = []
+        nfr = {"latency": "—", "uptime": "—", "coverage": "—"}
+        constraints = {"db": "—", "auth": "—", "api": "—", "runtime": "—"}
+        endpoints = []
+        entities = []
+        core_objective = "—"
+        sources_used = []
+        hydration_notes = []
+
+        # ─────────────────────────────────────────────────────────────────────
+        # READ PRD.md
+        # ─────────────────────────────────────────────────────────────────────
+        if os.path.exists(prd_path):
+            sources_used.append("PRD.md")
+            with open(prd_path, 'r', encoding='utf-8') as f:
+                prd_content = f.read()
+
+            # Extract Core Objective (One-liner section or first goal)
+            one_liner = extract_bullets(prd_content, r'^##\s*One-liner', 1)
+            if one_liner:
+                core_objective = one_liner[0]
+
+            # Extract Goals
+            goals = extract_bullets(prd_content, r'^##\s*Goals', 5)
+            if not goals:
+                hydration_notes.append("No goals found in PRD")
+
+            # Extract User Stories
+            stories = extract_bullets(prd_content, r'^##\s*User Stories', 5)
+            if not stories:
+                hydration_notes.append("No user stories found in PRD")
+
+            # Extract Out of Scope
+            out_of_scope = extract_bullets(prd_content, r'^##\s*Out of Scope', 5)
+
+            # Extract NFR from Success Metrics or Constraints
+            nfr_from_prd = extract_table_targets(prd_content, r'^##\s*(Success Metrics|Non-Functional|Constraints)')
+            for k, v in nfr_from_prd.items():
+                if v != "—":
+                    nfr[k] = v
+        else:
+            hydration_notes.append("PRD.md not found")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # READ SPEC.md (fallback to existing ACTIVE_SPEC.md)
+        # ─────────────────────────────────────────────────────────────────────
+        spec_content = None
+        if os.path.exists(spec_path):
+            sources_used.append("SPEC.md")
+            with open(spec_path, 'r', encoding='utf-8') as f:
+                spec_content = f.read()
+        elif os.path.exists(active_spec_path):
+            sources_used.append("ACTIVE_SPEC.md (fallback)")
+            with open(active_spec_path, 'r', encoding='utf-8') as f:
+                spec_content = f.read()
+
+        if spec_content:
+            # Extract API endpoints
+            api_bullets = extract_bullets(spec_content, r'^##\s*(API|Endpoints|Interfaces)', 5)
+            endpoints = [b for b in api_bullets if '/' in b or 'GET' in b.upper() or 'POST' in b.upper()]
+            if not endpoints:
+                # Try to find endpoint patterns in the whole doc
+                endpoint_patterns = re.findall(r'`?(GET|POST|PUT|DELETE|PATCH)\s+/[^\s`]+`?', spec_content, re.IGNORECASE)
+                endpoints = [f"{m[0]} {m[1]}" if isinstance(m, tuple) else m for m in endpoint_patterns[:5]]
+
+            # Extract Data Model entities
+            entities = extract_bullets(spec_content, r'^##\s*(Data Model|Entities|Schema)', 5)
+
+            # Extract Technical Constraints
+            constraints["db"] = extract_constraint(spec_content, r'(?:Database|Data\s*store)[:\s]+([^\n|]+)')
+            constraints["auth"] = extract_constraint(spec_content, r'(?:Auth|Authentication)[:\s]+([^\n|]+)')
+            constraints["api"] = extract_constraint(spec_content, r'(?:API\s*Style|API)[:\s]+([^\n|]+)')
+            constraints["runtime"] = extract_constraint(spec_content, r'(?:Runtime|Platform|Deployment)[:\s]+([^\n|]+)')
+
+            # Extract NFR from SPEC if not found in PRD
+            nfr_from_spec = extract_table_targets(spec_content, r'^##\s*(Non-Functional|Requirements|Constraints)')
+            for k, v in nfr_from_spec.items():
+                if nfr[k] == "—" and v != "—":
+                    nfr[k] = v
+        else:
+            hydration_notes.append("SPEC.md not found")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # READ DECISION_LOG.md (optional)
+        # ─────────────────────────────────────────────────────────────────────
+        if os.path.exists(decision_log_path):
+            sources_used.append("DECISION_LOG.md")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # BUILD ACTIVE_SPEC.md
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Format lists
+        def format_bullets(items: list, prefix: str = "- [ ] ") -> str:
+            if not items:
+                return f"{prefix}(none extracted)"
+            return "\n".join(f"{prefix}{item}" for item in items)
+
+        def format_simple_bullets(items: list, prefix: str = "- ") -> str:
+            if not items:
+                return f"{prefix}(none extracted)"
+            return "\n".join(f"{prefix}{item}" for item in items)
+
+        # Build the document
+        active_spec_content = f"""# ACTIVE SPECIFICATION: {project_name}
+
+> **Purpose:** Execution snapshot for the current batch.
+> **Derived from:** {', '.join(sources_used) if sources_used else 'No sources found'}.
+> **Rule:** Workers follow ACTIVE_SPEC first. Planners follow SPEC first.
+> **Updated:** {date_str}
+{f"> **Note:** {'; '.join(hydration_notes)}" if hydration_notes else ""}
+
+---
+
+## Current Batch Focus
+- Mode: DELIVERY | HARDENING | REFACTOR
+- Priority order: correctness > speed > elegance
+- Non-negotiables:
+  - Tests required (scaffold-first where applicable)
+  - No silent scope creep (update PRD/SPEC + log decision)
+  - Keep CLI stable (no breaking commands without explicit decision)
+
+---
+
+## Core Objective
+<!-- One sentence that describes product value in plain language -->
+- Objective: {core_objective}
+
+---
+
+## In Scope
+### Goals (from PRD)
+<!-- Hydrated list -->
+{format_bullets(goals)}
+
+### User Stories (from PRD)
+<!-- Hydrated list -->
+{format_bullets(stories)}
+
+---
+
+## Non-Functional Requirements
+<!-- Hydrated summary from PRD/SPEC -->
+| Requirement | Target | Notes |
+|---|---:|---|
+| Response Time | {nfr['latency']} | P95 |
+| Uptime | {nfr['uptime']} | Production |
+| Test Coverage | {nfr['coverage']} | Unit + Integration |
+
+---
+
+## Technical Constraints (from SPEC)
+- Database: {constraints['db']}
+- Auth: {constraints['auth']}
+- API Style: {constraints['api']}
+- Deployment/Runtime: {constraints['runtime']}
+
+---
+
+## Interfaces (from SPEC)
+### API Endpoints (if provided)
+{format_simple_bullets(endpoints) if endpoints else "- (none extracted)"}
+
+### Data Model (if provided)
+- Entities:
+{format_simple_bullets(entities, prefix="  - ") if entities else "  - (none extracted)"}
+- Relationships:
+  - (see SPEC.md for details)
+
+---
+
+## Out of Scope (from PRD)
+{format_simple_bullets(out_of_scope) if out_of_scope else "- (none specified)"}
+
+---
+
+## Acceptance Criteria (Execution Gate)
+A task is "reviewable" when:
+1. ✅ Tests exist + pass
+2. ✅ Spec alignment checked (ACTIVE_SPEC)
+3. ✅ `/simplify <task-id>` run OR waiver logged
+4. ✅ No critical security issues introduced
+5. ✅ Changes respect TECH_STACK / constraints
+
+---
+
+## Provenance
+- Source: docs/PRD.md {'✓' if 'PRD.md' in sources_used else '✗ (missing)'}
+- Source: docs/SPEC.md {'✓' if 'SPEC.md' in sources_used else '✗ (missing)'}
+- Source: docs/DECISION_LOG.md {'✓' if 'DECISION_LOG.md' in sources_used else '(optional)'}
+- Hydration: deterministic (regex/structure), no LLM required
+- Generated: {date_str}
+
+*Auto-generated by write_active_spec_snapshot() v15.0*
+"""
+
+        # Write the file
+        os.makedirs(docs_dir, exist_ok=True)
+        with open(active_spec_path, 'w', encoding='utf-8') as f:
+            f.write(active_spec_content)
+
+        return {
+            "ok": True,
+            "path": active_spec_path,
+            "reason": f"Hydrated from {', '.join(sources_used)}" if sources_used else "Created with placeholders",
+            "goals_count": len(goals),
+            "stories_count": len(stories),
+            "endpoints_count": len(endpoints)
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "path": active_spec_path,
+            "reason": f"Hydration failed: {str(e)}"
+        }
+
+
+
 @mcp.tool()
 def refresh_plan_preview() -> str:
     """
@@ -1053,7 +1385,16 @@ def refresh_plan_preview() -> str:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(plan, f, indent=2)
-        
+
+        # v15.0: Auto-hydrate ACTIVE_SPEC.md from PRD + SPEC (fail-open)
+        hydration_result = write_active_spec_snapshot(base_dir=BASE_DIR)
+        if hydration_result.get("ok"):
+            plan["active_spec_updated"] = hydration_result.get("path")
+            plan["hydration_note"] = f"ACTIVE_SPEC updated: {hydration_result.get('reason')}"
+        else:
+            # Log warning but don't block
+            plan["hydration_warning"] = hydration_result.get("reason", "Unknown error")
+
         return json.dumps(plan)
     except Exception as e:
         return json.dumps({
@@ -1922,8 +2263,11 @@ def get_release_readiness() -> str:
 @mcp.tool()
 def get_context_readiness() -> str:
     """
-    v13.6: Analyzes Golden Docs (PRD, SPEC, DECISIONS) for completeness.
+    v14.1: Analyzes Golden Docs (PRD, SPEC, DECISIONS) for completeness.
     Fast heuristic (<10ms) for dashboard refresh cycles.
+
+    Now includes template stub detection to prevent /init templates
+    from incorrectly triggering EXECUTION mode.
 
     Scoring Logic (per file):
     - Base: 0%
@@ -1932,121 +2276,21 @@ def get_context_readiness() -> str:
     - Each required header found: +10% (max 50%)
     - >5 bullet points: +20%
 
+    Template Stub Detection:
+    - If file contains ATOMIC_MESH_TEMPLATE_STUB marker:
+      - Stub without real content: capped at 40%
+      - Stub with ≥6 meaningful lines: full scoring enabled
+
     Thresholds: PRD ≥80%, SPEC ≥80%, DECISIONS ≥30%
 
     Returns:
         JSON with status (BOOTSTRAP|EXECUTION), file scores, and missing elements
     """
-    # File definitions
-    files_to_check = {
-        "PRD": {
-            "path": os.path.join(DOCS_DIR, "PRD.md"),
-            "threshold": 80,
-            "required_headers": ["## Goals", "## User Stories", "## Success Metrics"]
-        },
-        "SPEC": {
-            "path": os.path.join(DOCS_DIR, "SPEC.md"),
-            "alt_path": os.path.join(DOCS_DIR, "ACTIVE_SPEC.md"),
-            "threshold": 80,
-            "required_headers": ["## Data Model", "## API", "## Security"]
-        },
-        "DECISION_LOG": {
-            "path": os.path.join(DOCS_DIR, "DECISION_LOG.md"),
-            "threshold": 30,
-            "required_headers": ["## Records"]
-        }
-    }
-
-    results = {}
-
-    for doc_name, config in files_to_check.items():
-        # Check if file exists (try alt_path for SPEC)
-        file_path = config["path"]
-        if not os.path.exists(file_path) and "alt_path" in config:
-            file_path = config["alt_path"]
-
-        score = 0
-        exists = os.path.exists(file_path)
-        length = 0
-        headers_found = 0
-        bullets_found = 0
-        missing_headers = []
-
-        if not exists:
-            # Base case: file doesn't exist
-            results[doc_name] = {
-                "score": 0,
-                "exists": False,
-                "length": 0,
-                "headers": 0,
-                "bullets": 0,
-                "missing": config["required_headers"]
-            }
-            continue
-
-        # File exists: +10%
-        score += 10
-
-        # Read and analyze content
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Word count (rough estimate: split by whitespace)
-            words = len(content.split())
-            length = words
-
-            # Length check: +20% if >150 words
-            if words > 150:
-                score += 20
-
-            # Header check: +10% per required header (max 50%)
-            for header in config["required_headers"]:
-                if re.search(re.escape(header), content, re.IGNORECASE | re.MULTILINE):
-                    headers_found += 1
-                    score += 10
-                else:
-                    missing_headers.append(header)
-
-            # Bullet check: +20% if >5 bullet points
-            # Match lines starting with "- ", "* ", "1. ", or "- [ ]" (checkboxes)
-            bullet_lines = re.findall(r'^[\s]*(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?', content, re.MULTILINE)
-            bullets_found = len(bullet_lines)
-            if bullets_found > 5:
-                score += 20
-
-        except Exception as e:
-            # File read error - treat as empty
-            server_logger.error(f"Error reading {file_path}: {e}")
-            score = 10  # Still gets "exists" credit
-
-        results[doc_name] = {
-            "score": min(score, 100),  # Cap at 100%
-            "exists": True,
-            "length": length,
-            "headers": headers_found,
-            "bullets": bullets_found,
-            "missing": missing_headers
-        }
-
-    # Determine overall status
-    thresholds = {name: config["threshold"] for name, config in files_to_check.items()}
-    blocking_files = [
-        name for name, data in results.items()
-        if data["score"] < thresholds[name]
-    ]
-
-    status = "EXECUTION" if len(blocking_files) == 0 else "BOOTSTRAP"
-
-    return json.dumps({
-        "status": status,
-        "files": results,
-        "thresholds": thresholds,
-        "overall": {
-            "ready": status == "EXECUTION",
-            "blocking_files": blocking_files
-        }
-    }, indent=2)
+    # Delegate to tools/readiness.py implementation (v14.1 with stub detection)
+    # Pass base_dir to ensure it uses the correct project root
+    base_dir = os.path.dirname(DOCS_DIR)
+    result = _get_readiness_impl(base_dir=base_dir)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -4940,44 +5184,72 @@ def get_tech_stack() -> str:
         return json.dumps({"error": str(e)})
 
 @mcp.tool()
-def append_decision(decision: str, context: str) -> str:
+def append_decision(
+    decision: str,
+    context: str,
+    decision_type: str = "SCOPE",
+    scope: str = "—",
+    task: str = "—"
+) -> str:
     """
     Logs a major decision to docs/DECISION_LOG.md.
     Called by Router/Commander when significant choices are made.
     Prevents re-litigation of past decisions.
-    
+
     Args:
         decision: What was decided (e.g., "Use FastAPI for backend")
         context: Why it was decided (e.g., "Team familiar with Python async")
-    
+        decision_type: Type of decision (INIT, SCOPE, ARCH, API, DATA, SECURITY, UX, PERF, OPS, TEST, RELEASE)
+        scope: Affected scope (repo, module name, file path, etc.)
+        task: Related task ID or "—" if none
+
     Returns:
         Confirmation of logged decision with ID.
     """
     log_path = os.path.join(DOCS_DIR, "DECISION_LOG.md")
-    
+
     if not os.path.exists(log_path):
         return json.dumps({
             "error": "DECISION_LOG.md not found",
             "hint": "Run /init to bootstrap seed documents"
         })
-    
+
     try:
         decision_id = int(time.time())
         date_str = datetime.now().strftime("%Y-%m-%d")
-        
-        # Escape pipe characters in decision/context
+
+        # Escape pipe characters
         decision_clean = decision.replace("|", "\\|")
         context_clean = context.replace("|", "\\|")
-        
-        entry = f"| {decision_id} | {date_str} | {decision_clean} | {context_clean} | ✅ |\n"
-        
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(entry)
-        
+        type_clean = decision_type.replace("|", "\\|").upper()
+        scope_clean = scope.replace("|", "\\|") if scope else "—"
+        task_clean = task.replace("|", "\\|") if task else "—"
+
+        # New 8-column format: ID | Date | Type | Decision | Rationale | Scope | Task | Status
+        entry = f"| {decision_id} | {date_str} | {type_clean} | {decision_clean} | {context_clean} | {scope_clean} | {task_clean} | ✅ |\n"
+
+        # Read file and find anchor
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        anchor = "<!-- ATOMIC_MESH_APPEND_DECISIONS_BELOW -->"
+        if anchor in content:
+            # Insert after anchor
+            content = content.replace(anchor, anchor + "\n" + entry)
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        else:
+            # Fallback: append to end (legacy files)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(entry)
+
         return json.dumps({
             "logged": True,
             "id": decision_id,
             "decision": decision,
+            "type": type_clean,
+            "scope": scope_clean,
+            "task": task_clean,
             "date": date_str
         })
     except Exception as e:
@@ -6778,7 +7050,7 @@ def submit_review_decision(task_id: int, decision: str, notes: str, actor: str) 
     # 1. Load task
     with get_db() as conn:
         task = conn.execute(
-            "SELECT id, desc, status, source_ids FROM tasks WHERE id = ?",
+            "SELECT id, desc, status, source_ids, risk FROM tasks WHERE id = ?",
             (task_id,)
         ).fetchone()
 
@@ -6823,6 +7095,51 @@ def submit_review_decision(task_id: int, decision: str, notes: str, actor: str) 
                     f.write(f"{datetime.now().isoformat()} | ENTROPY_OVERRIDE | Task {task_id} | Actor: {actor} | CAPTAIN overrode entropy gate\n")
             except Exception:
                 pass  # Silent fail on logging
+
+    # v14.1: CONFIDENCE GATE - Enforce verify score for MEDIUM/HIGH risk before approval
+    if decision == "APPROVE":
+        task_risk = (task["risk"] or "LOW").upper()
+        notes_lower = notes.lower()
+
+        # Only enforce for MEDIUM/HIGH risk
+        if task_risk in ("MEDIUM", "MED", "HIGH"):
+            # Check for captain override first
+            has_confidence_override = "captain_override:" in notes_lower and "confidence" in notes_lower
+
+            if not has_confidence_override:
+                # Parse verify score from notes using pattern: Verify: XX/100
+                verify_match = re.search(r'verify:\s*(\d{1,3})/100', notes_lower)
+                verify_score = int(verify_match.group(1)) if verify_match else None
+
+                # Determine required threshold
+                required_threshold = 95 if task_risk == "HIGH" else 90
+
+                if verify_score is None:
+                    return json.dumps({
+                        "status": "BLOCKED",  # SAFETY-ALLOW: status-write
+                        "reason": "MISSING_CONFIDENCE_PROOF",
+                        "message": f"Approval blocked for {task_risk} risk task - missing 'Verify: XX/100' score in notes",
+                        "hint": f"Run /verify {task_id} first, or add 'CAPTAIN_OVERRIDE: CONFIDENCE' to notes"
+                    })
+
+                if verify_score < required_threshold:
+                    return json.dumps({
+                        "status": "BLOCKED",  # SAFETY-ALLOW: status-write
+                        "reason": "INSUFFICIENT_CONFIDENCE",
+                        "message": f"Approval blocked for {task_risk} risk task - Verify score {verify_score}/100 below threshold {required_threshold}",
+                        "hint": f"Fix issues and re-run /verify {task_id}, or add 'CAPTAIN_OVERRIDE: CONFIDENCE' to notes"
+                    })
+            else:
+                # Log captain confidence override
+                server_logger.warning(f"v14.1: CAPTAIN_OVERRIDE: CONFIDENCE used for task {task_id} by {actor}")
+                try:
+                    log_dir = os.path.join(BASE_DIR, "logs")
+                    os.makedirs(log_dir, exist_ok=True)
+                    log_path = os.path.join(log_dir, "decisions.log")
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"{datetime.now().isoformat()} | CONFIDENCE_OVERRIDE | Task {task_id} | Actor: {actor} | Risk: {task_risk} | CAPTAIN overrode confidence gate\n")
+                except Exception:
+                    pass  # Silent fail on logging
 
     # v10.12.2: Safety Lock - Re-Run Gatekeeper on APPROVE (Prevent drift)
     if decision == "APPROVE":
@@ -10564,29 +10881,123 @@ def system_doctor() -> str:
 # v9.1 AIR GAP INGESTION
 # =============================================================================
 
+# v15.1: INBOX stub template content (for clearing after ingest)
+INBOX_STUB_TEMPLATE = """<!-- ATOMIC_MESH_TEMPLATE_STUB -->
+# INBOX (Temporary)
+
+Drop clarifications, new decisions, and notes here.
+Next: run `/ingest` to merge into PRD/SPEC/DECISION_LOG, then this file will be cleared.
+
+## Entries
+-
+"""
+
+
+def get_inbox_meaningful_lines(base_dir: str = None) -> tuple:
+    """
+    v15.1: Extract meaningful lines from docs/INBOX.md.
+
+    Args:
+        base_dir: Base directory (defaults to BASE_DIR)
+
+    Returns:
+        Tuple of (lines: list, count: int, path: str)
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    inbox_path = os.path.join(base_dir, "docs", "INBOX.md")
+
+    if not os.path.exists(inbox_path):
+        return ([], 0, inbox_path)
+
+    try:
+        with open(inbox_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        return ([], 0, inbox_path)
+
+    meaningful = []
+    for line in content.split('\n'):
+        trimmed = line.strip()
+        # Skip: blank, stub marker, headings, placeholder dash, short lines
+        if not trimmed:
+            continue
+        if 'ATOMIC_MESH_TEMPLATE_STUB' in trimmed:
+            continue
+        if trimmed.startswith('#'):
+            continue
+        if trimmed == '-':
+            continue
+        if len(trimmed) < 3:
+            continue
+        # v15.1: Skip template instruction lines
+        if trimmed.startswith('Drop clarifications'):
+            continue
+        if trimmed.startswith('Next: run'):
+            continue
+        meaningful.append(line)  # Keep original formatting
+
+    return (meaningful, len(meaningful), inbox_path)
+
+
+def clear_inbox_to_stub(inbox_path: str) -> bool:
+    """
+    v15.1: Clear INBOX.md back to stub template after successful ingest.
+
+    Args:
+        inbox_path: Path to INBOX.md file
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        with open(inbox_path, 'w', encoding='utf-8') as f:
+            f.write(INBOX_STUB_TEMPLATE)
+        return True
+    except Exception:
+        return False
+
+
 @mcp.tool()
 def trigger_ingestion() -> str:
     """
     v9.1 Air Gap: Triggers the Product Owner to read docs/inbox and compile specs.
-    
+    v15.1: Also reads docs/INBOX.md and clears it on success.
+
     Workflow:
     1. Scans docs/inbox/ for raw PRDs, notes, PDFs
-    2. Checks against docs/DOMAIN_RULES.md
-    3. Compiles strict constraints into docs/ACTIVE_SPEC.md
-    4. Archives processed files to docs/archive/
-    
+    2. Reads docs/INBOX.md for ephemeral notes (v15.1)
+    3. Checks against docs/DOMAIN_RULES.md
+    4. Compiles strict constraints into docs/ACTIVE_SPEC.md
+    5. Archives processed files to docs/archive/
+    6. Clears docs/INBOX.md on success (v15.1)
+
     Returns:
         Status message with ingestion results
     """
     import asyncio
     from product_owner import ingest_inbox
-    
+
+    # v15.1: Read INBOX.md meaningful lines
+    inbox_lines, inbox_count, inbox_path = get_inbox_meaningful_lines()
+    inbox_content = ""
+    if inbox_count > 0:
+        inbox_content = "## INBOX (captured notes)\n" + "\n".join(inbox_lines) + "\n\n"
+
     try:
         # Run the async function synchronously
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(ingest_inbox(llm_client=None))
+        # v15.1: Pass INBOX content as additional context
+        result = loop.run_until_complete(ingest_inbox(llm_client=None, inbox_content=inbox_content))
         loop.close()
+
+        # v15.1: Clear INBOX on success (only if we had content)
+        if inbox_count > 0 and "❌" not in result:
+            if clear_inbox_to_stub(inbox_path):
+                result = result.rstrip() + f"\n✓ INBOX cleared ({inbox_count} notes merged)"
+
         return result
     except Exception as e:
         return f"❌ Ingestion failed: {str(e)}"
@@ -11020,6 +11431,241 @@ def kickback_task(task_id: str, reason: str) -> str:
         "decision_logged": log_success,
         "suggested_action": "Review spec and resubmit with /add or /clarify"
     })
+
+
+# === Librarian v15.0: Snippets (read-only) ===
+
+@mcp.tool()
+def snippet_search(query: str, lang: str = "any", tags: str = "", root_dir: str = "") -> str:
+    """
+    Read-only snippet search by keywords/tags.
+    No embeddings - uses simple substring matching.
+
+    Args:
+        query: Search term (matches filename, SNIPPET, INTENT lines)
+        lang: Filter by language (python, powershell, markdown, or "any")
+        tags: Comma-separated tags to match
+        root_dir: Root directory (for tests). If empty, uses current directory.
+
+    Returns:
+        JSON string with status and results
+    """
+    import json
+    from pathlib import Path
+
+    # If query is empty, require tags (prevent "return everything")
+    query_lower = query.lower() if query else ""
+    tag_set = set(t.strip().lower() for t in tags.split(",") if t.strip())
+
+    if not query_lower and not tag_set:
+        return json.dumps({"status": "OK", "results": [], "message": "Provide query or tags"})
+
+    # Use root_dir if provided (for tests), else current directory
+    base_path = Path(root_dir) if root_dir else Path(".")
+    snippets_dir = base_path / "library" / "snippets"
+    if not snippets_dir.exists():
+        return json.dumps({"status": "OK", "results": []})
+
+    results = []
+
+    # Search through snippet files
+    for lang_dir in snippets_dir.iterdir():
+        if not lang_dir.is_dir():
+            continue
+        if lang != "any" and lang_dir.name != lang:
+            continue
+
+        for snippet_file in lang_dir.glob("*"):
+            if not snippet_file.is_file():
+                continue
+
+            try:
+                with open(snippet_file, "r", encoding="utf-8") as f:
+                    header_lines = [f.readline() for _ in range(10)]
+
+                # Parse metadata with explicit prefix handling
+                metadata = {}
+                for line in header_lines:
+                    clean_line = line
+                    if line.startswith("///"):
+                        clean_line = line[3:]
+                    elif line.startswith("#"):
+                        clean_line = line[1:]
+                    else:
+                        continue
+
+                    parts = clean_line.strip().split(":", 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip().upper()
+                        value = parts[1].strip()
+                        metadata[key] = value
+
+                # Match logic
+                snippet_id = metadata.get("SNIPPET", snippet_file.stem)
+                # Strip empty strings from tags
+                snippet_tags = set(t.strip().lower() for t in metadata.get("TAGS", "").split(",") if t.strip())
+                intent = metadata.get("INTENT", "").lower()
+
+                # Score matches: tags > query in name > query in intent
+                score = 0
+                if tag_set and tag_set.intersection(snippet_tags):
+                    score = 3
+                elif query_lower and query_lower in snippet_id.lower():
+                    score = 2
+                elif query_lower and query_lower in intent:
+                    score = 1
+                else:
+                    continue  # No match
+
+                results.append({
+                    "id": snippet_id,
+                    "lang": lang_dir.name,
+                    "path": str(snippet_file),
+                    "tags": list(snippet_tags),
+                    "intent": metadata.get("INTENT", ""),
+                    "score": score
+                })
+            except Exception:
+                continue
+
+    # Sort by score (desc) and limit to top 10
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:10]
+
+    # Remove score from output
+    for r in results:
+        del r["score"]
+
+    return json.dumps({"status": "OK", "results": results}, indent=2)
+
+
+@mcp.tool()
+def snippet_duplicate_check(file_path: str, lang: str = "auto", root_dir: str = "") -> str:
+    """
+    Advisory duplicate detection using cheap heuristics.
+    Warns if file contains helpers similar to existing snippets.
+    No embeddings - uses token-based fingerprinting.
+
+    Args:
+        file_path: Path to file to check
+        lang: Language hint (auto-detected from extension if "auto")
+        root_dir: Root directory (for tests). If empty, uses current directory.
+
+    Returns:
+        JSON string with status and warnings
+    """
+    import json
+    import re
+    from pathlib import Path
+    from difflib import SequenceMatcher
+
+    if not os.path.exists(file_path):
+        return json.dumps({"status": "ERROR", "message": f"File not found: {file_path}"})
+
+    # Auto-detect language
+    if lang == "auto":
+        ext = Path(file_path).suffix
+        lang_map = {".py": "python", ".ps1": "powershell", ".md": "markdown"}
+        lang = lang_map.get(ext, "unknown")
+
+    if lang == "unknown":
+        return json.dumps({"status": "OK", "warnings": [], "message": "Unsupported file type"})
+
+    # Use root_dir if provided (for tests), else current directory
+    base_path = Path(root_dir) if root_dir else Path(".")
+    snippets_dir = base_path / "library" / "snippets" / lang
+    if not snippets_dir.exists():
+        return json.dumps({"status": "OK", "warnings": []})
+
+    # Read and normalize target file
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            target_content = f.read()
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
+
+    target_normalized = _normalize_code(target_content, lang)
+
+    # Skip if too little content to compare (< 50 tokens)
+    MIN_TOKENS = 50
+    if len(target_normalized.split()) < MIN_TOKENS:
+        return json.dumps({"status": "OK", "warnings": [], "message": "File too small for comparison"})
+
+    warnings = []
+    # Threshold of 0.65 catches near-duplicates while allowing minor variations
+    THRESHOLD = 0.65
+
+    # Compare against each snippet
+    for snippet_file in snippets_dir.glob("*"):
+        if not snippet_file.is_file():
+            continue
+
+        try:
+            with open(snippet_file, "r", encoding="utf-8") as f:
+                snippet_content = f.read()
+
+            snippet_normalized = _normalize_code(snippet_content, lang)
+
+            # Compute similarity using SequenceMatcher
+            similarity = SequenceMatcher(None, target_normalized, snippet_normalized).ratio()
+
+            if similarity >= THRESHOLD:
+                # Extract snippet ID from metadata
+                snippet_id = snippet_file.stem
+                for line in snippet_content.split("\n")[:10]:
+                    if "SNIPPET:" in line:
+                        snippet_id = line.split("SNIPPET:")[1].strip()
+                        break
+
+                warnings.append({
+                    "snippet_id": snippet_id,
+                    "path": str(snippet_file),
+                    "similarity": round(similarity, 2),
+                    "reason": f"Similar structure and identifier overlap ({int(similarity*100)}% match)"
+                })
+        except Exception:
+            continue
+
+    # Sort by similarity (desc)
+    warnings.sort(key=lambda x: x["similarity"], reverse=True)
+
+    return json.dumps({"status": "OK", "warnings": warnings}, indent=2)
+
+
+def _normalize_code(content: str, lang: str) -> str:
+    """
+    Normalize code for comparison: lowercase, strip comments/whitespace.
+    Skips metadata headers to avoid false positives.
+    """
+    import re
+
+    content_lines = content.split("\n")
+
+    # Skip metadata headers (first ~12 lines containing SNIPPET:/LANG:/TAGS:/INTENT:/UPDATED:)
+    # Case-insensitive matching
+    metadata_keywords = ["SNIPPET:", "LANG:", "TAGS:", "INTENT:", "UPDATED:"]
+    start_idx = 0
+    for i, line in enumerate(content_lines[:12]):
+        if any(kw in line.upper() for kw in metadata_keywords):
+            start_idx = i + 1
+
+    # Process lines after headers
+    lines = []
+    for line in content_lines[start_idx:]:
+        # Strip comments (including markdown)
+        if lang == "python":
+            line = re.sub(r'#.*$', '', line)
+        elif lang == "powershell":
+            line = re.sub(r'#.*$', '', line)
+        elif lang == "markdown":
+            line = re.sub(r'<!--.*?-->', '', line)  # Remove HTML comments
+
+        # Keep only alphanumeric and underscores
+        tokens = re.findall(r'\w+', line.lower())
+        if tokens:
+            lines.append(" ".join(tokens))
+
+    return "\n".join(lines)
 
 
 def graceful_shutdown(signum, frame):

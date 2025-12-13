@@ -131,6 +131,7 @@ class TestConstitution(unittest.TestCase):
                 override_justification TEXT,
                 review_decision TEXT,
                 review_notes TEXT,
+                risk TEXT DEFAULT 'LOW',
                 updated_at INTEGER
             )
         """)
@@ -139,14 +140,15 @@ class TestConstitution(unittest.TestCase):
 
     def _insert_task(self, task_id: int, desc: str, source_ids: list,
                      archetype: str = "PLUMBING", status: str = "pending",
-                     justification: str = "", task_type: str = "backend"):
+                     justification: str = "", task_type: str = "backend",
+                     risk: str = "LOW"):
         """Insert a test task into the database."""
         db_path = os.path.join(self.tmp, "mesh.db")
         conn = sqlite3.connect(db_path)
         conn.execute("""
-            INSERT OR REPLACE INTO tasks (id, type, desc, source_ids, archetype, status, override_justification, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (task_id, task_type, desc, json.dumps(source_ids), archetype, status, justification, int(datetime.now().timestamp())))
+            INSERT OR REPLACE INTO tasks (id, type, desc, source_ids, archetype, status, override_justification, risk, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (task_id, task_type, desc, json.dumps(source_ids), archetype, status, justification, risk, int(datetime.now().timestamp())))
         conn.commit()
         conn.close()
 
@@ -253,7 +255,8 @@ class TestConstitution(unittest.TestCase):
             )
             self._create_review_packet(task_id)
 
-            result = self.mesh.submit_review_decision(task_id, "APPROVE", "test", actor=actor)
+            # v14.1: Include entropy proof for approval (existing gate)
+            result = self.mesh.submit_review_decision(task_id, "APPROVE", "Entropy Check: Passed. test", actor=actor)
             result_dict = json.loads(result)
 
             # Should not fail due to actor validation
@@ -278,8 +281,8 @@ class TestConstitution(unittest.TestCase):
         )
         self._create_review_packet(701)
 
-        # Approve task
-        result = self.mesh.submit_review_decision(701, "APPROVE", "Ledger test", actor="HUMAN")
+        # Approve task (v14.1: include entropy proof)
+        result = self.mesh.submit_review_decision(701, "APPROVE", "Entropy Check: Passed. Ledger test", actor="HUMAN")
 
         # Check ledger file was created using path helper
         ledger_path = self.mesh.get_state_path("release_ledger.jsonl")
@@ -306,8 +309,8 @@ class TestConstitution(unittest.TestCase):
         )
         self._create_review_packet(702)
 
-        # Submit as AUTO
-        self.mesh.submit_review_decision(702, "APPROVE", "Auto-approved", actor="AUTO")
+        # Submit as AUTO (v14.1: include entropy proof)
+        self.mesh.submit_review_decision(702, "APPROVE", "Entropy Check: Passed. Auto-approved", actor="AUTO")
 
         # Verify Ledger using path helper
         ledger_path = self.mesh.get_state_path("release_ledger.jsonl")

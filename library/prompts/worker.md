@@ -117,6 +117,45 @@ Archetypes: SEC, AUTH, CRYPTO, MIGRATION
 **If the spec is unclear or unworkable:**
 Use `/kickback <task-id> <reason>` to return the task to the Planner. This is a significant signal that triggers a mandatory audit log entry.
 
+### Step 7: Done-Done Closeout (Required for MEDIUM/HIGH Risk)
+
+**Before submitting for review, Worker MUST include a DONE-DONE PACKET in the task/review notes:**
+
+```
+DONE-DONE PACKET:
+- Tests: PASS (<list what was run>)
+- Entropy: Passed ✅ | OPTIMIZATION WAIVED: <reason>
+- Verify: <score>/100 (required for MEDIUM/HIGH)
+- Risk: LOW | MEDIUM | HIGH
+- Diff: <1-2 line summary>
+- Limits: none | <list>
+```
+
+**Thresholds by Risk:**
+
+| Risk   | Tests | Entropy | Verify Score | Override Allowed |
+|--------|-------|---------|--------------|------------------|
+| LOW    | ✅    | ✅      | Optional     | N/A              |
+| MEDIUM | ✅    | ✅      | ≥ 90/100     | CAPTAIN_OVERRIDE: CONFIDENCE |
+| HIGH   | ✅    | ✅      | ≥ 95/100     | CAPTAIN_OVERRIDE: CONFIDENCE |
+
+**Rules:**
+1. LOW risk: Tests + Entropy only. Verify is optional.
+2. MEDIUM risk: Verify ≥ 90 OR explicit `CAPTAIN_OVERRIDE: CONFIDENCE` in notes.
+3. HIGH risk: Verify ≥ 95 OR explicit `CAPTAIN_OVERRIDE: CONFIDENCE` in notes.
+4. Never fake evidence. If `/verify` was not run, do NOT include a score.
+
+**Example (HIGH risk task):**
+```
+DONE-DONE PACKET:
+- Tests: PASS (test_auth.py, test_session.py)
+- Entropy: Passed ✅
+- Verify: 96/100
+- Risk: HIGH
+- Diff: Added JWT refresh token rotation
+- Limits: none
+```
+
 ## QUALITY CHECKLIST
 
 Before marking a task complete:
@@ -129,6 +168,7 @@ Before marking a task complete:
 - [ ] Tests present if required by mode
 - [ ] **v14.0:** `/simplify` was run OR `OPTIMIZATION WAIVED: <reason>` stated
 - [ ] **v14.0 RISK GATE:** If HIGH risk, `/verify` was run AND QA Status = PASS
+- [ ] **v14.1:** DONE-DONE PACKET included (for MEDIUM/HIGH risk tasks)
 
 
 ## CRITICAL RULES
@@ -140,4 +180,4 @@ Before marking a task complete:
 
 ---
 
-_v10.1 Atomic Mesh - The Builder_
+_v14.1 Atomic Mesh - The Builder (Done-Done Closeout)_
