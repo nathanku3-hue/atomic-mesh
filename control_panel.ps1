@@ -385,24 +385,24 @@ function Show-Header {
     $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
 
-    # Build title line: Path only (no project label)
+    # Build title line: Path only (right-aligned)
     $path = $CurrentDir
     $maxPathLen = $width - 4
     if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
         $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
     }
 
-    # Calculate padding for path
-    $padLen = $width - 3 - $path.Length
-    if ($padLen -lt 1) { $padLen = 1 }
+    # Calculate padding for path (right-aligned: padding first, then path)
+    $padLen = $width - 4 - $path.Length
+    if ($padLen -lt 0) { $padLen = 0 }
     $padding = " " * $padLen
 
     Write-Host ""
     Write-Host "+$line+" -ForegroundColor Cyan
 
-    # Line 1: Path only (centered or left-aligned)
+    # Line 1: Path right-aligned
     Write-Host "| " -NoNewline -ForegroundColor Cyan
-    Write-Host "$path$padding" -NoNewline -ForegroundColor DarkGray
+    Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
     Write-Host "|" -ForegroundColor Cyan
 
     # Line 2: Mode, Stats (pending + active only), Blocker Label
@@ -411,14 +411,14 @@ function Show-Header {
     $statsStr = "$($stats.pending) pending | $($stats.in_progress) active"
     # v16.1.4: Replace emoji dot with pipeline-derived blocker label
     $blockerLabel = Get-PrimaryBlockerLabel
-    $statusLine = "  $modeStr | $statsStr | $blockerLabel"
-    $statusPad = $width - 2 - $statusLine.Length
+    $statusLine = " $modeStr | $statsStr | $blockerLabel"
+    $statusPad = $width - 4 - $statusLine.Length
     if ($statusPad -lt 0) { $statusPad = 0 }
 
-    Write-Host "|" -NoNewline -ForegroundColor Cyan
+    Write-Host "| " -NoNewline -ForegroundColor Cyan
     Write-Host "$statusLine" -NoNewline -ForegroundColor White
     Write-Host (" " * $statusPad) -NoNewline
-    Write-Host "|" -ForegroundColor Cyan
+    Write-Host " |" -ForegroundColor Cyan
 
     Write-Host "+$line+" -ForegroundColor Cyan
 }
