@@ -393,7 +393,7 @@ function Show-Header {
     }
 
     # Calculate padding for path
-    $padLen = $width - 4 - $path.Length
+    $padLen = $width - 3 - $path.Length
     if ($padLen -lt 1) { $padLen = 1 }
     $padding = " " * $padLen
 
