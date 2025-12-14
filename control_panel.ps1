@@ -405,12 +405,13 @@ function Show-Header {
     Write-Host "$path$padding" -NoNewline -ForegroundColor DarkGray
     Write-Host "|" -ForegroundColor Cyan
 
-    # Line 2: Mode, Stats (pending + active only), Health
+    # Line 2: Mode, Stats (pending + active only), Blocker Label
     $modeStr = "$($proj.Icon) $($proj.Mode)"
     if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
     $statsStr = "$($stats.pending) pending | $($stats.in_progress) active"
-    $healthIcon = switch ($Global:HealthStatus) { "OK" { "🟢" } "WARN" { "🟡" } "FAIL" { "🔴" } default { "⚪" } }
-    $statusLine = "  $modeStr | $statsStr | $healthIcon"
+    # v16.1.4: Replace emoji dot with pipeline-derived blocker label
+    $blockerLabel = Get-PrimaryBlockerLabel
+    $statusLine = "  $modeStr | $statsStr | $blockerLabel"
     $statusPad = $width - 2 - $statusLine.Length
     if ($statusPad -lt 0) { $statusPad = 0 }
 
@@ -3034,7 +3035,7 @@ $Global:InputTopRow = [Math]::Min($Global:InputTopRow, $termHeight - $reserveBot
 # Derived anchors - Layout from top to bottom:
 #   Row (InputTopRow - 4): Dashboard bottom border
 #   Row (InputTopRow - 3): Micro-hint row (mode-specific hint, right-aligned)
-#   Row (InputTopRow - 2): Footer bar (Next: left, [MODE] right)
+#   Row (InputTopRow - 2): Footer bar (Hint: left, [MODE] right)
 #   Row (InputTopRow - 1): Input top border ┌───┐
 #   Row InputTopRow:       Input line │ > │
 #   Row (InputTopRow + 1): Input bottom border └───┘
@@ -3047,7 +3048,7 @@ $Global:RowDropdown = $Global:RowInput + 1
 $Global:BottomRegionTop = $Global:RowInputBottom + 1  # Below input box
 
 # v13.3.6: Shared left offset for input area alignment
-# Aligns input bar with "  Next:" label (2-space indent)
+# Aligns input bar with "  Hint:" label (2-space indent)
 $Global:InputLeft = 2
 
 # --- CORE POSITIONING FUNCTION ---
@@ -3068,8 +3069,8 @@ function Get-PromptLayout {
     $h = $Host.UI.RawUI.WindowSize.Height
     # Input row at 75% height, but cap to avoid writing past terminal
     $inputRow = [Math]::Min($Global:RowInput, $h - 5)
-    # v13.3.5: Editor-style footer layout (Next: left, [MODE] right, above input):
-    #   RowInput - 2: Footer bar (Next: left, [MODE] right)
+    # v13.3.5: Editor-style footer layout (Hint: left, [MODE] right, above input):
+    #   RowInput - 2: Footer bar (Hint: left, [MODE] right)
     #   RowInput - 1: Top border ┌───┐
     #   RowInput:     Input line │ > │
     #   RowInput + 1: Bottom border └───┘
@@ -3109,7 +3110,7 @@ function Redraw-PromptRegion {
     $width = $layout.Width
     # Clear region first
     Clear-PromptRegion
-    # Draw footer (Next: left, [MODE] right) - above input
+    # Draw footer (Hint: left, [MODE] right) - above input
     Draw-FooterBar
     # Draw framed input bar
     Draw-InputBar -width $width -rowInput $layout.RowInput
@@ -4067,6 +4068,49 @@ function Write-PipelineSnapshotIfNeeded {
     }
     catch {
         # Silent fail on write error
+    }
+}
+
+# ============================================================================
+# v16.1.4: PRIMARY BLOCKER LABEL (for unified signal layer)
+# ============================================================================
+# Returns a <=12 char label based on first non-GREEN pipeline stage.
+# Used in top header to replace emoji dots with actionable text.
+
+function Get-PrimaryBlockerLabel {
+    <#
+    .SYNOPSIS
+        Returns a short label indicating the primary blocker from pipeline status.
+    .DESCRIPTION
+        Walks stages in order: Ctx → Pln → Wrk → Opt → Ver → Shp
+        Returns "OK" if all green, otherwise returns stage-based label.
+    .RETURNS
+        String label (max 12 chars): OK, CONTEXT, PLAN MISSING, BLOCKED, etc.
+    #>
+    try {
+        $pipeline = Build-PipelineStatus
+        if (-not $pipeline -or -not $pipeline.stages) {
+            return "OK"  # No pipeline data = assume OK
+        }
+
+        $firstNonGreen = $pipeline.stages | Where-Object { $_.state -ne "GREEN" } | Select-Object -First 1
+        if (-not $firstNonGreen) {
+            return "OK"
+        }
+
+        # Map stage name to <=12 char label
+        switch ($firstNonGreen.name) {
+            "Context"  { return "CONTEXT" }
+            "Plan"     { return "PLAN MISSING" }
+            "Work"     { return "BLOCKED" }
+            "Optimize" { return "OPTIMIZE" }
+            "Verify"   { return "VERIFY" }
+            "Ship"     { return "SHIP BLOCK" }
+            default    { return $firstNonGreen.name.ToUpper().Substring(0, [Math]::Min(12, $firstNonGreen.name.Length)) }
+        }
+    }
+    catch {
+        return "OK"  # On error, default to OK
     }
 }
 
@@ -5582,7 +5626,7 @@ function Invoke-HistoryHotkey {
             $pipeline = $null
             try { $pipeline = Build-PipelineStatus -SelectedRow $selectedForPipeline } catch { $pipeline = $null }
             if (-not $pipeline -or -not $pipeline.stages) {
-                Set-HistoryHint -Text "Next: /refresh (pipeline unavailable)" -Color "Yellow"
+                Set-HistoryHint -Text "Hint: /refresh (pipeline unavailable)" -Color "Yellow"
                 return
             }
 
@@ -5600,7 +5644,7 @@ function Invoke-HistoryHotkey {
                 $Global:HistoryScrollOffset = 0
                 $Global:HistoryDetailsVisible = $false
                 $Global:HistoryData = @(Get-HistoryData)
-                Set-HistoryHint -Text "All green. Next: /ship" -Color "Green"
+                Set-HistoryHint -Text "All green. Hint: /ship" -Color "Green"
                 return
             }
 
@@ -5620,7 +5664,7 @@ function Invoke-HistoryHotkey {
 
                     $suggested = $pipeline.suggested_next.command
                     if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = "edit PRD.md | SPEC.md | DECISION_LOG.md" }
-                    Set-HistoryHint -Text "Context not ready. Next: $suggested" -Color "Yellow"
+                    Set-HistoryHint -Text "Context not ready. Hint: $suggested" -Color "Yellow"
                     return
                 }
 
@@ -5693,7 +5737,7 @@ function Invoke-HistoryHotkey {
 
                     $suggested = $pipeline.suggested_next.command
                     if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = "review ship blockers" }
-                    Set-HistoryHint -Text "Ship not ready. Next: $suggested" -Color "Yellow"
+                    Set-HistoryHint -Text "Ship not ready. Hint: $suggested" -Color "Yellow"
                     return
                 }
 
@@ -5718,7 +5762,7 @@ function Invoke-HistoryHotkey {
                     $Global:HistorySelectedRow = $idx
 
                     if ([string]::IsNullOrWhiteSpace($suggested)) { $suggested = $firstNonGreen.hint }
-                    Set-HistoryHint -Text "Next: $suggested" -Color "Yellow"
+                    Set-HistoryHint -Text "Hint: $suggested" -Color "Yellow"
                     return
                 }
             }
@@ -6671,7 +6715,7 @@ function Get-RecommendedAction {
 }
 
 # --- v13.3.6: Framed Input Bar with Unicode borders ---
-# ALIGNMENT: Input bar starts at $Global:InputLeft to align with "  Next:" label
+# ALIGNMENT: Input bar starts at $Global:InputLeft to align with "  Hint:" label
 # Box width = terminal width - InputLeft (right edge at terminal width - 1)
 function Draw-InputBar {
     param([int]$width, [int]$rowInput)
@@ -6715,8 +6759,9 @@ function Clear-InputContent {
     Set-Pos $rowInput ($left + 4)
 }
 
-# --- v13.3.5: Editor-Style Footer Bar (Next: left, [MODE] right) ---
-# Clean coding-CLI style: "Next: <hint>" on left, [MODE] on right
+# --- v16.1.4: Editor-Style Footer Bar (Hint: left, [MODE] right) ---
+# Clean coding-CLI style: "Hint: <suggestion>" on left (dim), [MODE] on right
+# Pipeline "Next:" is the only true next action (in COGNITIVE panel)
 function Draw-FooterBar {
     $footerRow = $Global:RowInput - 2
     $microHintRow = $Global:RowInput - 3
@@ -6731,17 +6776,17 @@ function Draw-FooterBar {
     # v16.1.2: Mode micro-hint removed from left side (declutter)
     # OPS hint now appears on footer row, left of [MODE] tag
 
-    # v16.1.1: Simplified footer - always show "Next:" hint (handles fresh/messy/pending scenarios)
+    # v16.1.4: Footer shows "Hint:" (dim) - pipeline Next: is the single truth
     $scenario = Get-SystemScenario
-    $nextHint = switch ($scenario) {
+    $hintText = switch ($scenario) {
         "fresh" { "/init" }
         "messy" { "/lib clean" }
         "pending" { "/run" }
         default { "/ops" }
     }
     Set-Pos $footerRow 0
-    Write-Host "  Next: " -NoNewline -ForegroundColor DarkGray
-    Write-Host $nextHint -NoNewline -ForegroundColor Cyan
+    Write-Host "  Hint: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $hintText -NoNewline -ForegroundColor DarkGray
 
     # Mode badge (right-aligned)
     $modeColors = @{
