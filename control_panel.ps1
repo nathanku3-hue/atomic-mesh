@@ -3017,22 +3017,34 @@ function Switch-Mode {
 # Every element is painted at specific X,Y coordinates - no streaming output
 
 # --- GLOBAL ROW CONSTANTS ---
+# v16.1.1: Layout anchoring - single source of truth for all regions
 $Global:RowHeader = 0
-$Global:RowDashStart = 4
+$Global:RowDashStart = 5  # Start after header (rows 0-4)
 $Global:MaxDropdownRows = 5  # Keep small to avoid terminal resize
 
-# Calculate input row at 75% height (bottom 1/4 reserved for input area)
-# v13.4.9: Layout breakdown:
-#   RowInput - 1: Top border    ┌───────────┐
-#   RowInput:     Input line    │ >         │
-#   RowInputBottom: Bottom border └───────────┘
-#   RowHint:       Mini-guide text row (below box)
-#   RowHint + 1:   Lookup panel starts here
+# v16.1.1: Layout Contract - compute from terminal height
+# InputTopRow is the anchor; all regions derive from it
 $termHeight = $Host.UI.RawUI.WindowSize.Height
-$Global:RowInput = [Math]::Floor($termHeight * 0.75)
-$Global:RowInputBottom = $Global:RowInput + 1    # Bottom border of input box
-$Global:RowHint = $Global:RowInput + 2           # Hint row below input box
+$minSafeTop = 15           # Minimum rows for dashboard content
+$reserveBottom = 5         # Reserve for input box + dropdown
+$Global:InputTopRow = [Math]::Floor($termHeight * 0.75)
+$Global:InputTopRow = [Math]::Max($Global:InputTopRow, $minSafeTop)
+$Global:InputTopRow = [Math]::Min($Global:InputTopRow, $termHeight - $reserveBottom)
+
+# Derived anchors - Layout from top to bottom:
+#   Row (InputTopRow - 4): Dashboard bottom border
+#   Row (InputTopRow - 3): Micro-hint row (mode-specific hint, right-aligned)
+#   Row (InputTopRow - 2): Footer bar (Next: left, [MODE] right)
+#   Row (InputTopRow - 1): Input top border ┌───┐
+#   Row InputTopRow:       Input line │ > │
+#   Row (InputTopRow + 1): Input bottom border └───┘
+#   Row (InputTopRow + 2): Dropdown/hint area
+$Global:TopRegionBottom = $Global:InputTopRow - 4  # Dashboard ends here (bottom border row)
+$Global:RowInput = $Global:InputTopRow             # Alias for compatibility
+$Global:RowInputBottom = $Global:RowInput + 1     # Bottom border of input box
+$Global:RowHint = $Global:RowInput + 2            # Hint row below input box
 $Global:RowDropdown = $Global:RowInput + 1
+$Global:BottomRegionTop = $Global:RowInputBottom + 1  # Below input box
 
 # v13.3.6: Shared left offset for input area alignment
 # Aligns input bar with "  Next:" label (2-space indent)
@@ -4330,12 +4342,71 @@ function Print-Row {
 # --- DRAW BORDER LINE ---
 function Draw-Border {
     param([int]$Row, [int]$HalfWidth)
-    
+
     $line = "-" * ($HalfWidth - 2)
     Set-Pos $Row 0
     Write-Host "+$line+" -NoNewline -ForegroundColor DarkGray
     Set-Pos $Row $HalfWidth
     Write-Host "+$line+" -NoNewline -ForegroundColor DarkGray
+}
+
+# --- v16.1.1: LEFT-ONLY PANEL RENDERER (doesn't touch right panel) ---
+function Print-LeftOnly {
+    param(
+        [int]$Row,
+        [string]$Text,
+        [int]$HalfWidth,
+        [string]$Color = "White"
+    )
+
+    $ContentWidth = $HalfWidth - 4
+    if ($Text.Length -gt $ContentWidth) { $Text = $Text.Substring(0, $ContentWidth - 3) + "..." }
+
+    Set-Pos $Row 0
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host $Text.PadRight($ContentWidth) -NoNewline -ForegroundColor $Color
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+}
+
+# --- v16.1.1: RIGHT-ONLY PANEL RENDERER (doesn't touch left panel) ---
+function Print-RightOnly {
+    param(
+        [int]$Row,
+        [string]$Text,
+        [int]$HalfWidth,
+        [string]$Color = "White"
+    )
+
+    $ContentWidth = $HalfWidth - 4
+    if ($Text.Length -gt $ContentWidth) { $Text = $Text.Substring(0, $ContentWidth - 3) + "..." }
+
+    Set-Pos $Row $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host $Text.PadRight($ContentWidth) -NoNewline -ForegroundColor $Color
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+}
+
+# --- v16.1.1: CLEAR DASHBOARD REGION (both panels, from start to TopRegionBottom) ---
+# Left panel: cleared with borders (content always has borders)
+# Right panel: cleared with spaces only (borders managed by content)
+function Clear-DashboardRegion {
+    param([int]$StartRow, [int]$HalfWidth)
+
+    $ContentWidth = $HalfWidth - 4
+    $blankContent = " " * $ContentWidth
+    $rightClearWidth = $HalfWidth - 1  # Full right panel width
+
+    for ($row = $StartRow; $row -lt $Global:TopRegionBottom; $row++) {
+        # Clear left panel (with borders - left panel always uses borders)
+        Set-Pos $row 0
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $blankContent -NoNewline
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+
+        # Clear right panel (no borders - borders managed by content/pipeline)
+        Set-Pos $row $HalfWidth
+        Write-Host (" " * $rightClearWidth) -NoNewline
+    }
 }
 
 # --- v14.1: PROGRESS BAR RENDERER for BOOTSTRAP MODE (Compact ASCII Style) ---
@@ -6016,18 +6087,13 @@ function Draw-Dashboard {
     $DecisionLog = Join-Path (Get-Location) "docs\DECISION_LOG.md"
     $Decisions = @()
     if (Test-Path $DecisionLog) {
-        $Decisions = Get-Content $DecisionLog -ErrorAction SilentlyContinue | 
-        Where-Object { $_ -match "^\|.*\|" -and $_ -notmatch "^[\|\-\s]+$" -and $_ -notmatch "ID\s*\|" } | 
+        $Decisions = Get-Content $DecisionLog -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match "^\|.*\|" -and $_ -notmatch "^[\|\-\s]+$" -and $_ -notmatch "ID\s*\|" } |
         Select-Object -Last 2
     }
-    
-    # Get audit logs
-    $LogFile = Join-Path (Get-Location) "logs\mesh.log"
-    $AuditLog = @()
-    if (Test-Path $LogFile) {
-        $AuditLog = Get-Content $LogFile -ErrorAction SilentlyContinue | Select-Object -Last 2
-    }
-    
+
+    # v16.1.1: Audit logs now loaded inline in LIVE AUDIT LOG section (uses TopRegionBottom anchor)
+
     # 2. Dimensions
     $W = $Host.UI.RawUI.WindowSize.Width
     $Half = [Math]::Floor($W / 2)
@@ -6101,18 +6167,35 @@ function Draw-Dashboard {
     # v14.1: CONDITIONAL RENDERING - PRE_INIT vs BOOTSTRAP vs EXECUTION
     if ($IsPreInit) {
         # === PRE_INIT: No docs exist yet, show setup instructions ===
+        # v16.1.1: Clear region first to prevent artifacts
+        Clear-DashboardRegion -StartRow $R -HalfWidth $Half
+
         $R = Draw-PreInitPanel -StartRow $R -HalfWidth $Half -WorkerData $Data
 
-        # Fill remaining space to maintain layout consistency
-        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
-        $R++
+        # v16.1.1: Fill to TopRegionBottom
+        while ($R -lt $Global:TopRegionBottom) {
+            Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+            $R++
+        }
     }
     elseif ($IsBootstrap) {
         # === BOOTSTRAP MODE: Show readiness panel (docs exist but incomplete) ===
+        # v16.1.1: Clear region first to prevent artifacts
+        Clear-DashboardRegion -StartRow $R -HalfWidth $Half
+
         $R = Draw-BootstrapPanel -StartRow $R -HalfWidth $Half -ReadinessData $Readiness
+
+        # v16.1.1: Fill to TopRegionBottom
+        while ($R -lt $Global:TopRegionBottom) {
+            Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+            $R++
+        }
     }
     else {
         # === EXECUTION MODE: Show compact stream dashboard (v16.0) ===
+
+        # v16.1.1: Clear dashboard region first to prevent artifacts from previous frames
+        Clear-DashboardRegion -StartRow $R -HalfWidth $Half
 
         # --- v16.0: COMPACT STREAM LINES (Left Panel) ---
         # Get stream status for all 4 streams
@@ -6290,31 +6373,63 @@ function Draw-Dashboard {
         $pipelineData = Build-PipelineStatus
         # v16.0: Write snapshot if any stage is non-GREEN (dedupe via hash + debounce)
         Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
-        $R = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData
+        $pipelineEndRow = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData
 
-        # === SEPARATOR ===
-        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+        # v16.1.1: Close right panel with bottom border after pipeline ends
+        # This prevents the "giant empty frame" appearance
+        $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
+        Set-Pos $pipelineEndRow $Half
+        Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
+
+        # v16.1.1: Clear remaining right panel rows (no borders - just blank space)
+        $RightContentWidth = $Half - 1  # Full right panel area
+        for ($clearRow = $pipelineEndRow + 1; $clearRow -lt $Global:TopRegionBottom; $clearRow++) {
+            Set-Pos $clearRow $Half
+            Write-Host (" " * $RightContentWidth) -NoNewline
+        }
+
+        # === v16.1.1: LIVE AUDIT LOG (left panel only, expands to fill space) ===
+        # Calculate available rows until TopRegionBottom
+        $availableRows = $Global:TopRegionBottom - $R - 1  # -1 for header row
+        if ($availableRows -lt 1) { $availableRows = 1 }
+
+        # --- ROW: LOG HEADER (left panel only) ---
+        Print-LeftOnly -Row $R -Text "LIVE AUDIT LOG" -HalfWidth $Half -Color "Yellow"
         $R++
 
-        # --- ROW: LOG HEADER ---
-        Print-Row $R "" "LIVE AUDIT LOG" $Half "DarkGray" "Yellow"
-        $R++
+        # --- ROWS: LOGS (expand to fill available space, left panel only) ---
+        # Load enough log lines to fill available rows
+        $LogFile = Join-Path (Get-Location) "logs\mesh.log"
+        $logLines = @()
+        if (Test-Path $LogFile) {
+            $logLines = Get-Content $LogFile -ErrorAction SilentlyContinue | Select-Object -Last $availableRows
+        }
 
-        # --- ROW: LOGS (single line) ---
-        $L1 = if ($AuditLog.Count -ge 1) { "  " + $AuditLog[-1] } else { "  (no logs)" }
-        Print-Row $R "" $L1 $Half "Gray" "DarkGray"
-        $R++
+        if ($logLines.Count -gt 0) {
+            # Show log lines (oldest first, newest at bottom)
+            foreach ($line in $logLines) {
+                $displayLine = "  " + $line
+                Print-LeftOnly -Row $R -Text $displayLine -HalfWidth $Half -Color "DarkGray"
+                $R++
+            }
+            # Fill any remaining rows (left panel only)
+            while ($R -lt $Global:TopRegionBottom) {
+                Print-LeftOnly -Row $R -Text "" -HalfWidth $Half -Color "DarkGray"
+                $R++
+            }
+        } else {
+            # No logs: single placeholder line, then fill remaining (left panel only)
+            Print-LeftOnly -Row $R -Text "  (no logs)" -HalfWidth $Half -Color "DarkGray"
+            $R++
+            while ($R -lt $Global:TopRegionBottom) {
+                Print-LeftOnly -Row $R -Text "" -HalfWidth $Half -Color "DarkGray"
+                $R++
+            }
+        }
 
     }  # End of EXECUTION mode conditional
 
-    # Fill remaining rows to reach input bar (v13.1: extend grid to bottom)
-    $BottomRow = $Global:RowInput - 1
-    while ($R -lt $BottomRow) {
-        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
-        $R++
-    }
-
-    # Bottom Border (now at row just above input)
+    # Bottom Border at TopRegionBottom (just above footer row)
     Set-Pos $R 0; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
     Set-Pos $R $Half; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
 }
@@ -6540,25 +6655,17 @@ function Draw-FooterBar {
         Write-Host $config.MicroHint -ForegroundColor DarkGray -NoNewline
     }
 
-    # SANDBOX UX: First-time hint
-    $stats = Get-TaskStats
-    $hasTasks = ($stats.pending -gt 0 -or $stats.in_progress -gt 0 -or $stats.completed -gt 0)
-    if (-not $hasTasks) {
-        Set-Pos $footerRow 2
-        Write-Host "First time here? Type /init to bootstrap a new project." -ForegroundColor DarkGray -NoNewline
+    # v16.1.1: Simplified footer - always show "Next:" hint (handles fresh/messy/pending scenarios)
+    $scenario = Get-SystemScenario
+    $nextHint = switch ($scenario) {
+        "fresh" { "/init" }
+        "messy" { "/lib clean" }
+        "pending" { "/run" }
+        default { "/ops" }
     }
-    else {
-        $scenario = Get-SystemScenario
-        $nextHint = switch ($scenario) {
-            "fresh" { "/init" }
-            "messy" { "/lib clean" }
-            "pending" { "/run" }
-            default { "/ops" }
-        }
-        Set-Pos $footerRow 0
-        Write-Host "  Next: " -NoNewline -ForegroundColor DarkGray
-        Write-Host $nextHint -NoNewline -ForegroundColor Cyan
-    }
+    Set-Pos $footerRow 0
+    Write-Host "  Next: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $nextHint -NoNewline -ForegroundColor Cyan
 
     # Mode badge (right-aligned)
     $modeColors = @{
