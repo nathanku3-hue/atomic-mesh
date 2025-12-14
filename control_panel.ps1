@@ -4631,21 +4631,22 @@ function Get-StreamStatusLine {
                     $result.Bar = "■□□□□"
                     $result.BarColor = "Red"
                     $result.SummaryColor = "Red"
-                    $result.Summary = "Root cluttered (>5 loose files)"
+                    # v16.1.3: Shortened to avoid truncation artifacts
+                    $result.Summary = "Cluttered (>5 files)"
                 }
                 "CLUTTERED" {
                     $result.State = "WARN"
                     $result.Bar = "■■□□□"
                     $result.BarColor = "Yellow"
                     $result.SummaryColor = "Yellow"
-                    $result.Summary = "Some loose files detected"
+                    $result.Summary = "Loose files found"
                 }
                 "*Inbox*" {
                     $result.State = "PENDING"
                     $result.Bar = "■■□□□"
                     $result.BarColor = "Yellow"
                     $result.SummaryColor = "Yellow"
-                    $result.Summary = "Inbox items pending /ingest"
+                    $result.Summary = "Inbox pending"
                 }
                 "CLEAN" {
                     $result.State = "OK"
@@ -6242,7 +6243,16 @@ function Draw-Dashboard {
             $summaryMaxLen = $ContentWidth - 10 - 6 - 8 - 2
             $summary = $Status.Summary
             if ($summary.Length -gt $summaryMaxLen) {
-                $summary = $summary.Substring(0, $summaryMaxLen - 3) + "..."
+                # v16.1.3: Truncate at word boundary to avoid partial words like "fi..."
+                $truncLen = $summaryMaxLen - 1  # Leave room for ellipsis
+                $truncated = $summary.Substring(0, $truncLen)
+                # Find last space to truncate at word boundary
+                $lastSpace = $truncated.LastIndexOf(' ')
+                if ($lastSpace -gt ($truncLen / 2)) {
+                    # Only use word boundary if it doesn't lose too much text
+                    $truncated = $truncated.Substring(0, $lastSpace)
+                }
+                $summary = $truncated.TrimEnd() + "…"
             }
             Write-Host $summary.PadRight($summaryMaxLen) -NoNewline -ForegroundColor $Status.SummaryColor
 
@@ -6335,8 +6345,11 @@ function Draw-Dashboard {
                     Write-Host "[$shortName]" -NoNewline -ForegroundColor $color
                     $pipelineChars += $shortName.Length + 2
                     if ($i -lt $stages.Count - 1) {
+                        # v16.1.3: Spaced arrows for readability " → "
+                        Write-Host " " -NoNewline
                         Write-Host ([char]0x2192) -NoNewline -ForegroundColor DarkGray
-                        $pipelineChars += 1
+                        Write-Host " " -NoNewline
+                        $pipelineChars += 3  # space + arrow + space
                     }
                 }
                 $padLen = $RightWidth - $pipelineChars
