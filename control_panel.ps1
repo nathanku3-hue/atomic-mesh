@@ -385,27 +385,10 @@ function Show-Header {
     $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
 
-    # Build title line: Path only (right-aligned)
-    $path = $CurrentDir
-    $maxPathLen = $width - 4
-    if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
-        $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
-    }
-
-    # Calculate padding for path (right-aligned: padding first, then path)
-    $padLen = $width - 4 - $path.Length
-    if ($padLen -lt 0) { $padLen = 0 }
-    $padding = " " * $padLen
-
     Write-Host ""
     Write-Host "+$line+" -ForegroundColor Cyan
 
-    # Line 1: Path right-aligned
-    Write-Host "| " -NoNewline -ForegroundColor Cyan
-    Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
-    Write-Host "|" -ForegroundColor Cyan
-
-    # Line 2: Mode, Stats (pending + active only), Blocker Label
+    # Line 1: Mode, Stats, Blocker Label (top-left)
     $modeStr = "$($proj.Icon) $($proj.Mode)"
     if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
     $statsStr = "$($stats.pending) pending | $($stats.in_progress) active"
@@ -419,6 +402,20 @@ function Show-Header {
     Write-Host "$statusLine" -NoNewline -ForegroundColor White
     Write-Host (" " * $statusPad) -NoNewline
     Write-Host " |" -ForegroundColor Cyan
+
+    # Line 2: Path (right-aligned)
+    $path = $CurrentDir
+    $maxPathLen = $width - 4
+    if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
+        $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
+    }
+    $padLen = $width - 4 - $path.Length
+    if ($padLen -lt 0) { $padLen = 0 }
+    $padding = " " * $padLen
+
+    Write-Host "| " -NoNewline -ForegroundColor Cyan
+    Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
+    Write-Host "|" -ForegroundColor Cyan
 
     Write-Host "+$line+" -ForegroundColor Cyan
 }
