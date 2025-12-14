@@ -6262,18 +6262,20 @@ function Draw-Dashboard {
                         elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
                         else { "Context Ready" }
         $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
-        $actionRow = if ($hasDelegation) { "  /ingest | /draft-plan | /accept-plan" }
-                     elseif ($IsBootstrap) { "  Edit PRD/SPEC | /add (tactical open)" }
-                     else { "  /refresh-plan | /draft-plan" }
+        $actionHints = if ($hasDelegation) { "/ingest | /draft-plan" }
+                       elseif ($IsBootstrap) { "Edit PRD/SPEC | /add" }
+                       else { "/refresh-plan | /draft-plan" }
+
+        # v16.1.2: Combine Context Ready + hints into single line (Change 3)
+        $topLine = "$nextFocusTxt  $actionHints"
 
         # Build pipeline data
         $pipelineData = Build-PipelineStatus
         Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
 
-        # Build content lines array with colors
+        # Build content lines array with colors (now 3 lines instead of 4)
         $contentLines = @(
-            @{ Text = $nextFocusTxt; Color = $nextFocusColor }
-            @{ Text = $actionRow; Color = "DarkGray" }
+            @{ Text = $topLine; Color = $nextFocusColor }
         )
 
         # Add pipeline arrow line
@@ -6478,39 +6480,36 @@ function Draw-Dashboard {
         Print-LeftOnly -Row $R -Text $autoIngestTxt -HalfWidth $Half -Color $autoIngestColor
         $R++
 
-        # === v16.1.1: LIVE AUDIT LOG (left panel only, expands to fill space) ===
-        # Calculate available rows until TopRegionBottom
-        $availableRows = $Global:TopRegionBottom - $R - 1  # -1 for header row
-        if ($availableRows -lt 1) { $availableRows = 1 }
-
-        # --- ROW: LOG HEADER (left panel only) ---
-        Print-LeftOnly -Row $R -Text "LIVE AUDIT LOG" -HalfWidth $Half -Color "Yellow"
-        $R++
-
-        # --- ROWS: LOGS (expand to fill available space, left panel only) ---
-        # Load enough log lines to fill available rows
+        # === v16.1.2: Compact audit line (replaces verbose LIVE AUDIT LOG header) ===
+        # Load log file to check if logs exist
         $LogFile = Join-Path (Get-Location) "logs\mesh.log"
         $logLines = @()
         if (Test-Path $LogFile) {
+            $availableRows = $Global:TopRegionBottom - $R - 1
+            if ($availableRows -lt 1) { $availableRows = 1 }
             $logLines = Get-Content $LogFile -ErrorAction SilentlyContinue | Select-Object -Last $availableRows
         }
 
         if ($logLines.Count -gt 0) {
-            # Show log lines (oldest first, newest at bottom)
+            # Has logs: show compact count header then log lines
+            Print-LeftOnly -Row $R -Text "Audit: $($logLines.Count)" -HalfWidth $Half -Color "DarkGray"
+            $R++
+            # Show log lines
             foreach ($line in $logLines) {
                 $displayLine = "  " + $line
                 Print-LeftOnly -Row $R -Text $displayLine -HalfWidth $Half -Color "DarkGray"
                 $R++
             }
-            # Fill any remaining rows (left panel only)
+            # Fill remaining rows
             while ($R -lt $Global:TopRegionBottom) {
                 Print-LeftOnly -Row $R -Text "" -HalfWidth $Half -Color "DarkGray"
                 $R++
             }
         } else {
-            # No logs: single placeholder line, then fill remaining (left panel only)
-            Print-LeftOnly -Row $R -Text "  (no logs)" -HalfWidth $Half -Color "DarkGray"
+            # No logs: compact single line, no big header
+            Print-LeftOnly -Row $R -Text "Audit: (no logs)" -HalfWidth $Half -Color "DarkGray"
             $R++
+            # Fill remaining rows (compact, no extra frames)
             while ($R -lt $Global:TopRegionBottom) {
                 Print-LeftOnly -Row $R -Text "" -HalfWidth $Half -Color "DarkGray"
                 $R++
@@ -6738,12 +6737,8 @@ function Draw-FooterBar {
     Set-Pos $footerRow 0
     Write-Host (" " * ($width - 1)) -NoNewline
 
-    # SANDBOX UX: Mode micro-hint
-    $config = $Global:ModeConfig[$Global:CurrentMode]
-    if ($config.MicroHint) {
-        Set-Pos $microHintRow 2
-        Write-Host $config.MicroHint -ForegroundColor DarkGray -NoNewline
-    }
+    # v16.1.2: Mode micro-hint removed from left side (declutter)
+    # OPS hint now appears on footer row, left of [MODE] tag
 
     # v16.1.1: Simplified footer - always show "Next:" hint (handles fresh/messy/pending scenarios)
     $scenario = Get-SystemScenario
@@ -6766,9 +6761,22 @@ function Draw-FooterBar {
     }
     $modeLabel = "[$($Global:CurrentMode)]"
     $modeColor = $modeColors[$Global:CurrentMode]
-    $col = $width - $modeLabel.Length - 1
+
+    # v16.1.2: Minimal mode hint positioned left of [MODE] tag (dark grey)
+    $modeHints = @{
+        "OPS"  = "ask 'health', 'drift'  "
+        "PLAN" = "describe work  "
+        "RUN"  = "feedback or Enter  "
+        "SHIP" = "/ship --confirm  "
+    }
+    $modeHint = $modeHints[$Global:CurrentMode]
+    $rightBlock = $modeHint + $modeLabel
+    $col = $width - $rightBlock.Length - 1
     if ($col -lt 0) { $col = 0 }
+
+    # Draw hint (dark grey) then mode label (colored)
     Set-Pos $footerRow $col
+    Write-Host $modeHint -NoNewline -ForegroundColor DarkGray
     Write-Host $modeLabel -NoNewline -ForegroundColor $modeColor
 
     # SANDBOX UX: Router debug overlay
