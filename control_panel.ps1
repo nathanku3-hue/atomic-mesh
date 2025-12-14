@@ -7869,7 +7869,13 @@ function Show-CommandPicker {
                     ClearDropdownOnly
                     return @{ Kind = "select"; Command = "/" + $exactMatch.Name }
                 }
-                # Otherwise use highlighted selection
+                # v16.1.1: Unique prefix auto-run (P2 enhancement)
+                # If exactly one command matches the prefix, run it immediately
+                if ($filteredCmds.Count -eq 1) {
+                    ClearDropdownOnly
+                    return @{ Kind = "select"; Command = "/" + $filteredCmds[0].Name }
+                }
+                # Otherwise use highlighted selection (multiple matches)
                 ClearDropdownOnly
                 return @{ Kind = "select"; Command = "/" + $filteredCmds[$script:pickerSelectedIdx].Name }
             }
