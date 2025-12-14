@@ -6247,56 +6247,187 @@ function Draw-Dashboard {
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
+        # v16.1.2: In compact mode, render the entire right panel as a balanced unit upfront
+        # This creates intentional spacing: TopBlock → spacer → BottomBlock
+        if ($compactMode) {
+            $RightWidth = $Half - 4  # Content width inside borders
+            $rightStartRow = $R
+            $rightEndRow = $Global:TopRegionBottom - 1  # Leave room for bottom border
+            $rightAvailable = $rightEndRow - $rightStartRow
+
+            # Prepare TopBlock content
+            $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
+            $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
+                            elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
+                            else { "Context Ready" }
+            $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
+            $actionRow = if ($hasDelegation) { "  /ingest | /draft-plan | /accept-plan" }
+                         elseif ($IsBootstrap) { "  Edit PRD/SPEC | /add (tactical open)" }
+                         else { "  /refresh-plan | /draft-plan" }
+
+            # Build pipeline data for BottomBlock
+            $pipelineData = Build-PipelineStatus
+            Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
+
+            # Prepare BottomBlock content (pipeline lines)
+            # Count how many lines the pipeline needs: header + arrow + next + reasons
+            $bottomBlockCount = 3  # PIPELINE header, arrow line, Next line
+            $nonGreenStages = @()
+            if ($pipelineData.stages) {
+                foreach ($s in $pipelineData.stages) {
+                    if ($s.state -in @("RED", "YELLOW") -and $s.reason) {
+                        $nonGreenStages += $s
+                    }
+                }
+            }
+            if ($nonGreenStages.Count -gt 0) {
+                $bottomBlockCount += 1  # Add 1 reason line in compact mode
+            }
+
+            # TopBlock = 2 lines (Context Ready + action hints)
+            $topBlockCount = 2
+
+            # Calculate spacer: floor(available / 2), clamped to fit content
+            $contentNeeded = $topBlockCount + $bottomBlockCount
+            $spacerMax = $rightAvailable - $contentNeeded
+            if ($spacerMax -lt 0) { $spacerMax = 0 }
+            $spacerHeight = [Math]::Floor($rightAvailable / 2)
+            $spacerHeight = [Math]::Min($spacerHeight, $spacerMax)
+            $spacerHeight = [Math]::Max($spacerHeight, 0)
+
+            # Helper to draw a right panel line
+            $currentRightRow = $rightStartRow
+            function Draw-RightPanelLine {
+                param([string]$Text, [string]$Color = "White")
+                if ($script:currentRightRow -gt $rightEndRow) { return }
+                Set-Pos $script:currentRightRow $Half
+                Write-Host "| " -NoNewline -ForegroundColor DarkGray
+                $truncated = $Text
+                if ($truncated.Length -gt $RightWidth) {
+                    $truncated = $truncated.Substring(0, $RightWidth - 3) + "..."
+                }
+                Write-Host $truncated.PadRight($RightWidth) -NoNewline -ForegroundColor $Color
+                Write-Host " |" -NoNewline -ForegroundColor DarkGray
+                $script:currentRightRow++
+            }
+
+            # === RENDER TopBlock ===
+            Draw-RightPanelLine $nextFocusTxt $nextFocusColor
+            Draw-RightPanelLine $actionRow "DarkGray"
+
+            # === RENDER Spacer ===
+            for ($i = 0; $i -lt $spacerHeight; $i++) {
+                Draw-RightPanelLine "" "DarkGray"
+            }
+
+            # === RENDER BottomBlock (Pipeline) ===
+            # PIPELINE header
+            Draw-RightPanelLine "PIPELINE" "Cyan"
+
+            # Arrow line
+            if ($currentRightRow -le $rightEndRow) {
+                Set-Pos $currentRightRow $Half
+                Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+                $stateColors = @{ "GREEN" = "Green"; "YELLOW" = "Yellow"; "RED" = "Red"; "GRAY" = "DarkGray" }
+                $stages = $pipelineData.stages
+                $pipelineChars = 0
+
+                for ($i = 0; $i -lt $stages.Count; $i++) {
+                    $stage = $stages[$i]
+                    $color = $stateColors[$stage.state]
+                    $shortName = switch ($stage.name) {
+                        "Context"  { "Ctx" }
+                        "Plan"     { "Pln" }
+                        "Work"     { "Wrk" }
+                        "Optimize" { "Opt" }
+                        "Verify"   { "Ver" }
+                        "Ship"     { "Shp" }
+                        default    { $stage.name.Substring(0, 3) }
+                    }
+                    Write-Host "[$shortName]" -NoNewline -ForegroundColor $color
+                    $pipelineChars += $shortName.Length + 2
+                    if ($i -lt $stages.Count - 1) {
+                        Write-Host ([char]0x2192) -NoNewline -ForegroundColor DarkGray
+                        $pipelineChars += 1
+                    }
+                }
+                $padLen = $RightWidth - $pipelineChars
+                if ($padLen -gt 0) { Write-Host (" " * $padLen) -NoNewline }
+                Write-Host " |" -NoNewline -ForegroundColor DarkGray
+                $currentRightRow++
+            }
+
+            # Next line
+            if ($currentRightRow -le $rightEndRow) {
+                Set-Pos $currentRightRow $Half
+                Write-Host "| " -NoNewline -ForegroundColor DarkGray
+                Write-Host "Next: " -NoNewline -ForegroundColor Yellow
+                $suggestedCmd = $pipelineData.suggested_next.command
+                $nextText = if ($suggestedCmd) { $suggestedCmd } else { $pipelineData.immediate_next }
+                $nextAvail = $RightWidth - 6
+                if ($nextText.Length -gt $nextAvail) {
+                    $nextText = $nextText.Substring(0, $nextAvail - 3) + "..."
+                }
+                Write-Host $nextText.PadRight($nextAvail) -NoNewline -ForegroundColor White
+                Write-Host " |" -NoNewline -ForegroundColor DarkGray
+                $currentRightRow++
+            }
+
+            # Reason line (1 in compact mode)
+            if ($nonGreenStages.Count -gt 0 -and $currentRightRow -le $rightEndRow) {
+                $rs = $nonGreenStages | Sort-Object -Property { if ($_.state -eq "RED") { 0 } else { 1 } } | Select-Object -First 1
+                $stageAbbrev = @{ "Context" = "CTX"; "Plan" = "PLN"; "Work" = "WRK"; "Optimize" = "OPT"; "Verify" = "VER"; "Ship" = "SHP" }
+                $abbrev = if ($stageAbbrev.ContainsKey($rs.name)) { $stageAbbrev[$rs.name] } else { $rs.name.Substring(0,3).ToUpper() }
+                $reasonLine = "($abbrev) $($rs.reason)"
+                $lineColor = if ($rs.state -eq "RED") { "Red" } else { "Yellow" }
+                Draw-RightPanelLine $reasonLine $lineColor
+            }
+
+            # === Clear remaining rows (safety) ===
+            while ($currentRightRow -le $rightEndRow) {
+                Draw-RightPanelLine "" "DarkGray"
+            }
+
+            # === Bottom border ===
+            $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
+            Set-Pos $currentRightRow $Half
+            Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
+        }
+
         # --- ROW: BACKEND ---
         Draw-StreamLine -Row $R -StreamName "BACKEND" -Status $BE_Status -Half $Half
-        # Right panel: NEXT FOCUS header
-        $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
-        $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
-                        elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
-                        else { "Context Ready" }
-        $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
-        Set-Pos $R $Half
-        Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host $nextFocusTxt.PadRight($Half - 4) -NoNewline -ForegroundColor $nextFocusColor
-        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        # Right panel content (only in non-compact mode - compact already rendered above)
+        if (-not $compactMode) {
+            $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
+            $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
+                            elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
+                            else { "Context Ready" }
+            $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
+            Set-Pos $R $Half
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host $nextFocusTxt.PadRight($Half - 4) -NoNewline -ForegroundColor $nextFocusColor
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        }
         $R++
 
         # --- ROW: FRONTEND ---
         Draw-StreamLine -Row $R -StreamName "FRONTEND" -Status $FE_Status -Half $Half
-        # Right panel: Action hints
-        $actionRow = if ($hasDelegation) { "  /ingest | /draft-plan | /accept-plan" }
-                     elseif ($IsBootstrap) { "  Edit PRD/SPEC | /add (tactical open)" }
-                     else { "  /refresh-plan | /draft-plan" }
-        Set-Pos $R $Half
-        Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host $actionRow.PadRight($Half - 4) -NoNewline -ForegroundColor DarkGray
-        Write-Host " |" -NoNewline -ForegroundColor DarkGray
-        $R++
-
-        # v16.1.1: In compact mode, start pipeline panel immediately after action hints
-        # This eliminates the large blank gap in the right panel
-        $pipelineStartRow = $R  # Remember where pipeline should start
-        if ($compactMode) {
-            # Build pipeline data now so we can render it alongside left panel
-            $pipelineData = Build-PipelineStatus
-            Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
-            # Draw pipeline starting at current row (right after action hints)
-            $pipelineEndRow = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData -Compact:$true
-            # Close pipeline panel with bottom border
-            $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
-            Set-Pos $pipelineEndRow $Half
-            Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
-            # Clear remaining right panel area (just spaces, no borders)
-            $RightClearWidth = $Half - 1
-            for ($clearRow = $pipelineEndRow + 1; $clearRow -lt $Global:TopRegionBottom; $clearRow++) {
-                Set-Pos $clearRow $Half
-                Write-Host (" " * $RightClearWidth) -NoNewline
-            }
+        # Right panel: Action hints (only in non-compact mode)
+        if (-not $compactMode) {
+            $actionRow = if ($hasDelegation) { "  /ingest | /draft-plan | /accept-plan" }
+                         elseif ($IsBootstrap) { "  Edit PRD/SPEC | /add (tactical open)" }
+                         else { "  /refresh-plan | /draft-plan" }
+            Set-Pos $R $Half
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host $actionRow.PadRight($Half - 4) -NoNewline -ForegroundColor DarkGray
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
+        $R++
 
         # --- ROW: QA/AUDIT ---
         Draw-StreamLine -Row $R -StreamName "QA/AUDIT" -Status $QA_Status -Half $Half
-        # Right panel: Separator (skip in compact mode - pipeline already rendered)
+        # Right panel: Separator (only in non-compact mode)
         if (-not $compactMode) {
             Set-Pos $R $Half
             Write-Host "| " -NoNewline -ForegroundColor DarkGray
@@ -6307,7 +6438,7 @@ function Draw-Dashboard {
 
         # --- ROW: LIBRARIAN ---
         Draw-StreamLine -Row $R -StreamName "LIBRARIAN" -Status $LIB_Status -Half $Half
-        # Right panel: Recent decision (skip in compact mode - pipeline already rendered)
+        # Right panel: Recent decision (only in non-compact mode)
         if (-not $compactMode) {
             $D1 = if ($Decisions.Count -ge 1) { "  " + ($Decisions[-1] -replace "\|", "").Trim() } else { "" }
             if ($D1.Length -gt ($Half - 4)) { $D1 = $D1.Substring(0, $Half - 7) + "..." }
