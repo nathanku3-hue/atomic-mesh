@@ -2,8 +2,9 @@
 
 **Priority:** P2
 **Type:** UX Enhancement
-**Status:** PENDING
+**Status:** IMPLEMENTED
 **Created:** 2025-12-14
+**Completed:** 2025-12-14
 **Milestone:** Post v16.1.0
 
 ---
