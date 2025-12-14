@@ -6249,12 +6249,11 @@ function Draw-Dashboard {
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
-        # v16.1.2: Render right panel as centered unit with equal top/bottom gaps (gap1 = gap2)
-        # This creates balanced vertical centering of the content block
+        # v16.1.2: Render right panel with Context Ready aligned to BACKEND row
+        # First line at same Y as BACKEND, then pipeline content centered below
         $RightWidth = $Half - 4  # Content width inside borders
         $rightStartRow = $R
         $rightEndRow = $Global:TopRegionBottom - 1  # Leave room for bottom border
-        $rightAvailable = $rightEndRow - $rightStartRow
 
         # Prepare content lines
         $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
@@ -6266,51 +6265,12 @@ function Draw-Dashboard {
                        elseif ($IsBootstrap) { "Edit PRD/SPEC | /add" }
                        else { "/refresh-plan | /draft-plan" }
 
-        # v16.1.2: Combine Context Ready + hints into single line (Change 3)
+        # v16.1.3: Combine Context Ready + hints into single line
         $topLine = "$nextFocusTxt  $actionHints"
 
         # Build pipeline data
         $pipelineData = Build-PipelineStatus
         Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
-
-        # Build content lines array with colors (now 3 lines instead of 4)
-        $contentLines = @(
-            @{ Text = $topLine; Color = $nextFocusColor }
-        )
-
-        # Add pipeline arrow line
-        $stateColors = @{ "GREEN" = "Green"; "YELLOW" = "Yellow"; "RED" = "Red"; "GRAY" = "DarkGray" }
-        $arrowLine = ""
-        for ($i = 0; $i -lt $pipelineData.stages.Count; $i++) {
-            $stage = $pipelineData.stages[$i]
-            $shortName = switch ($stage.name) {
-                "Context"  { "Ctx" }
-                "Plan"     { "Pln" }
-                "Work"     { "Wrk" }
-                "Optimize" { "Opt" }
-                "Verify"   { "Ver" }
-                "Ship"     { "Shp" }
-                default    { $stage.name.Substring(0, 3) }
-            }
-            $arrowLine += "[$shortName]"
-            if ($i -lt $pipelineData.stages.Count - 1) {
-                $arrowLine += [char]0x2192
-            }
-        }
-        # Store arrow line with stage colors for special rendering
-        $contentLines += @{ Text = "__ARROW__"; Color = "Special"; ArrowData = $pipelineData.stages }
-
-        # Add Next line
-        $suggestedCmd = $pipelineData.suggested_next.command
-        $nextText = if ($suggestedCmd) { $suggestedCmd } else { $pipelineData.immediate_next }
-        $contentLines += @{ Text = "Next: $nextText"; Color = "NextLine" }
-
-        # Calculate equal gaps: gap1 = gap2 (or gap2 = gap1 + 1 if odd)
-        $N = $contentLines.Count
-        $totalGap = $rightAvailable - $N
-        if ($totalGap -lt 0) { $totalGap = 0 }
-        $gap1 = [Math]::Floor($totalGap / 2)
-        $gap2 = $totalGap - $gap1  # gap2 >= gap1
 
         # Helper to draw a right panel line
         function Draw-RightLine {
@@ -6325,17 +6285,35 @@ function Draw-Dashboard {
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
-        # Render right panel: gap1 blank rows, then content, then gap2 blank rows
-        $rightRow = $rightStartRow
+        # v16.1.3: Render "Context Ready..." at same row as BACKEND (row $R)
+        Draw-RightLine $R $topLine $nextFocusColor
+        $rightRow = $R + 1  # Pipeline content starts on next row
 
-        # Gap1: top padding
+        # Build remaining content lines (pipeline arrow + Next)
+        $stateColors = @{ "GREEN" = "Green"; "YELLOW" = "Yellow"; "RED" = "Red"; "GRAY" = "DarkGray" }
+        $pipelineLines = @(
+            @{ Text = "__ARROW__"; Color = "Special"; ArrowData = $pipelineData.stages }
+        )
+        $suggestedCmd = $pipelineData.suggested_next.command
+        $nextText = if ($suggestedCmd) { $suggestedCmd } else { $pipelineData.immediate_next }
+        $pipelineLines += @{ Text = "Next: $nextText"; Color = "NextLine" }
+
+        # Calculate gaps for remaining content (pipeline arrow + Next)
+        $remainingAvailable = $rightEndRow - $rightRow
+        $N = $pipelineLines.Count
+        $totalGap = $remainingAvailable - $N
+        if ($totalGap -lt 0) { $totalGap = 0 }
+        $gap1 = [Math]::Floor($totalGap / 2)
+        $gap2 = $totalGap - $gap1
+
+        # Gap1: top padding for pipeline content
         for ($i = 0; $i -lt $gap1; $i++) {
             Draw-RightLine $rightRow "" "DarkGray"
             $rightRow++
         }
 
-        # Content lines
-        foreach ($line in $contentLines) {
+        # Pipeline content lines
+        foreach ($line in $pipelineLines) {
             if ($line.Text -eq "__ARROW__") {
                 # Special rendering for arrow line with colored stages
                 Set-Pos $rightRow $Half
@@ -6491,13 +6469,13 @@ function Draw-Dashboard {
         }
 
         if ($logLines.Count -gt 0) {
-            # Has logs: show compact count header then log lines
-            Print-LeftOnly -Row $R -Text "Audit: $($logLines.Count)" -HalfWidth $Half -Color "DarkGray"
+            # Has logs: show compact count header then log lines (bright color = actionable)
+            Print-LeftOnly -Row $R -Text "Audit: $($logLines.Count)" -HalfWidth $Half -Color "White"
             $R++
             # Show log lines
             foreach ($line in $logLines) {
                 $displayLine = "  " + $line
-                Print-LeftOnly -Row $R -Text $displayLine -HalfWidth $Half -Color "DarkGray"
+                Print-LeftOnly -Row $R -Text $displayLine -HalfWidth $Half -Color "Gray"
                 $R++
             }
             # Fill remaining rows
@@ -6506,7 +6484,7 @@ function Draw-Dashboard {
                 $R++
             }
         } else {
-            # No logs: compact single line, no big header
+            # No logs: compact single line, dim (quiet state)
             Print-LeftOnly -Row $R -Text "Audit: (no logs)" -HalfWidth $Half -Color "DarkGray"
             $R++
             # Fill remaining rows (compact, no extra frames)
