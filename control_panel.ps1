@@ -6263,7 +6263,7 @@ function Draw-Dashboard {
         # First line at same Y as BACKEND, then pipeline content centered below
         $RightWidth = $Half - 4  # Content width inside borders
         $rightStartRow = $R
-        $rightEndRow = $Global:TopRegionBottom - 1  # Leave room for bottom border
+        $rightEndRow = $Global:TopRegionBottom  # Content fills to border row
 
         # Prepare content lines
         $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
