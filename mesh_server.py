@@ -974,10 +974,10 @@ def get_cached_plan_preview() -> str:
         age_hours = (time.time() - generated_at) / 3600
         
         if age_hours > 24:
-            data["status"] = "STALE"
+            data["status"] = "STALE"  # SAFETY-ALLOW: status-write (plan cache freshness, not task status)
             data["reason"] = f"Plan is {int(age_hours)} hours old. Consider /refresh-plan."
         else:
-            data["status"] = "FRESH"
+            data["status"] = "FRESH"  # SAFETY-ALLOW: status-write (plan cache freshness, not task status)
         
         return json.dumps(data)
     except Exception as e:
@@ -1563,12 +1563,12 @@ def accept_plan(path: str) -> str:
                     idx += 1
                 task_id = f"T-{prefix}{idx}"
                 
-                # Create task
+                # Create task (initial creation, not mutation)
                 tasks[task_id] = {
                     "id": task_id,
                     "type": task_type,
                     "desc": desc,
-                    "status": "pending",
+                    "status": "pending",  # SAFETY-ALLOW: status-write (initial task creation)
                     "priority": 1,
                     "created_at": int(time.time()),
                     "source": os.path.basename(path)

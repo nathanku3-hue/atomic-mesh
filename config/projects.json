@@ -1,26 +1,40 @@
 [
     {
-        "id": 1,
-        "name": "Atomic Mesh (Core)",
-        "path": "E:\\Code\\atomic-mesh",
-        "db": "mesh.db"
+        "id":  1,
+        "name":  "Atomic Mesh (Core)",
+        "path":  "E:\\Code\\atomic-mesh",
+        "db":  "mesh.db"
     },
     {
-        "id": 2,
-        "name": "OpenStock-v2",
-        "path": "E:\\Finance\\openstock-v2",
-        "db": "mesh.db"
+        "id":  2,
+        "name":  "OpenStock-v2",
+        "path":  "E:\\Finance\\openstock-v2",
+        "db":  "mesh.db"
     },
     {
-        "id": 3,
-        "name": "Docs Site",
-        "path": "E:\\Sites\\docs",
-        "db": "mesh.db"
+        "id":  3,
+        "name":  "Docs Site",
+        "path":  "E:\\Sites\\docs",
+        "db":  "mesh.db"
     },
     {
-        "id": 4,
-        "name": "Personal Projects",
-        "path": "E:\\Code\\personal",
-        "db": "mesh.db"
+        "id":  4,
+        "name":  "Personal Projects",
+        "path":  "E:\\Code\\personal",
+        "db":  "mesh.db"
+    },
+    {
+        "db":  "mesh.db",
+        "path":  "E:\\code\\test",
+        "name":  "test",
+        "id":  5,
+        "profile":  "general"
+    },
+    {
+        "db":  "mesh.db",
+        "path":  "C:\\Users\\Lenovo",
+        "name":  "Lenovo",
+        "id":  6,
+        "profile":  "general"
     }
 ]

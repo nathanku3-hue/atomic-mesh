@@ -180,4 +180,14 @@ Before marking a task complete:
 
 ---
 
+## Optional Drift Reducer: Snippets
+
+If you need a common utility, search `/snippets <keyword>` first.
+
+Before writing a generic helper, run `/dupcheck <file>` (optional).
+
+**Recommended, not required.**
+
+---
+
 _v14.1 Atomic Mesh - The Builder (Done-Done Closeout)_

@@ -275,8 +275,8 @@ Warnings from `snippet_duplicate_check` suggest you may want to reuse an existin
 
 **Slash commands:**
 ```
-/snippets <kw> [--lang ...] [--tags ...]
-/dupcheck <path>
+/snippets retry --lang python
+/snippets --tags resilience,retry
 ```
 
 Advisory only; no auto-insert; no shipping gates.

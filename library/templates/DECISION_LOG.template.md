@@ -1,41 +1,24 @@
+<!-- ATOMIC_MESH_TEMPLATE_STUB -->
 # Decision Log: {{PROJECT_NAME}}
 
-> This document captures all major technical and product decisions.
-> The Router automatically appends here. Never delete entries.
-
----
-
-## How to Use
-
-1. **Router/Commander** appends decisions automatically via `append_decision()` MCP tool
-2. **Workers** can reference past decisions to avoid re-litigation
-3. **Auditor** uses this to verify consistency
-
----
-
-## Decision Format
-
-| ID | Date | Decision | Context | Status |
-|----|------|----------|---------|--------|
-| *Auto* | *YYYY-MM-DD* | *What was decided* | *Why it was decided* | ✅/🔄/❌ |
-
-**Status Legend:**
-- ✅ Active - Decision is in effect
-- 🔄 Superseded - Replaced by newer decision
-- ❌ Reverted - Decision was rolled back
+**Owner**: {{AUTHOR}} | **Date**: {{DATE}} | **Status**: Active
+**Rule:** This file is append-only. Never delete rows. Supersede instead.
 
 ---
 
 ## Records
 
-| ID | Date | Decision | Context | Status |
-|----|------|----------|---------|--------|
-| 001 | {{DATE}} | Project initialized | Bootstrap via Atomic Mesh /init | ✅ |
+| ID | Date | Type | Decision | Rationale | Scope | Task | Status |
+|----|------|------|----------|-----------|-------|------|--------|
+| 001 | {{DATE}} | INIT | Project initialized | Bootstrap via /init | repo | — | ✅ |
 
-<!-- Router appends decisions below -->
+<!-- ATOMIC_MESH_APPEND_DECISIONS_BELOW -->
 
 ---
 
-**Legend**: ✅ Active | 🔄 Superseded | ❌ Reverted
+**Status Legend:** ✅ Active | 🔄 Superseded | ❌ Reverted
+**Type Examples:** INIT, SCOPE, ARCH, API, DATA, SECURITY, UX, PERF, OPS, TEST, RELEASE
 
-*Template version: 13.6*
+## Notes (Optional, Human)
+- Prefer short rationale in the table. If long, add a link to a decision packet in `docs/DECISIONS/`.
+- When superseding: add a new row with `Type=...` and set the old row to 🔄 (do not delete).

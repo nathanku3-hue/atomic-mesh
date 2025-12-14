@@ -344,36 +344,45 @@ async def run_product_sync_async(task_desc: str, qa_status: str, files_changed: 
 import shutil
 import glob
 
-async def ingest_inbox(llm_client=None) -> str:
+async def ingest_inbox(llm_client=None, inbox_content: str = "") -> str:
     """
     Compiles Raw PRDs/Notes into the Strict Spec.
     Moves processed files to archive.
-    
+
     Args:
         llm_client: Optional LLM client for AI compilation (if None, uses rule-based extraction)
-        
+        inbox_content: v15.1 - Optional pre-extracted content from docs/INBOX.md
+
     Returns:
         Status message describing what was processed
     """
     root = os.getcwd()
     inbox_path = os.path.join(root, "docs", "inbox")
     archive_path = os.path.join(root, "docs", "archive")
-    
+
     # Ensure paths exist
     os.makedirs(inbox_path, exist_ok=True)
     os.makedirs(archive_path, exist_ok=True)
-    
+
     # 1. SCAN INBOX
-    files = [f for f in os.listdir(inbox_path) 
+    files = [f for f in os.listdir(inbox_path)
              if os.path.isfile(os.path.join(inbox_path, f)) and not f.startswith(".")]
-    
-    if not files:
-        return "📭 Inbox is empty. Drop files in `docs/inbox/` first."
-    
+
+    # v15.1: Allow processing if we have INBOX.md content even without folder files
+    has_inbox_content = bool(inbox_content and inbox_content.strip())
+
+    if not files and not has_inbox_content:
+        return "📭 Inbox is empty. Drop files in `docs/inbox/` or add notes to `docs/INBOX.md`."
+
     print(f"📥 PO: Found {len(files)} raw documents. Compiling...")
-    
+
     # 2. READ RAW CONTEXT
     raw_context = ""
+
+    # v15.1: Prepend INBOX.md content if provided
+    if has_inbox_content:
+        raw_context += f"\n--- SOURCE: INBOX.md (ephemeral notes) ---\n{inbox_content}\n"
+
     for filename in files:
         filepath = os.path.join(inbox_path, filename)
         try:

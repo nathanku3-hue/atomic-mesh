@@ -1,7 +1,32 @@
 # Tech Stack: {{PROJECT_NAME}}
+<!-- ATOMIC_MESH_TEMPLATE_STUB -->
 
 > This document is the **contract** for what tools/libraries Workers can use.
 > If it's not listed here, Workers should ASK before importing.
+
+---
+
+## Auto-Flight Contract (Machine Hints)
+
+- Stack ID: STACK_WEB_FASTAPI_NEXT
+- Primary Backend: Python + FastAPI
+- Primary Frontend: Next.js + TypeScript
+- Default Test Tools: pytest, Playwright
+- Default Lint/Format: Ruff/Black, ESLint/Prettier
+
+### Codegen Targets (where files go)
+- Backend root: backend/
+- Backend app entry: backend/app/main.py
+- Backend tests: backend/tests/
+- Frontend root: frontend/
+- Frontend app: frontend/app/
+- Frontend tests: frontend/tests/
+- E2E tests: e2e/
+
+### Dependency Policy (Enforcement)
+- If a dependency is **not listed** as Approved, Worker must:
+  1) Ask (preferred), or
+  2) Use `CAPTAIN_OVERRIDE: STACK` in the review notes with justification.
 
 ---
 

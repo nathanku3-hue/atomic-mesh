@@ -130,7 +130,12 @@ def run_golden_thread_smoke():
                 override_justification TEXT,
                 review_decision TEXT,
                 review_notes TEXT,
-                updated_at INTEGER
+                updated_at INTEGER,
+                risk TEXT DEFAULT 'LOW',
+                qa_status TEXT,
+                files_changed TEXT,
+                test_result TEXT,
+                output TEXT
             )
         """)
         conn.execute(f"""
@@ -151,7 +156,12 @@ def run_golden_thread_smoke():
             json.dump(packet, f)
 
         # THE CRITICAL TEST: Submit through Gavel
-        result = mesh_server.submit_review_decision(task_id, "APPROVE", "CI Auto", actor="AUTO")
+        # Note: Entropy proof required by optimization gate (v14.0)
+        result = mesh_server.submit_review_decision(
+            task_id, "APPROVE",
+            "Entropy Check: Passed. CI Auto verification.",
+            actor="AUTO"
+        )
         result_dict = json.loads(result)
 
         if result_dict.get("status") == "SUCCESS":

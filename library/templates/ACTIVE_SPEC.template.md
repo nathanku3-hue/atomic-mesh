@@ -1,66 +1,94 @@
+<!-- ATOMIC_MESH_TEMPLATE_STUB -->
 # ACTIVE SPECIFICATION: {{PROJECT_NAME}}
 
+> **Purpose:** Execution snapshot for the current batch.
+> **Derived from:** PRD.md + SPEC.md (+ Decision Log if present).
+> **Rule:** Workers follow ACTIVE_SPEC first. Planners follow SPEC first.
+> **Updated:** {{DATE}}
+
+---
+
+## Current Batch Focus
+- Mode: DELIVERY | HARDENING | REFACTOR
+- Priority order: correctness > speed > elegance
+- Non-negotiables:
+  - Tests required (scaffold-first where applicable)
+  - No silent scope creep (update PRD/SPEC + log decision)
+  - Keep CLI stable (no breaking commands without explicit decision)
+
+---
+
 ## Core Objective
-<!-- One sentence describing the product value proposition -->
-> Example: "Enable users to track investment opportunities with AI-powered insights."
+<!-- One sentence that describes product value in plain language -->
+- Objective: {{CORE_OBJECTIVE}}
 
 ---
 
-## User Stories (Scope)
+## In Scope
+### Goals (from PRD)
+<!-- Hydrated list -->
+- [ ] {{GOAL_1}}
+- [ ] {{GOAL_2}}
 
-### MVP (v1.0)
-- [ ] As a **user**, I can sign up/login via email
-- [ ] As a **user**, I can view my dashboard
-- [ ] As an **admin**, I can manage users
-
-### Future (v2.0+)
-- [ ] As a user, I can export data
-- [ ] As a user, I can integrate with third-party services
+### User Stories (from PRD)
+<!-- Hydrated list -->
+- [ ] {{STORY_1}}
+- [ ] {{STORY_2}}
 
 ---
 
-## Non-Functional Requirements (Constraints)
-
+## Non-Functional Requirements
+<!-- Hydrated summary from PRD/SPEC -->
 | Requirement | Target | Notes |
-|-------------|--------|-------|
-| Response Time | < 200ms | P95 latency |
-| Uptime | 99.9% | Production |
-| Test Coverage | > 80% | Unit + Integration |
+|---|---:|---|
+| Response Time | {{P95_LATENCY}} | P95 |
+| Uptime | {{UPTIME}} | Production |
+| Test Coverage | {{COVERAGE}} | Unit + Integration |
 
 ---
 
-## Technical Constraints
-
-- **Database:** {{DB_TYPE}} (e.g., PostgreSQL, SQLite)
-- **Auth:** JWT-based, stateless
-- **API Style:** REST with OpenAPI spec
-
----
-
-## Out of Scope (v1.0)
-
-> Explicitly list what we are NOT building to prevent scope creep.
-
-- Mobile app (web-first)
-- Real-time websockets (polling acceptable)
-- Multi-tenancy
+## Technical Constraints (from SPEC)
+- Database: {{DB}}
+- Auth: {{AUTH}}
+- API Style: {{API_STYLE}}
+- Deployment/Runtime: {{RUNTIME}}
 
 ---
 
-## Acceptance Criteria
+## Interfaces (from SPEC)
+### API Endpoints (if provided)
+- {{ENDPOINT_1}}
+- {{ENDPOINT_2}}
 
-A feature is "Done" when:
-
-1. ✅ User story checkbox is checked
-2. ✅ Unit tests written and passing
-3. ✅ Code reviewed (Auditor approved)
-4. ✅ No critical security issues
-5. ✅ Matches TECH_STACK.md constraints
+### Data Model (if provided)
+- Entities:
+  - {{ENTITY_1}}
+  - {{ENTITY_2}}
+- Relationships:
+  - {{REL_1}}
 
 ---
 
-## Revision History
+## Out of Scope (from PRD)
+- {{OUT_1}}
+- {{OUT_2}}
 
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 0.1 | {{DATE}} | {{AUTHOR}} | Initial draft |
+---
+
+## Acceptance Criteria (Execution Gate)
+A task is "reviewable" when:
+1. ✅ Tests exist + pass
+2. ✅ Spec alignment checked (ACTIVE_SPEC)
+3. ✅ `/simplify <task-id>` run OR waiver logged
+4. ✅ No critical security issues introduced
+5. ✅ Changes respect TECH_STACK / constraints
+
+---
+
+## Provenance
+- Source: docs/PRD.md
+- Source: docs/SPEC.md (or docs/ACTIVE_SPEC.md if SPEC missing)
+- Source: docs/DECISION_LOG.md (optional)
+- Hydration: deterministic (regex/structure), no LLM required
+
+*Template version: 15.0*

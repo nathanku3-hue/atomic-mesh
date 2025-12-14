@@ -84,7 +84,7 @@ def run_smoke_test():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
-    # Create tasks table
+    # Create tasks table (v14.1: includes risk column for confidence gate)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY,
@@ -96,7 +96,12 @@ def run_smoke_test():
             override_justification TEXT,
             review_decision TEXT,
             review_notes TEXT,
-            updated_at INTEGER
+            updated_at INTEGER,
+            risk TEXT DEFAULT 'LOW',
+            qa_status TEXT,
+            files_changed TEXT,
+            test_result TEXT,
+            output TEXT
         )
     """)
 
@@ -123,7 +128,12 @@ def run_smoke_test():
 
     # 6. Submit to Gavel
     print("[6/7] Submitting to Gavel...", end=" ")
-    result = mesh_server.submit_review_decision(999, "APPROVE", "Smoke test approval", actor="HUMAN")
+    # Note: Entropy proof required by optimization gate (v14.0)
+    result = mesh_server.submit_review_decision(
+        999, "APPROVE",
+        "Entropy Check: Passed. Smoke test approval.",
+        actor="HUMAN"
+    )
     result_dict = json.loads(result)
 
     if result_dict.get("status") == "SUCCESS" and result_dict.get("decision") == "APPROVE":
