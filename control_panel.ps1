@@ -4084,6 +4084,7 @@ function Get-PrimaryBlockerLabel {
     .DESCRIPTION
         Walks stages in order: Ctx → Pln → Wrk → Opt → Ver → Shp
         Returns "OK" if all green, otherwise returns stage-based label.
+        Fail-open: never throws, returns "OK" on any error.
     .RETURNS
         String label (max 12 chars): OK, CONTEXT, PLAN MISSING, BLOCKED, etc.
     #>
@@ -4098,19 +4099,25 @@ function Get-PrimaryBlockerLabel {
             return "OK"
         }
 
+        # Guard: ensure name field exists
+        $stageName = $firstNonGreen.name
+        if (-not $stageName) {
+            return "OK"
+        }
+
         # Map stage name to <=12 char label
-        switch ($firstNonGreen.name) {
+        switch ($stageName) {
             "Context"  { return "CONTEXT" }
             "Plan"     { return "PLAN MISSING" }
             "Work"     { return "BLOCKED" }
             "Optimize" { return "OPTIMIZE" }
             "Verify"   { return "VERIFY" }
             "Ship"     { return "SHIP BLOCK" }
-            default    { return $firstNonGreen.name.ToUpper().Substring(0, [Math]::Min(12, $firstNonGreen.name.Length)) }
+            default    { return $stageName.ToUpper().Substring(0, [Math]::Min(12, $stageName.Length)) }
         }
     }
     catch {
-        return "OK"  # On error, default to OK
+        return "OK"  # Fail-open: never break the frame
     }
 }
 
