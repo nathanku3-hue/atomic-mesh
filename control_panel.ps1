@@ -6273,9 +6273,30 @@ function Draw-Dashboard {
         Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
 
+        # v16.1.1: In compact mode, start pipeline panel immediately after action hints
+        # This eliminates the large blank gap in the right panel
+        $pipelineStartRow = $R  # Remember where pipeline should start
+        if ($compactMode) {
+            # Build pipeline data now so we can render it alongside left panel
+            $pipelineData = Build-PipelineStatus
+            Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
+            # Draw pipeline starting at current row (right after action hints)
+            $pipelineEndRow = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData -Compact:$true
+            # Close pipeline panel with bottom border
+            $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
+            Set-Pos $pipelineEndRow $Half
+            Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
+            # Clear remaining right panel area (just spaces, no borders)
+            $RightClearWidth = $Half - 1
+            for ($clearRow = $pipelineEndRow + 1; $clearRow -lt $Global:TopRegionBottom; $clearRow++) {
+                Set-Pos $clearRow $Half
+                Write-Host (" " * $RightClearWidth) -NoNewline
+            }
+        }
+
         # --- ROW: QA/AUDIT ---
         Draw-StreamLine -Row $R -StreamName "QA/AUDIT" -Status $QA_Status -Half $Half
-        # Right panel: Separator (skip in compact mode)
+        # Right panel: Separator (skip in compact mode - pipeline already rendered)
         if (-not $compactMode) {
             Set-Pos $R $Half
             Write-Host "| " -NoNewline -ForegroundColor DarkGray
@@ -6286,7 +6307,7 @@ function Draw-Dashboard {
 
         # --- ROW: LIBRARIAN ---
         Draw-StreamLine -Row $R -StreamName "LIBRARIAN" -Status $LIB_Status -Half $Half
-        # Right panel: Recent decision (skip in compact mode)
+        # Right panel: Recent decision (skip in compact mode - pipeline already rendered)
         if (-not $compactMode) {
             $D1 = if ($Decisions.Count -ge 1) { "  " + ($Decisions[-1] -replace "\|", "").Trim() } else { "" }
             if ($D1.Length -gt ($Half - 4)) { $D1 = $D1.Substring(0, $Half - 7) + "..." }
@@ -6303,7 +6324,7 @@ function Draw-Dashboard {
             $R++
         }
 
-        # --- v15.1: INBOX indicator ---
+        # --- v15.1: INBOX indicator (left panel only in compact mode) ---
         $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
         $inboxStatus = "—"
         $inboxColor = "DarkGray"
@@ -6332,7 +6353,11 @@ function Draw-Dashboard {
                 $inboxStatus = "empty"
             }
         }
-        Print-Row $R "INBOX     [$inboxStatus]" "" $Half $inboxColor "DarkGray"
+        if ($compactMode) {
+            Print-LeftOnly -Row $R -Text "INBOX     [$inboxStatus]" -HalfWidth $Half -Color $inboxColor
+        } else {
+            Print-Row $R "INBOX     [$inboxStatus]" "" $Half $inboxColor "DarkGray"
+        }
         $R++
 
         # === SEPARATOR (skip in compact mode) ===
@@ -6341,7 +6366,7 @@ function Draw-Dashboard {
             $R++
         }
 
-        # === v15.2: AUTO-INGEST STATUS LINE (compact) ===
+        # === v15.2: AUTO-INGEST STATUS LINE (left panel only in compact mode) ===
         $autoIngestTxt = "Auto-ingest: "
         $autoIngestColor = "DarkGray"
         if (-not $Global:AutoIngestEnabled) {
@@ -6367,44 +6392,34 @@ function Draw-Dashboard {
             $autoIngestTxt += "armed"
         }
 
-        # === v14.1: TRANSPARENCY LINE (skip empty Scope/Opt in compact mode) ===
-        $scopeTxt = if ($Global:LastScope) { $Global:LastScope } else { "—" }
-        $optimizedIcon = if ($Global:LastOptimized) { "OK" } else { "—" }
-        $transparencyTxt = "Scope: $scopeTxt | Opt: $optimizedIcon"
-
-        # In compact mode, only show transparency if at least one value is meaningful
-        $showTransparency = $true
-        if ($compactMode -and $scopeTxt -eq "—" -and $optimizedIcon -eq "—") {
-            $showTransparency = $false
-        }
-
-        if ($showTransparency) {
-            Print-Row $R $autoIngestTxt $transparencyTxt $Half $autoIngestColor "DarkGray"
-            $R++
-        } else {
-            # Compact mode with empty transparency: just show auto-ingest on left
+        # In compact mode, just show auto-ingest on left (pipeline already on right)
+        if ($compactMode) {
             Print-LeftOnly -Row $R -Text $autoIngestTxt -HalfWidth $Half -Color $autoIngestColor
             $R++
-        }
+        } else {
+            # === v14.1: TRANSPARENCY LINE ===
+            $scopeTxt = if ($Global:LastScope) { $Global:LastScope } else { "—" }
+            $optimizedIcon = if ($Global:LastOptimized) { "OK" } else { "—" }
+            $transparencyTxt = "Scope: $scopeTxt | Opt: $optimizedIcon"
+            Print-Row $R $autoIngestTxt $transparencyTxt $Half $autoIngestColor "DarkGray"
+            $R++
 
-        # === v15.5: PIPELINE PANEL (right side) ===
-        $pipelineData = Build-PipelineStatus
-        # v16.0: Write snapshot if any stage is non-GREEN (dedupe via hash + debounce)
-        Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
-        # v16.1.1: Pass Compact flag if space is tight
-        $pipelineEndRow = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData -Compact:$compactMode
+            # === v15.5: PIPELINE PANEL (right side) - only in non-compact mode ===
+            $pipelineData = Build-PipelineStatus
+            Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
+            $pipelineEndRow = Draw-PipelinePanel -StartRow $R -HalfWidth $Half -PipelineData $pipelineData
 
-        # v16.1.1: Close right panel with bottom border after pipeline ends
-        # This prevents the "giant empty frame" appearance
-        $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
-        Set-Pos $pipelineEndRow $Half
-        Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
+            # Close right panel with bottom border after pipeline ends
+            $rightBorder = "+" + ("-" * ($Half - 2)) + "+"
+            Set-Pos $pipelineEndRow $Half
+            Write-Host $rightBorder -NoNewline -ForegroundColor DarkGray
 
-        # v16.1.1: Clear remaining right panel rows (no borders - just blank space)
-        $RightContentWidth = $Half - 1  # Full right panel area
-        for ($clearRow = $pipelineEndRow + 1; $clearRow -lt $Global:TopRegionBottom; $clearRow++) {
-            Set-Pos $clearRow $Half
-            Write-Host (" " * $RightContentWidth) -NoNewline
+            # Clear remaining right panel rows (no borders - just blank space)
+            $RightContentWidth = $Half - 1
+            for ($clearRow = $pipelineEndRow + 1; $clearRow -lt $Global:TopRegionBottom; $clearRow++) {
+                Set-Pos $clearRow $Half
+                Write-Host (" " * $RightContentWidth) -NoNewline
+            }
         }
 
         # === v16.1.1: LIVE AUDIT LOG (left panel only, expands to fill space) ===
