@@ -380,9 +380,9 @@ function Get-PickerCommands {
 function Show-Header {
     $proj = Get-ProjectMode
     $stats = Get-TaskStats
-    
+
     # Get console width - use full width
-    $width = $Host.UI.RawUI.WindowSize.Width - 1
+    $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
     
     # Build title line: Project Name (left) ... Path (right)
@@ -393,7 +393,7 @@ function Show-Header {
     }
     
     # Calculate padding
-    $padLen = $width - 6 - $ProjectName.Length - $path.Length
+    $padLen = $width - 8 - $ProjectName.Length - $path.Length
     if ($padLen -lt 1) { $padLen = 1 }
     $padding = " " * $padLen
     
@@ -412,10 +412,11 @@ function Show-Header {
     $statsStr = "$($stats.pending) pending | $($stats.in_progress) active | $($stats.completed) done"
     $healthIcon = switch ($Global:HealthStatus) { "OK" { "🟢" } "WARN" { "🟡" } "FAIL" { "🔴" } default { "⚪" } }
     $statusLine = "  $modeStr | $statsStr | $healthIcon"
-    $statusPad = $width - 3 - $statusLine.Length
+    $statusPad = $width - 2 - $statusLine.Length
     if ($statusPad -lt 0) { $statusPad = 0 }
 
-    Write-Host "|$statusLine" -NoNewline -ForegroundColor White
+    Write-Host "|" -NoNewline -ForegroundColor Cyan
+    Write-Host "$statusLine" -NoNewline -ForegroundColor White
     Write-Host (" " * $statusPad) -NoNewline
     Write-Host "|" -ForegroundColor Cyan
     
