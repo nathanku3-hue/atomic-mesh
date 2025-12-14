@@ -2,17 +2,30 @@
 
 **Priority:** P2
 **Type:** UX Hardening
-**Status:** PENDING (may be unnecessary)
+**Status:** CLOSED (Already Works)
 **Created:** 2025-12-14
+**Closed:** 2025-12-14
 **Milestone:** Post v16.1.0
 
 ---
 
-## Summary
+## Resolution
 
-Add explicit Ctrl+C double-press check in History Mode navigation loop, if it doesn't already share the main handler.
+**No implementation needed.** History Mode shares the same `Read-StableInput` function that already has Ctrl+C double-press protection.
 
-**Note:** Current analysis suggests History Mode shares the same `Read-StableInput` loop which already has Ctrl+C protection. This task may be unnecessary - verify first.
+### Evidence
+
+- History Mode toggles via `__TOGGLE_HISTORY__` token returned from `Read-StableInput`
+- Navigation (F2, arrows, D/I/S/V) all happen inside `Read-StableInput` loop
+- Ctrl+C protection at `control_panel.ps1:7099-7115` applies to all ReadKey operations
+- Single Ctrl+C shows warning; double-press within 1s exits
+
+### Verification
+
+Tested manually:
+- [x] In History Mode, single Ctrl+C shows "Ctrl+C again to exit" warning
+- [x] In History Mode, double Ctrl+C within 1s exits cleanly
+- [x] Console redraws correctly after warning
 
 ---
 
