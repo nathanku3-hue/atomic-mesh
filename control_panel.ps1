@@ -384,32 +384,31 @@ function Show-Header {
     # Get console width - use full width
     $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
-    
-    # Build title line: Project Name (left) ... Path (right)
+
+    # Build title line: Path only (no project label)
     $path = $CurrentDir
-    $maxPathLen = $width - $ProjectName.Length - 15
+    $maxPathLen = $width - 4
     if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
         $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
     }
-    
-    # Calculate padding
-    $padLen = $width - 8 - $ProjectName.Length - $path.Length
+
+    # Calculate padding for path
+    $padLen = $width - 4 - $path.Length
     if ($padLen -lt 1) { $padLen = 1 }
     $padding = " " * $padLen
-    
+
     Write-Host ""
     Write-Host "+$line+" -ForegroundColor Cyan
-    
-    # Line 1: Project Name (left) ... Path (right)
+
+    # Line 1: Path only (centered or left-aligned)
     Write-Host "| " -NoNewline -ForegroundColor Cyan
-    Write-Host "[>] $ProjectName" -NoNewline -ForegroundColor Yellow
-    Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
+    Write-Host "$path$padding" -NoNewline -ForegroundColor DarkGray
     Write-Host "|" -ForegroundColor Cyan
-    
-    # Line 2: Mode, Stats, Health, and CLI Mode (v13.2: modal mode)
+
+    # Line 2: Mode, Stats (pending + active only), Health
     $modeStr = "$($proj.Icon) $($proj.Mode)"
     if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
-    $statsStr = "$($stats.pending) pending | $($stats.in_progress) active | $($stats.completed) done"
+    $statsStr = "$($stats.pending) pending | $($stats.in_progress) active"
     $healthIcon = switch ($Global:HealthStatus) { "OK" { "🟢" } "WARN" { "🟡" } "FAIL" { "🔴" } default { "⚪" } }
     $statusLine = "  $modeStr | $statsStr | $healthIcon"
     $statusPad = $width - 2 - $statusLine.Length
@@ -419,7 +418,7 @@ function Show-Header {
     Write-Host "$statusLine" -NoNewline -ForegroundColor White
     Write-Host (" " * $statusPad) -NoNewline
     Write-Host "|" -ForegroundColor Cyan
-    
+
     Write-Host "+$line+" -ForegroundColor Cyan
 }
 
@@ -6156,10 +6155,10 @@ function Draw-Dashboard {
     Set-Pos $R $Half; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
     $R++
     
-    # v9.6/v9.7/v9.8: Show Phase, Core Lock, and Task Status
-    $LeftHeader = "EXEC [$($Mode.ToUpper()) $ModeIcon] [CORE: $LockIcon]"
-    $RightHeader = "COGNITIVE$TaskStatus$MileDays"
-    Print-Row $R $LeftHeader $RightHeader $Half $ModeColor $TaskColor
+    # v16.1.4: Simplified headers (no ornaments, always enforced)
+    $LeftHeader = "EXEC"
+    $RightHeader = "COGNITIVE"
+    Print-Row $R $LeftHeader $RightHeader $Half "White" "White"
     $R++
     
     Set-Pos $R 0; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
@@ -6260,7 +6259,7 @@ function Draw-Dashboard {
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
-        # v16.1.2: Render right panel with Context Ready aligned to BACKEND row
+        # v16.1.4: Render right panel with context status aligned to BACKEND row
         # First line at same Y as BACKEND, then pipeline content centered below
         $RightWidth = $Half - 4  # Content width inside borders
         $rightStartRow = $R
@@ -6270,13 +6269,13 @@ function Draw-Dashboard {
         $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
         $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
                         elseif ($IsBootstrap) { "NEXT FOCUS: CONTEXT" }
-                        else { "Context Ready" }
+                        else { "Context: Ready" }
         $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsBootstrap) { "Yellow" } else { "Green" }
         $actionHints = if ($hasDelegation) { "/ingest | /draft-plan" }
                        elseif ($IsBootstrap) { "Edit PRD/SPEC | /add" }
                        else { "/refresh-plan | /draft-plan" }
 
-        # v16.1.3: Combine Context Ready + hints into single line
+        # v16.1.4: Context status + hints on single line
         $topLine = "$nextFocusTxt  $actionHints"
 
         # Build pipeline data
@@ -6296,7 +6295,7 @@ function Draw-Dashboard {
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
-        # v16.1.3: Render "Context Ready..." at same row as BACKEND (row $R)
+        # v16.1.4: Render context status at same row as BACKEND (row $R)
         Draw-RightLine $R $topLine $nextFocusColor
         $rightRow = $R + 1  # Pipeline content starts on next row
 
