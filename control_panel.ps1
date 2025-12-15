@@ -203,6 +203,18 @@ function Get-TaskStats {
     return $result
 }
 
+# v17.2: Lane-aware counts for header (counts distinct lanes, not tasks)
+# Prefers lane column, falls back to type if lane is empty/null
+function Get-LaneActivityCounts {
+    $laneExpr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+    $pendingLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) = 'pending'" -Silent
+    $activeLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) = 'in_progress'" -Silent
+    return @{
+        pendingLaneCount = if ($pendingLanes -and $pendingLanes.c) { $pendingLanes.c } else { 0 }
+        activeLaneCount = if ($activeLanes -and $activeLanes.c) { $activeLanes.c } else { 0 }
+    }
+}
+
 function Resolve-HealthColor {
     param([string]$Health)
     switch ($Health) {
@@ -380,11 +392,18 @@ function Get-PickerCommands {
 function Show-Header {
     $proj = Get-ProjectMode
     $stats = Get-TaskStats
+feat/v17.2-lane-counts
+    $laneCounts = Get-LaneActivityCounts  # v17.2: Lane counts for pending/active
+=======
+main
 
     # Get console width - use full width
     $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
 
+feat/v17.2-lane-counts
+    # Build title line: Project Name (left) ... Path (right)
+=======
     Write-Host ""
     Write-Host "+$line+" -ForegroundColor Cyan
 
@@ -404,19 +423,51 @@ function Show-Header {
     Write-Host " |" -ForegroundColor Cyan
 
     # Line 2: Path (right-aligned)
+main
     $path = $CurrentDir
     $maxPathLen = $width - 4
     if ($path.Length -gt $maxPathLen -and $maxPathLen -gt 10) {
         $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
     }
+feat/v17.2-lane-counts
+
+    # Calculate padding
+    $padLen = $width - 6 - $ProjectName.Length - $path.Length
+    if ($padLen -lt 1) { $padLen = 1 }
+    $padding = " " * $padLen
+
+    Write-Host ""
+    Write-Host "+$line+" -ForegroundColor Cyan
+
+    # Line 1: Project Name (left) ... Path (right)
+=======
     $padLen = $width - 4 - $path.Length
     if ($padLen -lt 0) { $padLen = 0 }
     $padding = " " * $padLen
 
+main
     Write-Host "| " -NoNewline -ForegroundColor Cyan
     Write-Host "$padding$path " -NoNewline -ForegroundColor DarkGray
     Write-Host "|" -ForegroundColor Cyan
+feat/v17.2-lane-counts
 
+    # Line 2: Mode, Stats, Health, and CLI Mode (v13.2: modal mode)
+    # v17.2: pending/active now show lane counts (not task counts)
+    $modeStr = "$($proj.Icon) $($proj.Mode)"
+    if ($null -ne $proj.Days) { $modeStr += " ($($proj.Days)d)" }
+    $statsStr = "$($laneCounts.pendingLaneCount) pending | $($laneCounts.activeLaneCount) active | $($stats.completed) done"
+    $healthIcon = switch ($Global:HealthStatus) { "OK" { "🟢" } "WARN" { "🟡" } "FAIL" { "🔴" } default { "⚪" } }
+    $statusLine = "  $modeStr | $statsStr | $healthIcon"
+    $statusPad = $width - 3 - $statusLine.Length
+    if ($statusPad -lt 0) { $statusPad = 0 }
+
+    Write-Host "|$statusLine" -NoNewline -ForegroundColor White
+    Write-Host (" " * $statusPad) -NoNewline
+    Write-Host "|" -ForegroundColor Cyan
+
+=======
+
+main
     Write-Host "+$line+" -ForegroundColor Cyan
 }
 
