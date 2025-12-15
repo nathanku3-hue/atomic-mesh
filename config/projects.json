@@ -36,5 +36,12 @@
         "name":  "Lenovo",
         "id":  6,
         "profile":  "general"
+    },
+    {
+        "db":  "mesh.db",
+        "path":  "E:\\Code\\mesh-test-scratch",
+        "name":  "mesh-test-scratch",
+        "id":  7,
+        "profile":  "python_backend"
     }
 ]
