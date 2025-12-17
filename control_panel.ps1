@@ -3070,39 +3070,46 @@ print(consult_standard('$cmdArgs', '$profile'))
         }
 
         "draft-plan" {
-            # v19.9: Silent operation - no clearing needed, just redraw footer/input
+            # v19.11: Bulletproof silent operation using .NET directly
             $draftPath = $null
 
-            # v18.4: Single-draft protection - if draft exists, use it instead of creating new
-            $existingDraft = Get-LatestDraftPlan
-            if ($existingDraft) {
-                $draftPath = $existingDraft
-            } else {
-                # Create new draft
-                try {
-                    $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())" 2>&1
-                    $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
-                    $response = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "draft_plan"
+            # Check for existing draft
+            try { $draftPath = Get-LatestDraftPlan } catch { }
 
+            # Create new draft if none exists
+            if (-not $draftPath) {
+                try {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "python"
+                    $psi.Arguments = "-c `"import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())`""
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    $rawResult = $proc.StandardOutput.ReadToEnd()
+                    $proc.WaitForExit()
+
+                    $response = ConvertFrom-SafeJson -RawOutput $rawResult -CommandName "draft_plan"
                     if (-not $response._parseError -and $response.status -eq "OK") {
                         $draftPath = $response.path
                     }
-                }
-                catch { }
+                } catch { }
             }
 
-            # Open draft in editor
+            # Open in editor using cmd /c start (silent and reliable)
             if ($draftPath) {
-                $vsCodeCmd = Get-Command code -ErrorAction SilentlyContinue
-                if ($vsCodeCmd) {
-                    & code $draftPath 2>$null
-                } else {
-                    Start-Process $draftPath
-                }
+                try {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "cmd.exe"
+                    $psi.Arguments = "/c start `"`" `"code`" `"$draftPath`""
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    [void][System.Diagnostics.Process]::Start($psi)
+                } catch { }
             }
 
-            Redraw-PromptRegion  # No -AboveFooter, preserves dashboard
-            # Show hint below input bar
+            Redraw-PromptRegion
             if ($draftPath) {
                 Set-Pos ($Global:RowInput + 2) 2
                 Write-Host "Draft: $draftPath" -ForegroundColor White -NoNewline
