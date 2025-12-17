@@ -3651,8 +3651,10 @@ print(consult_standard('$cmdArgs', '$profile'))
         }
 
         "draft-plan" {
-            # v19.11: Bulletproof silent operation using .NET directly
+            # v20.0: Fixed silent failure - now displays result to user
             $draftPath = $null
+            $response = $null
+            $errorMessage = $null
 
             # Check for existing draft
             try { $draftPath = Get-LatestDraftPlan } catch { }
@@ -3674,10 +3676,33 @@ print(consult_standard('$cmdArgs', '$profile'))
                     $proc.WaitForExit()
 
                     $response = ConvertFrom-SafeJson -RawOutput $rawResult -CommandName "draft_plan"
-                    if (-not $response._parseError -and $response.status -eq "OK") {
-                        $draftPath = $response.path
+
+                    # v20.0: Handle response status explicitly
+                    if ($response -and -not $response._parseError) {
+                        switch ($response.status) {
+                            "OK" {
+                                $draftPath = $response.path
+                            }
+                            "BLOCKED" {
+                                $errorMessage = "BLOCKED: $($response.message)"
+                                if ($response.blocking_files) {
+                                    $errorMessage += " Missing: $($response.blocking_files -join ', ')"
+                                }
+                            }
+                            "ERROR" {
+                                $errorMessage = "Error: $($response.message)"
+                            }
+                            default {
+                                $errorMessage = "Unexpected: $($response.status)"
+                            }
+                        }
                     }
-                } catch { }
+                    elseif ($response -and $response._parseError) {
+                        $errorMessage = "Parse error: $($response._cause)"
+                    }
+                } catch {
+                    $errorMessage = "Exception: $_"
+                }
             }
 
             # Open in editor (silent, fully detached to prevent log leaks)
@@ -3711,9 +3736,11 @@ print(consult_standard('$cmdArgs', '$profile'))
             Redraw-PromptRegion
             Set-Pos ($Global:RowInput + 2) 2
             if ($draftPath) {
-                Write-Host "Draft: $draftPath" -ForegroundColor White -NoNewline
+                Write-Host "Draft: $draftPath" -ForegroundColor Green -NoNewline
+            } elseif ($errorMessage) {
+                Write-Host "  $errorMessage" -ForegroundColor Red -NoNewline
             } else {
-                Write-Host "Draft: failed (check mesh_server.py)" -ForegroundColor Red -NoNewline
+                Write-Host "  Draft: failed (unknown error)" -ForegroundColor Red -NoNewline
             }
             Set-Pos $Global:RowInput ($Global:InputLeft + 4)
             # v19.11: Force Read-StableInput to redraw input bar (clears any artifacts)
@@ -9284,8 +9311,11 @@ function Test-RepoInitialized {
 
 # B1: Check if a draft plan exists in docs/PLANS/
 # Returns the path to the most recent draft, or $null if none exists
+# v20.0: Use $RepoRoot instead of $CurrentDir for consistency with mesh_server.py
 function Get-LatestDraftPlan {
-    $plansDir = Join-Path $CurrentDir "docs\PLANS"
+    # Use $RepoRoot (script directory) - same as mesh_server.py's BASE_DIR
+    $baseDir = if ($RepoRoot) { $RepoRoot } else { $CurrentDir }
+    $plansDir = Join-Path $baseDir "docs\PLANS"
     if (-not (Test-Path $plansDir)) {
         return $null
     }
