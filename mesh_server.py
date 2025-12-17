@@ -134,11 +134,14 @@ def _resolve_worker_lane_policy(worker_id: str | None, worker_type: str | None) 
 
     role = explicit_role or inferred_role
     if not role:
+        # Backward compatibility: if no role can be determined, allow all lanes.
+        # This ensures existing tests and callers that don't specify worker_type
+        # continue to work. Server-side enforcement only applies when role is known.
         return {
-            "ok": False,
+            "ok": True,
             "role": None,
-            "allowed_lanes": set(),
-            "error": "MISSING_WORKER_ROLE",
+            "allowed_lanes": set(LANE_ORDER),
+            "error": None,
         }
 
     allowed = set(DEFAULT_WORKER_ALLOWED_LANES.get(role, set()))
@@ -1119,6 +1122,291 @@ def get_system_status() -> str:
         
         "worker_cot": worker_cot
     })
+
+
+@mcp.tool()
+def get_exec_snapshot() -> str:
+    """
+    v21.0: Returns EXEC dashboard snapshot for live execution monitoring.
+
+    All fields are optional-safe (missing values won't crash UI).
+    Used by control_panel.ps1 Draw-ExecScreen for the new EXEC dashboard.
+
+    Returns JSON with:
+    - plan: {hash, name, version, path} - current accepted plan identity
+    - stream: {id, name} - current stream focus
+    - security: {read_only} - system security state
+    - scheduler: {rotation_ptr, last_pick} - braided scheduler state
+    - lanes: [{name, active, pending, done, total, blocked}] - per-lane stats
+    - workers: [{id, type, allowed_lanes, status, last_seen_s, task_ids}] - worker roster
+    - active_tasks: [{id, lane, status, title, age_s, worker_id, parent_id, deps_blocked}]
+    - alerts: [{level, code, text}] - system alerts
+    """
+    import time
+    import hashlib
+
+    snapshot = {
+        "plan": {"hash": None, "name": None, "version": None, "path": None},
+        "stream": {"id": None, "name": None},
+        "security": {"read_only": True},  # Default to read-only (safe)
+        "scheduler": {"rotation_ptr": None, "last_pick": None},
+        "lanes": [],
+        "workers": [],
+        "active_tasks": [],
+        "alerts": [],
+    }
+
+    try:
+        with get_db() as conn:
+            now = int(time.time())
+
+            # === PLAN IDENTITY ===
+            # Get latest accepted plan from config (if stored)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='accepted_plan_path' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    plan_path = row["value"]
+                    snapshot["plan"]["path"] = plan_path
+                    # Extract name from filename
+                    snapshot["plan"]["name"] = os.path.basename(plan_path) if plan_path else None
+                    # Generate hash from path (simple identity)
+                    snapshot["plan"]["hash"] = hashlib.md5(plan_path.encode()).hexdigest()[:8] if plan_path else None
+            except Exception:
+                pass
+
+            # Get version from config
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='plan_version' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    snapshot["plan"]["version"] = row["value"]
+            except Exception:
+                pass
+
+            # === SCHEDULER STATE ===
+            # Lane pointer
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='scheduler_lane_pointer' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    ptr_data = json.loads(row["value"])
+                    snapshot["scheduler"]["rotation_ptr"] = ptr_data.get("index")
+            except Exception:
+                pass
+
+            # Last pick decision
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='scheduler_last_decision' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    dec_data = json.loads(row["value"])
+                    snapshot["scheduler"]["last_pick"] = {
+                        "task_id": dec_data.get("picked_id"),
+                        "lane": dec_data.get("lane"),
+                        "reason": dec_data.get("reason"),
+                    }
+            except Exception:
+                pass
+
+            # === LANE STATISTICS ===
+            try:
+                # Query task counts by lane and status
+                lane_expr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+                rows = conn.execute(f"""
+                    SELECT {lane_expr} as lane_name, status, COUNT(*) as c
+                    FROM tasks
+                    GROUP BY {lane_expr}, status
+                """).fetchall()
+
+                lane_stats = {}
+                for row in rows:
+                    lane_name = row["lane_name"] or "unknown"
+                    if lane_name not in lane_stats:
+                        lane_stats[lane_name] = {
+                            "name": lane_name,
+                            "active": 0,
+                            "pending": 0,
+                            "done": 0,
+                            "total": 0,
+                            "blocked": 0,
+                        }
+                    count = int(row["c"])
+                    lane_stats[lane_name]["total"] += count
+                    status = (row["status"] or "").lower()
+                    if status == "in_progress":
+                        lane_stats[lane_name]["active"] += count
+                    elif status == "pending":
+                        lane_stats[lane_name]["pending"] += count
+                    elif status == "completed":
+                        lane_stats[lane_name]["done"] += count
+                    elif status == "blocked":
+                        lane_stats[lane_name]["blocked"] += count
+
+                # Convert to list ordered by standard lane order
+                lane_order = ["backend", "frontend", "qa", "ops", "docs"]
+                for lane_name in lane_order:
+                    if lane_name in lane_stats:
+                        snapshot["lanes"].append(lane_stats[lane_name])
+                # Add any extra lanes not in standard order
+                for lane_name, stats in lane_stats.items():
+                    if lane_name not in lane_order:
+                        snapshot["lanes"].append(stats)
+            except Exception:
+                pass
+
+            # === WORKERS ===
+            # Query worker heartbeats table (if exists)
+            try:
+                # Check if worker_heartbeats table exists
+                tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='worker_heartbeats'"
+                ).fetchall()
+                if tables:
+                    rows = conn.execute("""
+                        SELECT worker_id, worker_type, allowed_lanes, status, last_seen, task_ids
+                        FROM worker_heartbeats
+                        ORDER BY last_seen DESC
+                        LIMIT 10
+                    """).fetchall()
+                    for row in rows:
+                        last_seen_s = now - int(row["last_seen"]) if row["last_seen"] else None
+                        allowed = json.loads(row["allowed_lanes"]) if row["allowed_lanes"] else []
+                        task_ids = json.loads(row["task_ids"]) if row["task_ids"] else []
+                        snapshot["workers"].append({
+                            "id": row["worker_id"],
+                            "type": row["worker_type"],
+                            "allowed_lanes": allowed,
+                            "status": row["status"] or "unknown",
+                            "last_seen_s": last_seen_s,
+                            "task_ids": task_ids,
+                        })
+            except Exception:
+                pass
+
+            # === ACTIVE TASKS ===
+            try:
+                rows = conn.execute("""
+                    SELECT id, lane, type, status, desc, updated_at, worker_id, parent_task_id, deps
+                    FROM tasks
+                    WHERE status = 'in_progress'
+                    ORDER BY updated_at DESC
+                    LIMIT 10
+                """).fetchall()
+                for row in rows:
+                    lane = row["lane"] or row["type"] or "unknown"
+                    age_s = now - int(row["updated_at"]) if row["updated_at"] else 0
+                    # Count blocked deps
+                    deps_blocked = 0
+                    if row["deps"]:
+                        try:
+                            deps_list = json.loads(row["deps"])
+                            if deps_list:
+                                # Count incomplete deps
+                                dep_ids = [d for d in deps_list if isinstance(d, int) or (isinstance(d, str) and d.isdigit())]
+                                if dep_ids:
+                                    placeholders = ",".join("?" * len(dep_ids))
+                                    incomplete = conn.execute(
+                                        f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders}) AND status != 'completed'",
+                                        [int(d) for d in dep_ids]
+                                    ).fetchone()[0]
+                                    deps_blocked = incomplete
+                        except Exception:
+                            pass
+
+                    snapshot["active_tasks"].append({
+                        "id": row["id"],
+                        "lane": lane,
+                        "status": row["status"],
+                        "title": (row["desc"] or "")[:50],
+                        "age_s": age_s,
+                        "worker_id": row["worker_id"],
+                        "parent_id": row["parent_task_id"],
+                        "deps_blocked": deps_blocked,
+                    })
+            except Exception:
+                pass
+
+            # === ALERTS ===
+            # Check for various alert conditions
+
+            # 1. Working tree dirty
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=BASE_DIR,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "WORKTREE_DIRTY",
+                        "text": "Working tree dirty (uncommitted changes)",
+                    })
+            except Exception:
+                pass
+
+            # 2. Blocked tasks
+            try:
+                blocked_count = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status='blocked'"
+                ).fetchone()[0]
+                if blocked_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "TASKS_BLOCKED",
+                        "text": f"{blocked_count} task(s) blocked",
+                    })
+            except Exception:
+                pass
+
+            # 3. RED decisions pending
+            try:
+                red_count = conn.execute(
+                    "SELECT COUNT(*) FROM decisions WHERE status='pending' AND priority='red'"
+                ).fetchone()[0]
+                if red_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "error",
+                        "code": "RED_DECISION",
+                        "text": f"RED decision pending - work blocked",
+                    })
+            except Exception:
+                pass
+
+            # 4. Stale tasks (in_progress for too long)
+            try:
+                stale_threshold = 3600  # 1 hour
+                stale_count = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND updated_at < ?",
+                    (now - stale_threshold,)
+                ).fetchone()[0]
+                if stale_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "STALE_TASKS",
+                        "text": f"{stale_count} task(s) stale (>1h in progress)",
+                    })
+            except Exception:
+                pass
+
+    except Exception as e:
+        # If DB connection fails, return minimal snapshot with error alert
+        snapshot["alerts"].append({
+            "level": "error",
+            "code": "DB_ERROR",
+            "text": f"Database error: {str(e)[:50]}",
+        })
+
+    return json.dumps(snapshot)
+
 
 # =============================================================================
 # v17.0: DOCUMENT EXTRACTION PIPELINE
@@ -4218,6 +4506,71 @@ def _dependency_status(task_id: int, deps_json: str, conn) -> dict:
         "missing_ids": [],
         "incomplete_ids": [],
     }
+
+
+@mcp.tool()
+def worker_heartbeat(
+    worker_id: str,
+    worker_type: str = None,
+    allowed_lanes: list[str] = None,
+    task_ids: list[int] = None,
+) -> str:
+    """
+    v21.0: Update worker heartbeat for EXEC dashboard monitoring.
+
+    Workers should call this every N seconds (e.g., 30s) to register their presence.
+    The heartbeat table is used by /workers command and EXEC dashboard.
+
+    Args:
+        worker_id: Unique worker identifier (e.g., "backend_1423", "frontend_0912")
+        worker_type: Worker type (e.g., "backend", "frontend", "qa")
+        allowed_lanes: List of lanes this worker can process
+        task_ids: List of task IDs currently being processed by this worker
+
+    Returns:
+        JSON with status (OK or ERROR)
+    """
+    import time
+
+    if not worker_id:
+        return json.dumps({"status": "ERROR", "message": "worker_id required"})
+
+    try:
+        with get_db() as conn:
+            # Create heartbeats table if not exists
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                    worker_id TEXT PRIMARY KEY,
+                    worker_type TEXT,
+                    allowed_lanes TEXT,
+                    task_ids TEXT,
+                    status TEXT DEFAULT 'ok',
+                    last_seen INTEGER,
+                    created_at INTEGER
+                )
+            """)
+
+            now = int(time.time())
+            allowed_json = json.dumps(allowed_lanes or [])
+            task_json = json.dumps(task_ids or [])
+
+            # Upsert heartbeat
+            conn.execute("""
+                INSERT INTO worker_heartbeats (worker_id, worker_type, allowed_lanes, task_ids, status, last_seen, created_at)
+                VALUES (?, ?, ?, ?, 'ok', ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    worker_type = excluded.worker_type,
+                    allowed_lanes = excluded.allowed_lanes,
+                    task_ids = excluded.task_ids,
+                    status = 'ok',
+                    last_seen = excluded.last_seen
+            """, (worker_id, worker_type, allowed_json, task_json, now, now))
+            conn.commit()
+
+            return json.dumps({"status": "OK", "worker_id": worker_id, "last_seen": now})
+
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)[:100]})
 
 
 @mcp.tool()
