@@ -705,5 +705,111 @@ class TestBlockedLaneHandling:
         assert result.get("lane") == "qa", f"Should advance to QA lane, got {result.get('lane')}"
 
 
+class TestAtomicClaim:
+    """Regression test for atomic task claiming (prevents double-claim)."""
+
+    def test_double_claim_prevented(self, scheduler_workspace, monkeypatch):
+        """
+        Simulate two workers trying to claim the same task.
+        Only one should succeed; the other should get a different task or NO_WORK.
+
+        This tests the atomic UPDATE ... WHERE status='pending' pattern.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided, get_db
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert exactly ONE task
+        insert_task(conn, 'backend', 'Single task for race test', priority=10, created_at=base_time)
+
+        conn.commit()
+        conn.close()
+
+        _write_lane_pointer(0, None)
+
+        # Worker 1 claims the task
+        result1 = json.loads(pick_task_braided("worker_1"))
+        assert result1.get("status") == "OK", "Worker 1 should claim the task"
+        task_id = result1.get("id")
+
+        # Worker 2 tries to claim - should get NO_WORK (task already claimed)
+        result2 = json.loads(pick_task_braided("worker_2"))
+        assert result2.get("status") == "NO_WORK", \
+            f"Worker 2 should get NO_WORK since only task was claimed, got {result2}"
+
+        # Verify task is claimed by worker_1
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        task = conn.execute("SELECT worker_id, status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+
+        assert task["worker_id"] == "worker_1", f"Task should be claimed by worker_1, got {task['worker_id']}"
+        assert task["status"] == "in_progress", f"Task should be in_progress, got {task['status']}"
+
+    def test_concurrent_claim_with_multiple_tasks(self, scheduler_workspace, monkeypatch):
+        """
+        With multiple tasks, two workers should each get a different task.
+        No task should be double-claimed.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert two tasks
+        insert_task(conn, 'backend', 'Task A', priority=10, created_at=base_time)
+        insert_task(conn, 'backend', 'Task B', priority=10, created_at=base_time+1)
+
+        conn.commit()
+        conn.close()
+
+        _write_lane_pointer(0, None)
+
+        # Two workers claim tasks
+        result1 = json.loads(pick_task_braided("worker_1"))
+        result2 = json.loads(pick_task_braided("worker_2"))
+
+        assert result1.get("status") == "OK", "Worker 1 should get a task"
+        assert result2.get("status") == "OK", "Worker 2 should get a task"
+
+        # They should have different task IDs
+        assert result1.get("id") != result2.get("id"), \
+            f"Workers should claim different tasks: {result1.get('id')} vs {result2.get('id')}"
+
+        # Verify both tasks are claimed by different workers
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        tasks = conn.execute("SELECT id, worker_id FROM tasks WHERE status='in_progress'").fetchall()
+        conn.close()
+
+        worker_ids = [t["worker_id"] for t in tasks]
+        assert len(set(worker_ids)) == 2, f"Each task should have different worker: {worker_ids}"
+        assert "worker_1" in worker_ids
+        assert "worker_2" in worker_ids
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -33,7 +33,7 @@ except ImportError:
 # =============================================================================
 # v10.18.0: VERSION CONSTANT
 # =============================================================================
-MESH_VERSION = "13.0.0"
+MESH_VERSION = "18.0.0"
 
 # FIX #3: Environment Variable for DB Path - allows isolation between environments
 # =============================================================================
@@ -52,6 +52,25 @@ DB_PATH = os.getenv("ATOMIC_MESH_DB", os.path.join(BASE_DIR, "mesh.db"))
 DB_FILE = DB_PATH
 MODE_FILE = ".mesh_mode"
 MILESTONE_FILE = ".milestone_date"
+
+# =============================================================================
+# v18.0: LANE CONSTANTS (Braided Stream Scheduler)
+# =============================================================================
+# Lower weight = higher priority. Used for default task priority by lane.
+LANE_WEIGHTS = {"backend": 10, "frontend": 20, "qa": 30, "ops": 40, "docs": 50}
+LANE_ORDER = ["backend", "frontend", "qa", "ops", "docs"]
+
+# Deferred: LANE_POINTER_FILE set after module init (needs STATE_DIR)
+# Will be: os.path.join(STATE_DIR, "scheduler_lane_pointer.json")
+LANE_POINTER_FILE = None  # Set in _get_lane_pointer_file()
+
+
+def _get_lane_pointer_file():
+    """Get lane pointer file path (deferred to avoid circular import)."""
+    global LANE_POINTER_FILE
+    if LANE_POINTER_FILE is None:
+        LANE_POINTER_FILE = os.path.join(STATE_DIR, "scheduler_lane_pointer.json")
+    return LANE_POINTER_FILE
 
 
 def get_project_root() -> str:
@@ -628,6 +647,13 @@ def init_db():
                 ("review_notes", "TEXT DEFAULT ''", "v10.12"),
                 ("risk", "TEXT DEFAULT 'LOW'", "v14.0"),
                 ("qa_status", "TEXT DEFAULT 'NONE'", "v14.0"),
+                # v18.0: Braided Stream Scheduler columns
+                ("lane", "TEXT DEFAULT ''", "v18.0"),
+                ("lane_rank", "INTEGER DEFAULT 0", "v18.0"),
+                ("created_at", "INTEGER DEFAULT 0", "v18.0"),
+                ("exec_class", "TEXT DEFAULT 'exclusive'", "v18.0"),
+                ("task_signature", "TEXT DEFAULT ''", "v18.0"),
+                ("source_plan_hash", "TEXT DEFAULT ''", "v18.0"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -1192,7 +1218,10 @@ def _extract_data_entities(spec_text: str) -> list:
 
         for match in bullet_entity_pattern.finditer(section_text):
             name = match.group(1).strip()
-            skip_words = ('key', 'note', 'field', 'type', 'input', 'output', 'description')
+            # Skip common non-entity words including Security/API section items
+            skip_words = ('key', 'note', 'field', 'type', 'input', 'output', 'description',
+                          'method', 'access', 'threat', 'isolation', 'control', 'risk',
+                          'mitigation', 'authentication', 'validation', 'endpoint', 'interface')
             if name.lower() in skip_words:
                 continue
 
@@ -1506,12 +1535,22 @@ def _generate_short_title(text: str, max_len: int = 48) -> str:
     Generate a short title (<= max_len chars) from text.
     Never truncates mid-word; adds no ellipsis.
     Returns "(untitled)" if input is empty or whitespace-only.
+    Strips markdown formatting (**bold**, __underline__, etc.)
     """
+    import re as re_mod
+
     # Guardrail: never return empty
     if not text or not text.strip():
         return "(untitled)"
 
     text = text.strip()
+
+    # Strip markdown formatting: **bold**, __underline__, *italic*, _italic_
+    text = re_mod.sub(r'\*\*([^*]+)\*\*', r'\g<1>', text)  # **bold**
+    text = re_mod.sub(r'__([^_]+)__', r'\g<1>', text)      # __underline__
+    text = re_mod.sub(r'\*([^*]+)\*', r'\g<1>', text)      # *italic*
+    text = re_mod.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\g<1>', text)  # _italic_ (word boundary)
+
     if len(text) <= max_len:
         return text
     # Find last space before max_len
@@ -1529,53 +1568,89 @@ def _generate_short_title(text: str, max_len: int = 48) -> str:
 def _generate_decision_action(dec_type: str, dec_text: str, dec_id: str) -> dict:
     """
     Generate concrete action title and DoD for a decision based on type.
+    FIX 5: DoDs are artifact-based with specific file paths, config keys, or test refs.
     Returns dict with 'title', 'dod'.
     """
     dec_type_upper = dec_type.upper()
+    dec_text_lower = dec_text.lower()
 
     # Generate short title from decision text
     short_title = _generate_short_title(dec_text, 40)
 
+    # FIX 5: Content-specific artifact-based DoDs
+    if "duckdb" in dec_text_lower or "parquet" in dec_text_lower:
+        return {
+            "title": f"Setup {short_title}",
+            "dod": "db/schema.sql exists; src/data/ingest.py loads Parquet; tests/test_ingest.py passes"
+        }
+    elif "read-only" in dec_text_lower or "read only" in dec_text_lower:
+        return {
+            "title": f"Enable {short_title}",
+            "dod": "config.read_only_mode key added; src/core/safety.py enforces; tests/test_readonly.py passes"
+        }
+    elif "merge_asof" in dec_text_lower or "pit" in dec_text_lower:
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "src/data/pit_join.py implements merge_asof; tests/test_pit.py proves no leakage"
+        }
+    elif "abc" in dec_text_lower or "protocol" in dec_text_lower or "cartridge" in dec_text_lower:
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "src/strategies/base.py defines Protocol; tests/test_strategy_contract.py passes"
+        }
+    elif "streamlit" in dec_text_lower:
+        return {
+            "title": f"Bootstrap {short_title}",
+            "dod": "app.py exists in root; streamlit run app.py shows landing page"
+        }
+
+    # Type-based artifact DoDs
     if dec_type_upper == "SECURITY" or dec_type_upper == "SEC":
         return {
             "title": f"Enable {short_title}",
-            "dod": "Config toggle added; validation check passes; docs/_mesh/SECURITY updated"
+            "dod": "config.security.* keys set; src/core/security.py enforces; tests/test_security.py passes"
         }
     elif dec_type_upper == "DATA":
         return {
             "title": f"Setup {short_title}",
-            "dod": "Schema/storage validated; sample query runs; docs/_mesh/DATA_LAYER updated"
+            "dod": "db/schema.sql updated; migrations/ contains change; tests/test_data.py passes"
         }
     elif dec_type_upper == "ARCH":
+        # Derive module name from short_title
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
         return {
             "title": f"Bootstrap {short_title}",
-            "dod": "Package installed; hello-world smoke test passes; docs/_mesh/TECH_STACK updated"
+            "dod": f"src/{module_name}/__init__.py exists; tests/test_{module_name}.py smoke passes"
         }
     elif dec_type_upper == "PERF":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
         return {
             "title": f"Optimize {short_title}",
-            "dod": "Performance baseline measured; optimization applied; benchmark documented"
+            "dod": f"benchmarks/bench_{module_name}.py shows target met; config.perf.* keys documented"
         }
     elif dec_type_upper == "API":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
         return {
             "title": f"Configure {short_title}",
-            "dod": "API pattern implemented; contract test passes; docs/_mesh/API_DESIGN updated"
+            "dod": f"docs/openapi.yaml updated; src/api/{module_name}.py exists; tests/test_api.py passes"
         }
     elif dec_type_upper == "UX":
+        # Derive module name from short_title
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
         return {
             "title": f"Implement {short_title}",
-            "dod": "UX pattern applied; visual test passes; docs/_mesh/UX_PATTERNS updated"
+            "dod": f"docs/_mesh/UX_PATTERNS.md updated; src/ui/{module_name}.py exists"
         }
     elif dec_type_upper == "ALGO":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
         return {
             "title": f"Implement {short_title}",
-            "dod": "Algorithm coded; unit test with known input/output passes"
+            "dod": f"src/algo/{module_name}.py exists; tests/test_algo.py fixture passes"
         }
     else:
-        # Generic fallback
         return {
             "title": f"Configure {short_title}",
-            "dod": f"Decision {dec_id} implemented; smoke test passes"
+            "dod": f"config.* key for DEC-{dec_id} set; related test passes"
         }
 
 
@@ -1603,6 +1678,10 @@ def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> 
 
     Entity persistence is collapsed into schema definition - no per-entity CRUD.
     Each task has a _key for dependency tracking.
+
+    FIX 1: Data-layer tasks (schema/ingest/query) require entities>0 and depend on
+    Docs:data_model_entities if entities were missing initially.
+
     Returns list of task dicts.
     """
     spine_tasks = []
@@ -1610,16 +1689,20 @@ def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> 
     user_stories = ctx.get("user_stories", [])
     data_entities = ctx.get("data_entities", [])
 
-    # Only create spine if we have something to build
-    if len(data_entities) == 0 and len(user_stories) == 0:
+    # FIX 1: Only create spine if we have user stories (for runner/metrics)
+    # Data-layer tasks additionally require entities
+    if len(user_stories) == 0:
         return spine_tasks
 
     # Get entity names for traceability
     entity_names = [e.get("name", "Unknown") for e in data_entities]
     entity_list = ", ".join(entity_names) if entity_names else "none"
 
+    # FIX 1: Track if we need entity dependency (entities=0 means Docs task needed first)
+    needs_entity_dep = len(data_entities) == 0
+
     # A) DuckDB schema definition (consolidates entity persistence)
-    # TASK 1: Trace to DEC or SPEC-DATA, never PRD-US
+    # FIX 1: Only generate if entities exist; otherwise this depends on Docs task
     if len(data_entities) > 0:
         task_counter["B"] += 1
         schema_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
@@ -1635,32 +1718,35 @@ def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> 
         })
 
     # B) Data ingest pipeline
-    # TASK 1: Trace to DEC or SPEC-DATA, not PRD-US
-    task_counter["B"] += 1
-    ingest_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Implement ingest pipeline Parquet to DuckDB",
-        "dod": "Loads prices/fundamentals from ./data; mapping defined; idempotent load works",
-        "trace": ingest_trace,
-        "priority": "HIGH",
-        "_spine": True,
-        "_key": "duckdb_ingest"
-    })
+    # FIX 1: Add Dep to Docs:data_model_entities if entities=0
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        ingest_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
+        ingest_task = {
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement ingest pipeline Parquet to DuckDB",
+            "dod": "Loads prices/fundamentals from ./data; mapping defined; idempotent load works",
+            "trace": ingest_trace,
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "duckdb_ingest"
+        }
+        spine_tasks.append(ingest_task)
 
     # C) Query layer for backtest runner
-    # TASK 1: This is data-layer, trace to SPEC-DATA not PRD-US:US-02
-    task_counter["B"] += 1
-    query_trace = find_decision_trace(["duckdb", "query"]) or "SPEC-DATA"
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Implement query layer for backtest runner",
-        "dod": "Functions for fetching price/fund slices, joins, time range filters",
-        "trace": query_trace,
-        "priority": "HIGH",
-        "_spine": True,
-        "_key": "query_layer"
-    })
+    # FIX 1: Only generate if entities exist (query layer needs schema)
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        query_trace = find_decision_trace(["duckdb", "query"]) or "SPEC-DATA"
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement query layer for backtest runner",
+            "dod": "Functions for fetching price/fund slices, joins, time range filters",
+            "trace": query_trace,
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "query_layer"
+        })
 
     # D) Backtest runner core - PRD-derived, trace to PRD-US:US-04 is correct
     task_counter["B"] += 1
@@ -1996,22 +2082,42 @@ def build_plan_from_context(ctx: dict) -> str:
     # =================================================================
     # FIX D: Limit P:HIGH to max 2 tasks (prioritize US-01 data load + US-04 metrics)
     # TASK 2: Add machine-actionable Dep tags for schedulability
+    # FIX 2: Filter out "Acceptance:" pseudo-tasks
+    # FIX 3: Deduplicate story IDs
 
     high_priority_story_ids = {"US-01", "US-04"}  # Data load + metrics view
     frontend_high_count = 0
     MAX_FRONTEND_HIGH = 2
 
-    # TASK 2: Define story -> backend dependency mappings
+    # TASK 2 + FIX 6: Define story -> backend dependency mappings
+    # Map Frontend stories to actual Backend task keys (must match _key values in spine)
     story_deps = {
-        "US-04": "Backend:metrics,Backend:results_store",
-        "US-06": "Backend:txn_view",
-        "US-07": "Backend:results_store",
+        "US-01": "Backend:duckdb_ingest",              # Load data -> needs ingest
+        "US-02": "Backend:strategy_interface",          # Select strategy -> needs interface
+        "US-03": "Backend:strategy_interface",          # Adjust params -> needs interface  
+        "US-04": "Backend:metrics,Backend:runner_core", # View metrics -> needs runner+metrics
+        "US-05": "Backend:runner_core,Backend:query_layer",  # Time range filter -> needs runner+query
+        "US-06": "Backend:txn_view",                    # Transaction log -> needs txn view
+        "US-07": "Backend:results_store",               # Compare strategies -> needs results store
     }
 
+    # FIX 3: Deduplicate stories by ID (keep first occurrence)
+    seen_story_ids = set()
+    deduplicated_stories = []
     for story in user_stories:
-        task_counter["F"] += 1
+        story_id = story.get("id", "US-??")
+        if story_id not in seen_story_ids:
+            seen_story_ids.add(story_id)
+            deduplicated_stories.append(story)
+
+    for story in deduplicated_stories:
         story_id = story.get("id", "US-??")
         full_story = story.get("story", "")
+
+        # FIX 2: Skip if this looks like an "Acceptance:" pseudo-task
+        if "acceptance:" in full_story.lower()[:20] or story_id.startswith("ACC-"):
+            continue
+
         short_title = f"{story_id} " + _generate_short_title(full_story, 40)
 
         task = {
@@ -2021,6 +2127,7 @@ def build_plan_from_context(ctx: dict) -> str:
             "trace": f"PRD-US:{story_id}",
             "detail": full_story
         }
+        task_counter["F"] += 1
 
         # TASK 2: Add machine-actionable Dep tag if this story has known dependencies
         if story_id in story_deps:
@@ -2037,6 +2144,7 @@ def build_plan_from_context(ctx: dict) -> str:
     # QA LANE: Decision Enforcement (INVARIANT B) + Story Tests
     # =================================================================
     # TASK 3: Add Level field and normalize harness language
+    # FIX 4: Domain-specific edge cases (not generic "empty input")
 
     # Get decision-driven QA tasks
     enforcement = _decision_enforcement_tasks(ctx, task_counter)
@@ -2044,26 +2152,53 @@ def build_plan_from_context(ctx: dict) -> str:
     # Add enforcement QA tasks first (they're higher priority)
     streams["QA"].extend(enforcement["qa"])
 
-    # TASK 3: Story integration tests with Level field and consistent harness
-    edge_cases = {
-        "load": "missing file",
-        "select": "invalid strategy",
-        "adjust": "out-of-range parameter",
-        "view": "empty dataset",
-        "drag": "invalid date range",
-        "compare": "same strategy twice",
+    # FIX 4: Domain-specific edge cases per story type
+    domain_edge_cases = {
+        # Data loading
+        "load": "missing Parquet file, corrupt header, schema mismatch",
+        "ingest": "duplicate rows, null primary key, timezone mismatch",
+        # Strategy/backtest
+        "select": "strategy file not found, invalid params schema",
+        "run": "empty price series, single-day backtest, future leak attempt",
+        "backtest": "zero trades generated, negative position size",
+        # Metrics/results
+        "metrics": "division by zero (no trades), NaN in equity curve",
+        "results": "missing run_id, corrupt JSON, concurrent write",
+        "compare": "same run twice, incompatible date ranges",
+        # UI/display
+        "view": "empty dataset, 10k+ rows pagination, missing columns",
+        "equity": "flat equity line, single data point, extreme drawdown",
+        "transaction": "1000+ trades table, missing reason field",
+        "pipeline": "missing snapshot file, corrupt JSON, stage overflow",
+        "status": "all stages green, mixed red/yellow ordering",
+        # Parameters
+        "adjust": "out-of-range value, non-numeric input, boundary values",
+        "drag": "invalid date range, future dates, pre-data dates",
     }
 
     # Keywords to determine test level
-    backend_keywords = ["load", "run", "compute", "persist", "query", "ingest"]
+    backend_keywords = ["load", "run", "compute", "persist", "query", "ingest", "backtest"]
 
+    # FIX 3: Deduplicate QA stories too
+    seen_qa_ids = set()
     for story in user_stories:
-        task_counter["Q"] += 1
         story_id = story.get("id", "US-??")
-        story_text = story.get("story", "").lower()
 
-        edge_case = "empty input"
-        for kw, ec in edge_cases.items():
+        # Skip duplicates
+        if story_id in seen_qa_ids:
+            continue
+        seen_qa_ids.add(story_id)
+
+        # FIX 2: Skip Acceptance pseudo-tasks
+        full_story = story.get("story", "")
+        if "acceptance:" in full_story.lower()[:20]:
+            continue
+
+        story_text = full_story.lower()
+
+        # FIX 4: Find domain-specific edge case
+        edge_case = "boundary values, null input, timeout"  # Default fallback
+        for kw, ec in domain_edge_cases.items():
             if kw in story_text:
                 edge_case = ec
                 break
@@ -2077,6 +2212,7 @@ def build_plan_from_context(ctx: dict) -> str:
             level = "UI_SMOKE"
             harness = "pytest + Streamlit session state assertions"
 
+        task_counter["Q"] += 1
         streams["QA"].append({
             "id": f"T-Q{task_counter['Q']}",
             "title": f"{story_id} Integration Test",
@@ -2922,20 +3058,81 @@ def draft_plan() -> str:
         })
 
 
+# =============================================================================
+# v18.0: EXECUTION CLASS CLASSIFIER
+# =============================================================================
+def classify_exec_class(lane: str, desc: str, override: str = None) -> str:
+    """
+    Classify task execution class for parallel scheduling safety.
+
+    Args:
+        lane: Task lane (backend, frontend, qa, ops, docs)
+        desc: Task description
+        override: Explicit override from plan syntax (EXC, PAR, ADD)
+
+    Returns:
+        exec_class: "exclusive" | "parallel_safe" | "additive"
+
+    Rules:
+        - Override syntax (| X:EXC/PAR/ADD) always wins
+        - Read-only verbs → parallel_safe (review, audit, analyze, verify, summarize, document, report)
+        - Additive verbs WITHOUT exclusive verbs → additive (create, add, new, build)
+        - Exclusive verbs → exclusive (refactor, remove, update, rename, modify, change, delete, fix)
+        - Default → exclusive (safe default for mutation)
+    """
+    # Override always wins
+    if override:
+        override_map = {"EXC": "exclusive", "PAR": "parallel_safe", "ADD": "additive"}
+        return override_map.get(override.upper(), "exclusive")
+
+    desc_lower = desc.lower()
+
+    # Define verb categories
+    # Note: "build" excluded from additive - ambiguous (often modifies existing)
+    EXCLUSIVE_VERBS = ["refactor", "remove", "update", "rename", "modify", "change", "delete", "fix"]
+    READ_ONLY_VERBS = ["review", "audit", "analyze", "verify", "summarize", "document", "report"]
+    ADDITIVE_VERBS = ["create", "add"]  # Clear file creation patterns only
+
+    has_exclusive = any(verb in desc_lower for verb in EXCLUSIVE_VERBS)
+    has_read_only = any(verb in desc_lower for verb in READ_ONLY_VERBS)
+    has_additive = any(verb in desc_lower for verb in ADDITIVE_VERBS)
+
+    # Exclusive verbs win over everything (mutates existing state)
+    if has_exclusive:
+        return "exclusive"
+
+    # Read-only verbs → parallel_safe (safe to run concurrently)
+    if has_read_only:
+        return "parallel_safe"
+
+    # Additive verbs → additive (creates new files, doesn't modify existing)
+    if has_additive:
+        return "additive"
+
+    # Default: exclusive (safe default)
+    return "exclusive"
+
+
 @mcp.tool()
 def accept_plan(path: str) -> str:
     """
-    Parses a plan markdown file and hydrates the database with tasks.
+    v18.0: Parses a plan markdown file and hydrates SQLite with tasks.
 
     Args:
         path: Path to the plan markdown file
 
     Expected format:
-        - [ ] Type: Description
+        - [ ] Type: Description -- DoD: ... | Trace: ... [| P:URGENT|HIGH] [| X:EXC|PAR|ADD]
         - [x] Type: Description (already done, skipped)
 
-    Returns summary of created tasks.
+    Returns summary of created tasks with v18.0 fields.
+
+    Idempotency:
+        - Plan hash computed from content; duplicate plans rejected (ALREADY_ACCEPTED)
+        - Task signature = sha1(lane:desc:trace); duplicate tasks within plan skipped
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -2954,69 +3151,467 @@ def accept_plan(path: str) -> str:
         if not os.path.isabs(path):
             plans_dir = os.path.join(DOCS_DIR, "PLANS")
             path = os.path.join(plans_dir, path)
-        
+
         if not os.path.exists(path):
             return json.dumps({
                 "status": "ERROR",
                 "message": f"File not found: {path}"
             })
-        
+
         # Read the file
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        
-        # Parse task lines
-        # Pattern: - [ ] Type: Description
+
+        # v18.0: Compute source_plan_hash for idempotency
+        source_plan_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
+
+        # v18.0: Check if this plan was already accepted
+        with get_db() as conn:
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE source_plan_hash = ?",
+                (source_plan_hash,)
+            ).fetchone()[0]
+            if existing > 0:
+                return json.dumps({
+                    "status": "ALREADY_ACCEPTED",
+                    "plan_hash": source_plan_hash,
+                    "message": f"Plan already accepted ({existing} tasks from this plan)"
+                })
+
+        # v18.0: Enhanced task pattern with optional modifiers
+        # - [ ] Type: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR
         task_pattern = r"^-\s*\[\s*\]\s*(\w+):\s*(.+)$"
-        
+
         created = []
-        state = load_state()
-        tasks = state.get("tasks", {})
-        
+        skipped_duplicates = 0
+        now = int(time.time())
+
+        # Track lane_rank per lane for ordering within lane
+        lane_ranks = {lane: 0 for lane in LANE_ORDER}
+
+        # Get existing task signatures to skip duplicates
+        with get_db() as conn:
+            existing_sigs = set(
+                row[0] for row in conn.execute(
+                    "SELECT task_signature FROM tasks WHERE task_signature != ''"
+                ).fetchall()
+            )
+
+        tasks_to_insert = []
+
         for line in content.split("\n"):
             match = re.match(task_pattern, line.strip())
-            if match:
-                task_type = match.group(1).lower()
-                desc = match.group(2).strip()
-                
-                # Generate task ID
-                existing_ids = [t.get("id", "") for t in tasks.values()]
-                prefix = task_type[0].upper()
-                idx = 1
-                while f"T-{prefix}{idx}" in existing_ids:
-                    idx += 1
-                task_id = f"T-{prefix}{idx}"
-                
-                # Create task (initial creation, not mutation)
-                tasks[task_id] = {
-                    "id": task_id,
-                    "type": task_type,
-                    "desc": desc,
-                    "status": "pending",  # SAFETY-ALLOW: status-write (initial task creation)
-                    "priority": 1,
-                    "created_at": int(time.time()),
-                    "source": os.path.basename(path)
-                }
-                
-                created.append({"id": task_id, "type": task_type, "desc": desc})
-        
-        # Save state
-        state["tasks"] = tasks
-        save_state(state)
-        
-        # Also refresh the plan preview cache
-        refresh_plan_preview()
-        
+            if not match:
+                continue
+
+            task_type = match.group(1).lower()
+            full_desc = match.group(2).strip()
+
+            # v18.0: Normalize lane
+            lane = task_type if task_type in LANE_WEIGHTS else "backend"
+
+            # v18.0: Parse description components
+            # Format: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR
+            desc = full_desc
+            trace = ""
+            priority_override = None
+            exec_class_override = None
+
+            # Extract Trace if present
+            trace_match = re.search(r'\|\s*Trace:\s*([^\|]+)', full_desc)
+            if trace_match:
+                trace = trace_match.group(1).strip()
+
+            # Extract priority override (P:URGENT or P:HIGH)
+            priority_match = re.search(r'\|\s*P:(URGENT|HIGH)\b', full_desc, re.IGNORECASE)
+            if priority_match:
+                priority_override = priority_match.group(1).upper()
+
+            # Extract exec_class override (X:EXC, X:PAR, X:ADD)
+            exec_match = re.search(r'\|\s*X:(EXC|PAR|ADD)\b', full_desc, re.IGNORECASE)
+            if exec_match:
+                exec_class_override = exec_match.group(1).upper()
+
+            # v18.0: Compute priority
+            # URGENT=0, HIGH=5, else lane weight
+            if priority_override == "URGENT":
+                priority = 0
+            elif priority_override == "HIGH":
+                priority = 5
+            else:
+                priority = LANE_WEIGHTS.get(lane, 50)
+
+            # v18.0: Classify exec_class
+            exec_class = classify_exec_class(lane, desc, exec_class_override)
+
+            # v18.0: Compute task_signature = sha1(lane:desc:trace)
+            sig_input = f"{lane}:{desc}:{trace}"
+            task_signature = hashlib.sha1(sig_input.encode("utf-8")).hexdigest()
+
+            # v18.0: Skip duplicate tasks (same signature already exists)
+            if task_signature in existing_sigs:
+                skipped_duplicates += 1
+                continue
+
+            # Add to existing_sigs to catch duplicates within same plan
+            existing_sigs.add(task_signature)
+
+            # v18.0: Compute lane_rank (order within lane)
+            lane_rank = lane_ranks.get(lane, 0)
+            lane_ranks[lane] = lane_rank + 1
+
+            tasks_to_insert.append({
+                "type": task_type,
+                "desc": desc,
+                "lane": lane,
+                "priority": priority,
+                "lane_rank": lane_rank,
+                "created_at": now,
+                "exec_class": exec_class,
+                "task_signature": task_signature,
+                "source_plan_hash": source_plan_hash,
+                "trace": trace,
+            })
+
+        # v18.0: Insert all tasks into SQLite
+        with get_db() as conn:
+            for task in tasks_to_insert:
+                cursor = conn.execute(
+                    """INSERT INTO tasks (
+                        type, desc, status, priority, updated_at,
+                        lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash
+                    ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
+                    (
+                        task["type"],
+                        task["desc"],
+                        task["priority"],
+                        now,
+                        task["lane"],
+                        task["lane_rank"],
+                        task["created_at"],
+                        task["exec_class"],
+                        task["task_signature"],
+                        task["source_plan_hash"],
+                    )
+                )
+                task["id"] = cursor.lastrowid
+                created.append({
+                    "id": task["id"],
+                    "type": task["type"],
+                    "desc": task["desc"],
+                    "lane": task["lane"],
+                    "priority": task["priority"],
+                    "lane_rank": task["lane_rank"],
+                    "created_at": task["created_at"],
+                    "exec_class": task["exec_class"],
+                    "task_signature": task["task_signature"],
+                })
+            conn.commit()
+
+        # v18.0: Create plan_preview.json derived from SQLite
+        _write_plan_preview_from_sqlite()
+
         return json.dumps({
             "status": "OK",
             "created_count": len(created),
+            "skipped_duplicates": skipped_duplicates,
+            "plan_hash": source_plan_hash,
             "tasks": created,
             "message": f"Created {len(created)} tasks from {os.path.basename(path)}"
         })
     except Exception as e:
         return json.dumps({
             "status": "ERROR",
-            "message": f"Failed to accept plan: {e}"
+            "message": f"Failed to accept plan: {e}",
+            "traceback": tb.format_exc()
+        })
+
+
+def _write_plan_preview_from_sqlite():
+    """
+    v18.0: Write plan_preview.json derived from SQLite tasks table.
+
+    Marks the file with source='sqlite:mesh.db' and _derived=True to indicate
+    it's a cache derived from SQLite (not authoritative).
+    """
+    try:
+        preview_path = get_plan_preview_path()
+
+        with get_db() as conn:
+            tasks = conn.execute(
+                """SELECT id, type, desc, status, lane, priority, lane_rank,
+                          created_at, exec_class, task_signature
+                   FROM tasks
+                   WHERE status IN ('pending', 'in_progress', 'blocked')
+                   ORDER BY priority ASC, lane_rank ASC, id ASC"""
+            ).fetchall()
+
+        # Group tasks by lane
+        streams = {}
+        for task in tasks:
+            lane = task["lane"] or task["type"]
+            if lane not in streams:
+                streams[lane] = {"name": lane.capitalize(), "tasks": []}
+            streams[lane]["tasks"].append({
+                "id": task["id"],
+                "desc": task["desc"],
+                "status": task["status"],
+                "priority": task["priority"],
+                "exec_class": task["exec_class"],
+            })
+
+        # Build preview structure
+        preview = {
+            "source": "sqlite:mesh.db",
+            "_derived": True,
+            "generated_at": int(time.time()),
+            "streams": list(streams.values()),
+        }
+
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        with open(preview_path, "w", encoding="utf-8") as f:
+            json.dump(preview, f, indent=2)
+
+    except Exception as e:
+        server_logger.warning(f"Failed to write plan_preview.json: {e}")
+
+
+# =============================================================================
+# v18.0: BRAIDED STREAM SCHEDULER
+# =============================================================================
+
+def _read_lane_pointer() -> dict:
+    """
+    Read the lane pointer state from persistent storage.
+
+    Returns:
+        dict with "index" key (default 0 if file missing/corrupt)
+    """
+    pointer_file = _get_lane_pointer_file()
+    try:
+        if os.path.exists(pointer_file):
+            with open(pointer_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data.get("index"), int):
+                    return data
+    except (json.JSONDecodeError, IOError, KeyError):
+        pass  # Corrupt or missing - reset to default
+    return {"index": 0}
+
+
+def _write_lane_pointer(index: int, lane: str = None):
+    """
+    Write lane pointer state atomically (write temp then replace).
+
+    Args:
+        index: Lane index in LANE_ORDER (wraps around)
+        lane: Optional lane name for debugging
+    """
+    pointer_file = _get_lane_pointer_file()
+    os.makedirs(os.path.dirname(pointer_file), exist_ok=True)
+
+    # Wrap index
+    wrapped_index = index % len(LANE_ORDER) if index >= 0 else 0
+
+    data = {
+        "index": wrapped_index,
+        "lane": lane or LANE_ORDER[wrapped_index] if wrapped_index < len(LANE_ORDER) else None,
+        "updated_at": int(time.time())
+    }
+
+    # Atomic write: temp file then replace
+    temp_file = pointer_file + ".tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(temp_file, pointer_file)
+    except Exception as e:
+        server_logger.warning(f"Failed to write lane pointer: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+
+def _check_dependencies_satisfied(task_id: int, deps_json: str, conn) -> bool:
+    """
+    Check if all dependencies of a task are satisfied (completed).
+
+    Args:
+        task_id: The task to check
+        deps_json: JSON string of dependency task IDs
+        conn: SQLite connection
+
+    Returns:
+        True if all dependencies are completed, False otherwise
+
+    Behavior:
+        - Empty deps → True (no dependencies)
+        - Unknown dep IDs → False (block - safer than ignoring)
+        - All deps completed → True
+        - Any dep not completed → False
+    """
+    try:
+        deps = json.loads(deps_json) if deps_json else []
+        if not deps:
+            return True
+
+        # Check how many deps exist in DB
+        placeholders = ",".join("?" * len(deps))
+        existing = conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders})",
+            deps
+        ).fetchone()[0]
+
+        # Block if any deps are unknown (safer than ignoring)
+        if existing != len(deps):
+            server_logger.warning(
+                f"Task {task_id}: {len(deps) - existing} unknown dependency IDs in {deps}"
+            )
+            return False
+
+        # Check if all existing dependencies are completed
+        completed = conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders}) AND status='completed'",
+            deps
+        ).fetchone()[0]
+        return completed == len(deps)
+
+    except json.JSONDecodeError as e:
+        server_logger.warning(f"Task {task_id}: Invalid deps JSON '{deps_json}': {e}")
+        return False  # Block on malformed deps (safer)
+    except Exception as e:
+        server_logger.warning(f"Task {task_id}: Dependency check error: {e}")
+        return False  # Block on errors (safer)
+
+
+def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
+    """
+    v18.0: Braided stream scheduler - picks next task with round-robin across lanes.
+
+    Selection logic:
+    1. PREEMPTION: If any pending tasks with priority in (0=URGENT, 5=HIGH) exist,
+       pick the best by: priority ASC, lane_rank ASC, created_at ASC, id ASC
+       (ignores lane pointer for priority preemption)
+
+    2. BRAID: Otherwise, round-robin across lanes:
+       - Start at pointer index in LANE_ORDER
+       - Find first lane with pending tasks not in blocked_lanes
+       - Pick lane-local best task
+       - Advance pointer to next lane (wraps)
+
+    Args:
+        worker_id: Optional worker identifier for claiming task
+        blocked_lanes: Set of lane names to skip (default empty)
+
+    Returns:
+        JSON with task info or {"status": "NO_WORK"}
+    """
+    if blocked_lanes is None:
+        blocked_lanes = set()
+
+    try:
+        with get_db() as conn:
+            now = int(time.time())
+
+            # =========================================================
+            # Step 1: PREEMPTION CHECK (URGENT=0, HIGH=5)
+            # =========================================================
+            preempt_task = conn.execute(
+                """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                   FROM tasks
+                   WHERE status = 'pending' AND priority IN (0, 5)
+                   ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
+                   LIMIT 10"""
+            ).fetchall()
+
+            # Find first preempt task with satisfied dependencies
+            for task in preempt_task:
+                if _check_dependencies_satisfied(task["id"], task["deps"], conn):
+                    # Atomic claim: UPDATE only if still pending (prevents double-claim)
+                    cursor = conn.execute(
+                        "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'",
+                        (worker_id, now, task["id"])
+                    )
+                    if cursor.rowcount == 0:
+                        # Task was claimed by another worker, try next
+                        continue
+                    conn.commit()
+
+                    return json.dumps({
+                        "status": "OK",
+                        "id": task["id"],
+                        "type": task["type"],
+                        "description": task["desc"],
+                        "lane": task["lane"],
+                        "priority": task["priority"],
+                        "lane_rank": task["lane_rank"],
+                        "exec_class": task["exec_class"],
+                        "preempted": True
+                    })
+
+            # =========================================================
+            # Step 2: BRAID - Round-robin across lanes
+            # =========================================================
+            pointer = _read_lane_pointer()
+            start_index = pointer.get("index", 0)
+
+            # Try each lane starting from pointer position
+            for offset in range(len(LANE_ORDER)):
+                lane_index = (start_index + offset) % len(LANE_ORDER)
+                lane = LANE_ORDER[lane_index]
+
+                # Skip blocked lanes
+                if lane in blocked_lanes:
+                    continue
+
+                # Find best pending task in this lane
+                task = conn.execute(
+                    """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                       FROM tasks
+                       WHERE status = 'pending' AND lane = ?
+                       ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
+                       LIMIT 10""",
+                    (lane,)
+                ).fetchall()
+
+                # Find first task with satisfied dependencies
+                for candidate in task:
+                    if _check_dependencies_satisfied(candidate["id"], candidate["deps"], conn):
+                        # Atomic claim: UPDATE only if still pending (prevents double-claim)
+                        cursor = conn.execute(
+                            "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'",
+                            (worker_id, now, candidate["id"])
+                        )
+                        if cursor.rowcount == 0:
+                            # Task was claimed by another worker, try next
+                            continue
+                        conn.commit()
+
+                        # Advance pointer to next lane (after the one we picked from)
+                        next_index = (lane_index + 1) % len(LANE_ORDER)
+                        _write_lane_pointer(next_index, LANE_ORDER[next_index])
+
+                        return json.dumps({
+                            "status": "OK",
+                            "id": candidate["id"],
+                            "type": candidate["type"],
+                            "description": candidate["desc"],
+                            "lane": candidate["lane"],
+                            "priority": candidate["priority"],
+                            "lane_rank": candidate["lane_rank"],
+                            "exec_class": candidate["exec_class"],
+                            "preempted": False
+                        })
+
+            # No work found in any lane
+            return json.dumps({
+                "status": "NO_WORK",
+                "message": "No pending tasks available"
+            })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "ERROR",
+            "message": f"Scheduler error: {e}"
         })
 
 
