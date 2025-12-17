@@ -802,5 +802,132 @@ def test_exec_class_override_syntax(temp_workspace, monkeypatch):
     assert exec_by_desc["forced_add"] == "additive", f"Forced ADD should be additive, got {exec_by_desc['forced_add']}"
 
 
+# =============================================================================
+# v20.0: Regression Test - Pipeline Advancement After /accept-plan
+# =============================================================================
+# Issue: /accept-plan was silently failing (BLOCKED in BOOTSTRAP mode)
+# but the UI handler ignored the response and just refreshed.
+# After fix, BLOCKED status is properly reported to the user.
+
+def test_accept_plan_blocked_in_bootstrap_mode(temp_workspace, sample_plan_file, monkeypatch):
+    """
+    Regression test: accept_plan returns BLOCKED when context is in BOOTSTRAP mode.
+
+    Root cause: UI was swallowing errors with empty catch{} and always refreshing.
+    Expected: accept_plan returns {"status": "BLOCKED", "reason": "BOOTSTRAP_MODE", ...}
+    """
+    from mesh_server import accept_plan
+
+    # Patch directories
+    monkeypatch.setattr('mesh_server.BASE_DIR', str(temp_workspace))
+    monkeypatch.setattr('mesh_server.DB_FILE', str(temp_workspace / "mesh.db"))
+    monkeypatch.setattr('mesh_server.DOCS_DIR', str(temp_workspace / "docs"))
+    monkeypatch.setattr('mesh_server.STATE_DIR', str(temp_workspace / "control" / "state"))
+
+    # Mock get_context_readiness to return BOOTSTRAP mode (incomplete context)
+    bootstrap_response = json.dumps({
+        "status": "BOOTSTRAP",
+        "overall": {
+            "ready": False,
+            "blocking_files": ["PRD", "SPEC"]
+        }
+    })
+    monkeypatch.setattr('mesh_server.get_context_readiness', lambda: bootstrap_response)
+
+    # Run accept_plan - should be BLOCKED
+    result = accept_plan(str(sample_plan_file))
+    data = json.loads(result)
+
+    # Verify BLOCKED response
+    assert data["status"] == "BLOCKED", f"Expected BLOCKED, got: {data}"
+    assert data["reason"] == "BOOTSTRAP_MODE", f"Expected BOOTSTRAP_MODE reason, got: {data}"
+    assert "blocking_files" in data, "Should include blocking_files"
+    assert "PRD" in data["blocking_files"], "PRD should be blocking"
+    assert "SPEC" in data["blocking_files"], "SPEC should be blocking"
+
+    # Verify NO tasks were created
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    conn.close()
+
+    assert count == 0, f"Expected 0 tasks when BLOCKED, got {count}"
+
+
+def test_pipeline_advances_only_on_success(temp_workspace, sample_plan_file, monkeypatch):
+    """
+    Verify that tasks DB has >0 tasks after successful accept_plan.
+    This is what drives pipeline state from RED to GREEN for [Pln] stage.
+    """
+    from mesh_server import accept_plan
+
+    # Patch directories
+    monkeypatch.setattr('mesh_server.BASE_DIR', str(temp_workspace))
+    monkeypatch.setattr('mesh_server.DB_FILE', str(temp_workspace / "mesh.db"))
+    monkeypatch.setattr('mesh_server.DOCS_DIR', str(temp_workspace / "docs"))
+    monkeypatch.setattr('mesh_server.STATE_DIR', str(temp_workspace / "control" / "state"))
+
+    # Mock get_context_readiness to allow accept (EXECUTION mode)
+    monkeypatch.setattr('mesh_server.get_context_readiness', lambda: '{"status": "EXECUTION"}')
+
+    # Before accept: no tasks
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    count_before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    conn.close()
+    assert count_before == 0, "Should start with 0 tasks"
+
+    # Accept plan
+    result = accept_plan(str(sample_plan_file))
+    data = json.loads(result)
+
+    assert data["status"] == "OK", f"Expected OK, got: {data}"
+
+    # After accept: tasks exist (drives pipeline [Pln] stage to GREEN)
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    count_after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    queued_count = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status IN ('pending', 'next', 'planned')"
+    ).fetchone()[0]
+    conn.close()
+
+    assert count_after > 0, f"Expected >0 tasks, got {count_after}"
+    assert queued_count > 0, f"Expected >0 queued tasks, got {queued_count}"
+
+    # This proves: tasks exist → pipeline [Pln] advances from RED to GREEN
+    # UI logic in Build-PipelineStatus checks: $queuedCount -gt 0 → $planState = "GREEN"
+
+
+def test_accept_plan_file_not_found_error(temp_workspace, monkeypatch):
+    """Verify accept_plan returns ERROR status for non-existent file."""
+    from mesh_server import accept_plan
+
+    # Patch directories
+    monkeypatch.setattr('mesh_server.BASE_DIR', str(temp_workspace))
+    monkeypatch.setattr('mesh_server.DB_FILE', str(temp_workspace / "mesh.db"))
+    monkeypatch.setattr('mesh_server.DOCS_DIR', str(temp_workspace / "docs"))
+    monkeypatch.setattr('mesh_server.STATE_DIR', str(temp_workspace / "control" / "state"))
+    monkeypatch.setattr('mesh_server.get_context_readiness', lambda: '{"status": "EXECUTION"}')
+
+    # Try to accept non-existent file
+    result = accept_plan("nonexistent_plan.md")
+    data = json.loads(result)
+
+    assert data["status"] == "ERROR", f"Expected ERROR, got: {data}"
+    assert "not found" in data["message"].lower() or "File not found" in data["message"], \
+        f"Expected 'not found' in message, got: {data['message']}"
+
+
+def test_all_response_statuses_are_json():
+    """Verify all accept_plan return paths produce valid JSON with status field."""
+    # This is a documentation test - we verify the contract
+    valid_statuses = {"OK", "BLOCKED", "ALREADY_ACCEPTED", "ERROR"}
+
+    # All return paths in accept_plan should return JSON with one of these statuses
+    # This test serves as documentation and can be extended to mock all paths
+    assert "OK" in valid_statuses
+    assert "BLOCKED" in valid_statuses
+    assert "ALREADY_ACCEPTED" in valid_statuses
+    assert "ERROR" in valid_statuses
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -743,7 +743,7 @@ function Show-GoldenPathHelp {
 
 function Invoke-Query {
     param([string]$Query, [switch]$Silent)
-    
+
     # Basic SQL injection protection
     $dangerousPatterns = @("DROP TABLE", "DELETE FROM tasks", "--", ";--")
     foreach ($pattern in $dangerousPatterns) {
@@ -752,18 +752,22 @@ function Invoke-Query {
             return @()
         }
     }
-    
+
     # Escape backslashes for Python (Windows paths)
     $SafeDbPath = $DB_FILE.Replace('\', '/')
+    # v20.0: Match mesh_server.py connection settings to avoid lock contention
     $script = @"
 import sqlite3, json
 try:
-    conn = sqlite3.connect('$SafeDbPath')
+    conn = sqlite3.connect('$SafeDbPath', timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=5000')
     rows = conn.execute('''$Query''').fetchall()
     print(json.dumps([dict(r) for r in rows]))
     conn.close()
-except: print('[]')
+except Exception as e:
+    print('[]')
 "@
     try {
         $result = $script | python 2>$null
@@ -1552,51 +1556,81 @@ function Invoke-Continue {
     }
 
     # v18.5: Use braided scheduler for task selection (round-robin across lanes)
-    try {
-        $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import pick_task_braided; print(pick_task_braided('control_panel'))" 2>&1
-        $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
-        $result = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "pick_task_braided"
+    # v20.0: Added retry logic for transient DB lock errors
+    $maxRetries = 3
+    $retryDelayMs = 500
+    $result = $null
 
-        if ($result._parseError) {
-            Write-Host "  ❌ Scheduler error - see logs" -ForegroundColor Red
-            return
-        }
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import pick_task_braided; print(pick_task_braided('control_panel'))" 2>&1
+            $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+            $result = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "pick_task_braided"
 
-        if ($result.status -eq "NO_WORK") {
-            # Check if any tasks exist at all
-            $taskCount = Invoke-Query "SELECT COUNT(*) as c FROM tasks" -Silent
-            $count = if ($taskCount -and $taskCount.Count -gt 0) { $taskCount[0].c } else { 0 }
-
-            if ($count -eq 0) {
-                Write-Host "  📋 No tasks yet. Run /accept-plan first." -ForegroundColor Yellow
+            # Check for transient errors that warrant retry
+            if ($result._parseError -or $result.status -eq "ERROR") {
+                $errorMsg = if ($result.message) { $result.message } else { "parse error" }
+                # Retry on locked/busy errors
+                if ($errorMsg -match "locked|busy|timeout" -and $attempt -lt $maxRetries) {
+                    Start-Sleep -Milliseconds $retryDelayMs
+                    continue
+                }
             }
-            else {
-                Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
+            # Got a valid response, exit retry loop
+            break
+        }
+        catch {
+            if ($attempt -lt $maxRetries) {
+                Start-Sleep -Milliseconds $retryDelayMs
+                continue
             }
+            Write-Host "  ❌ Failed to pick task: $_" -ForegroundColor Red
             return
         }
+    }
 
-        if ($result.status -eq "OK") {
-            $task = $result
-            $laneLabel = if ($task.lane) { "[$($task.lane)]" } else { "" }
-            $preemptLabel = if ($task.preempted) { " [PREEMPT]" } else { "" }
+    if ($result._parseError) {
+        Write-Host "  ❌ Scheduler error - see logs" -ForegroundColor Red
+        return
+    }
 
-            Write-Host ""
-            Write-Host "  ▶ Picked task via braided scheduler$preemptLabel" -ForegroundColor Cyan
-            Write-Host "     ID:   T-$($task.id)" -ForegroundColor White
-            Write-Host "     Lane: $laneLabel" -ForegroundColor Gray
-            Write-Host "     Desc: $($task.description)" -ForegroundColor White
-            Write-Host ""
-            Write-Host "  Task is now IN_PROGRESS. Worker can claim it." -ForegroundColor DarkGray
-            return
+    if ($result.status -eq "NO_WORK") {
+        # Check if any tasks exist at all
+        $taskCount = Invoke-Query "SELECT COUNT(*) as c FROM tasks" -Silent
+        $count = if ($taskCount -and $taskCount.Count -gt 0) { $taskCount[0].c } else { 0 }
+
+        if ($count -eq 0) {
+            Write-Host "  📋 No tasks yet. Run /accept-plan first." -ForegroundColor Yellow
         }
+        else {
+            Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
+        }
+        return
+    }
 
-        # Unexpected status
-        Write-Host "  ⚠️ Unexpected scheduler response: $($result.status)" -ForegroundColor Yellow
+    if ($result.status -eq "OK") {
+        $task = $result
+        $laneLabel = if ($task.lane) { "[$($task.lane)]" } else { "" }
+        $preemptLabel = if ($task.preempted) { " [PREEMPT]" } else { "" }
+
+        Write-Host ""
+        Write-Host "  ▶ Picked task via braided scheduler$preemptLabel" -ForegroundColor Cyan
+        Write-Host "     ID:   T-$($task.id)" -ForegroundColor White
+        Write-Host "     Lane: $laneLabel" -ForegroundColor Gray
+        Write-Host "     Desc: $($task.description)" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Task is now IN_PROGRESS. Worker can claim it." -ForegroundColor DarkGray
+        return
     }
-    catch {
-        Write-Host "  ❌ Failed to pick task: $_" -ForegroundColor Red
+
+    # v20.0: Handle ERROR status explicitly
+    if ($result.status -eq "ERROR") {
+        Write-Host "  ❌ Scheduler error: $($result.message)" -ForegroundColor Red
+        return
     }
+
+    # Unexpected status
+    Write-Host "  ⚠️ Unexpected scheduler response: $($result.status)" -ForegroundColor Yellow
 }
 
 function Show-Stream {
@@ -3750,6 +3784,7 @@ print(consult_standard('$cmdArgs', '$profile'))
         "accept-plan" {
             # v20.0: Fixed silent failure - now displays result to user
             # v18.4: Default to latest draft when no argument provided
+            # v20.0: Pass full absolute path to avoid DOCS_DIR mismatch
             $planPath = $cmdArgs
             if (-not $planPath) {
                 $latestDraft = Get-LatestDraftPlan
@@ -3760,13 +3795,15 @@ print(consult_standard('$cmdArgs', '$profile'))
                     Set-Pos $Global:RowInput ($Global:InputLeft + 4)
                     break
                 }
-                $planPath = Split-Path $latestDraft -Leaf
+                # Use full path, not just filename - avoids DOCS_DIR mismatch between PS and Python
+                $planPath = $latestDraft
             }
 
             $response = $null
             try {
+                # v20.0: Use raw string r'...' for Windows path to avoid backslash escape issues
                 $escapedPath = $planPath -replace "'", "''"
-                $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import accept_plan; print(accept_plan('$escapedPath'))" 2>&1
+                $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import accept_plan; print(accept_plan(r'$escapedPath'))" 2>&1
                 $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
                 $response = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "accept_plan"
             }
