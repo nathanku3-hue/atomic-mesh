@@ -254,3 +254,131 @@ class TestDecisionCategoryMapping:
         raw = "| 010 | 2025-12-15 | SEC | Read-Only Mode for Data | Rationale | Scope | Task | Status |"
         result = self.format_decision_for_display(raw)
         assert "  " not in result, f"Double spaces found: {result}"
+
+
+class TestPlanScreenDeclutter:
+    """v21.2: Regression tests for PLAN screen decluttering.
+
+    T-UX-PLAN-DECLUTTER: Source diagnostics hidden on PLAN, available via /ops.
+    """
+
+    def test_bootstrap_panel_no_source_line(self):
+        """Draw-BootstrapPanel should NOT render 'Source: readiness.py' on PLAN screen."""
+        import os
+        control_panel_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "control_panel.ps1"
+        )
+
+        # Read the Draw-BootstrapPanel function
+        with open(control_panel_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Find the Draw-BootstrapPanel function section
+        bootstrap_start = content.find("function Draw-BootstrapPanel")
+        if bootstrap_start == -1:
+            pytest.skip("Draw-BootstrapPanel function not found")
+
+        # Find next function (approximate end)
+        bootstrap_end = content.find("\nfunction ", bootstrap_start + 1)
+        if bootstrap_end == -1:
+            bootstrap_end = len(content)
+
+        bootstrap_section = content[bootstrap_start:bootstrap_end]
+
+        # v21.2: Source line should be REMOVED from PLAN screen
+        # It should NOT add 'Source: readiness.py' to $rightLines
+        assert '$rightLines += "Source: readiness.py' not in bootstrap_section, \
+            "Draw-BootstrapPanel should NOT render Source: line on PLAN screen (v21.2 declutter)"
+
+        # Should have a comment explaining the removal
+        assert "v21.2" in bootstrap_section or "declutter" in bootstrap_section.lower() or "moved" in bootstrap_section.lower(), \
+            "Draw-BootstrapPanel should document the Source line removal"
+
+    def test_ops_command_has_diagnostics_section(self):
+        """The /ops command should include a DIAGNOSTICS section with source info."""
+        import os
+        control_panel_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "control_panel.ps1"
+        )
+
+        with open(control_panel_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Find the /ops command handler
+        ops_start = content.find('"ops" {')
+        if ops_start == -1:
+            pytest.skip("/ops command handler not found")
+
+        # Find next command handler (approximate end)
+        ops_end = content.find('"health" {', ops_start)
+        if ops_end == -1:
+            ops_end = len(content)
+
+        ops_section = content[ops_start:ops_end]
+
+        # v21.2: /ops should have DIAGNOSTICS section
+        assert "DIAGNOSTICS" in ops_section, \
+            "/ops command should have DIAGNOSTICS section (v21.2)"
+
+        # Should show readiness source
+        assert "Readiness source" in ops_section, \
+            "/ops DIAGNOSTICS should show Readiness source"
+
+        # Should show DB path
+        assert "DB path" in ops_section, \
+            "/ops DIAGNOSTICS should show DB path"
+
+        # Should show read-only mode
+        assert "Read-only mode" in ops_section or "read_only" in ops_section, \
+            "/ops DIAGNOSTICS should show read-only mode state"
+
+    def test_no_source_line_in_plan_dashboard(self):
+        """Build-PipelineStatus source should NOT be rendered on PLAN screen panels."""
+        import os
+        control_panel_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "control_panel.ps1"
+        )
+
+        with open(control_panel_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # The Draw-Dashboard function renders PLAN screen
+        dashboard_start = content.find("function Draw-Dashboard")
+        if dashboard_start == -1:
+            pytest.skip("Draw-Dashboard function not found")
+
+        # Find end of function
+        dashboard_end = content.find("\n# ==========", dashboard_start + 100)
+        if dashboard_end == -1:
+            dashboard_end = len(content)
+
+        dashboard_section = content[dashboard_start:dashboard_end]
+
+        # Should NOT have explicit 'Source:' text rendering in the main PLAN section
+        # The $pipelineData.source is used but should not be directly shown on PLAN
+        # Note: It's OK if source is used internally, just not displayed
+        source_renders = dashboard_section.count('Write-Host "Source:')
+        assert source_renders == 0, \
+            f"Draw-Dashboard should not directly render 'Source:' text on PLAN screen (found {source_renders} occurrences)"
+
+    def test_diagnostics_preserves_traceability(self):
+        """Diagnostics info should be preserved SOMEWHERE for traceability."""
+        import os
+        control_panel_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "control_panel.ps1"
+        )
+
+        with open(control_panel_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Build-PipelineStatus should still build the source string (for internal use/logging)
+        assert '$source = "readiness.py"' in content, \
+            "Build-PipelineStatus should still construct source string for internal use"
+
+        # The source should be part of the returned model
+        assert '"source"' in content or "'source'" in content or "source =" in content, \
+            "Pipeline status should still include source in its return model"
