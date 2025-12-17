@@ -312,17 +312,31 @@ def get_context_readiness(base_dir=None):
                 score += 20
 
             # Header check: +10% per required header (max 50%)
+            # v18.2: Flexible header matching - allows:
+            #   - "## Goals" (markdown h2)
+            #   - "# Goals" (markdown h1)
+            #   - "Goals" (plain text at line start)
             for header in config["required_headers"]:
-                if re.search(re.escape(header), content, re.IGNORECASE | re.MULTILINE):
+                # Extract header text without ## prefix
+                header_text = header.lstrip('# ').strip()
+                # Match: optional 1-6 # chars + optional whitespace + header text
+                # Note: {{1,6}} escapes braces in f-string to produce {1,6} in regex
+                # Header must be at end of line OR followed by parenthetical (e.g., "API (Internal)")
+                # This prevents "Goals are important" from matching as "Goals" header
+                pattern = rf'^(?:#{{1,6}}\s+)?{re.escape(header_text)}(?:[\s:]*$|\s*\()'
+                if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
                     headers_found += 1
                     score += 10
                 else:
                     missing_headers.append(header)
 
             # Bullet check: +20% if >5 bullet points (disabled for stubs)
-            # Match lines starting with "- ", "* ", "1. ", or "- [ ]" (checkboxes)
+            # v18.2: Match lines starting with:
+            #   - "- ", "* ", "1. " (standard bullets)
+            #   - "- [ ]", "- [x]" (bulleted checkboxes)
+            #   - "[ ]", "[x]" (standalone checkboxes - common in generated docs)
             bullet_lines = re.findall(
-                r'^[\s]*(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?',
+                r'^[\s]*(?:(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?|\[[ xX]\]\s+)',
                 content,
                 re.MULTILINE
             )

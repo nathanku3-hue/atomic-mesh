@@ -44,6 +44,21 @@ control/snapshots/
 logs/
 *.log
 
+# Local/tooling
+.claude/
+
+# Generated artifacts / local outputs
+control/state/plan_preview.json
+docs/PLANS/draft_*.md
+stdout.txt
+stderr.txt
+test_stderr.txt
+*.bak
+nul
+
+# Local planning docs
+PLAN.md
+
 # Sensitive
 .env
 *.key

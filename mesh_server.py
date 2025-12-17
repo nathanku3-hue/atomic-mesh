@@ -60,6 +60,100 @@ MILESTONE_FILE = ".milestone_date"
 LANE_WEIGHTS = {"backend": 10, "frontend": 20, "qa": 30, "ops": 40, "docs": 50}
 LANE_ORDER = ["backend", "frontend", "qa", "ops", "docs"]
 
+# =============================================================================
+# v20.1: WORKER ROLE → ALLOWED LANES (Production Safety)
+# =============================================================================
+# Goal: prevent silent misrouting/starvation by enforcing lane access server-side.
+#
+# NOTE: This is not a security boundary (MCP has no auth here). It is a correctness
+# boundary that protects against misconfigured workers and accidental callers.
+DEFAULT_WORKER_ALLOWED_LANES: dict[str, set[str]] = {
+    # Codex/generalist worker
+    "backend": {"backend", "qa", "ops"},
+    # Claude/creative worker
+    "frontend": {"frontend", "docs"},
+    # Optional dedicated workers
+    "qa": {"qa"},
+    "ops": {"ops"},
+    "docs": {"docs"},
+    # Local operator tools (full visibility)
+    "admin": set(LANE_ORDER),
+}
+
+ADMIN_WORKER_IDS = {
+    "control_panel",
+    "mission_control",
+    "commander",
+    "planner",
+    "admin",
+}
+
+_WORKER_ROLE_PREFIX_RE = re.compile(r"^(backend|frontend|qa|ops|docs)(?:$|[_-])", re.IGNORECASE)
+
+
+def _resolve_worker_lane_policy(worker_id: str | None, worker_type: str | None) -> dict:
+    """
+    Resolve worker role and allowed lanes (fail closed).
+
+    Identity inputs:
+      - worker_type: explicit role label provided by caller (preferred)
+      - worker_id: inferred via prefix like "backend_123" or special admin IDs
+
+    Returns:
+      {"ok": bool, "role": str|None, "allowed_lanes": set[str], "error": str|None}
+    """
+    inferred_role: str | None = None
+    if worker_id:
+        wid = str(worker_id).strip().lower()
+        if wid in ADMIN_WORKER_IDS:
+            inferred_role = "admin"
+        else:
+            m = _WORKER_ROLE_PREFIX_RE.match(wid)
+            if m:
+                inferred_role = m.group(1).lower()
+
+    explicit_role: str | None = None
+    if worker_type:
+        explicit_role = str(worker_type).strip().lower()
+
+    if explicit_role and explicit_role not in DEFAULT_WORKER_ALLOWED_LANES:
+        return {
+            "ok": False,
+            "role": None,
+            "allowed_lanes": set(),
+            "error": f"UNKNOWN_WORKER_TYPE:{explicit_role}",
+        }
+
+    if explicit_role and inferred_role and explicit_role != inferred_role:
+        return {
+            "ok": False,
+            "role": None,
+            "allowed_lanes": set(),
+            "error": f"WORKER_TYPE_MISMATCH:{explicit_role}!={inferred_role}",
+        }
+
+    role = explicit_role or inferred_role
+    if not role:
+        return {
+            "ok": False,
+            "role": None,
+            "allowed_lanes": set(),
+            "error": "MISSING_WORKER_ROLE",
+        }
+
+    allowed = set(DEFAULT_WORKER_ALLOWED_LANES.get(role, set()))
+    if not allowed:
+        return {
+            "ok": False,
+            "role": role,
+            "allowed_lanes": set(),
+            "error": f"NO_ALLOWED_LANES:{role}",
+        }
+
+    # Normalize to known lanes only (fail closed on unknown lanes).
+    allowed &= set(LANE_ORDER)
+    return {"ok": True, "role": role, "allowed_lanes": allowed, "error": None}
+
 # Deferred: LANE_POINTER_FILE set after module init (needs STATE_DIR)
 # Will be: os.path.join(STATE_DIR, "scheduler_lane_pointer.json")
 LANE_POINTER_FILE = None  # Set in _get_lane_pointer_file()
@@ -539,11 +633,14 @@ def get_safe_files_for_librarian(file_list: List[str]) -> List[str]:
     return safe_files
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
     # WAL mode for concurrent access - set once per connection
     conn.execute("PRAGMA journal_mode=WAL;")
+    # Speed/durability balance for WAL (production default; override via env if needed)
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -654,6 +751,7 @@ def init_db():
                 ("exec_class", "TEXT DEFAULT 'exclusive'", "v18.0"),
                 ("task_signature", "TEXT DEFAULT ''", "v18.0"),
                 ("source_plan_hash", "TEXT DEFAULT ''", "v18.0"),
+                ("plan_key", "TEXT DEFAULT ''", "v19.10"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -663,6 +761,43 @@ def init_db():
                         server_logger.info(f"{version}: Added {col_name} column to tasks table")
                     except Exception:
                         pass  # Column already exists
+
+            # v19.10: Cheap-win indexes for scheduler hot paths
+            # - Preemption: status + priority ordering
+            # - Lane scan: status + lane ordering
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_pick_preempt "
+                    "ON tasks(status, priority, lane_rank, created_at, id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_pick_lane "
+                    "ON tasks(status, lane, priority, lane_rank, created_at, id)"
+                )
+
+                # v20.0: Targeted indexes for dashboard/query hot paths
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_auditor_status_status "
+                    "ON tasks(auditor_status, status)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_archetype "
+                    "ON tasks(status, archetype)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated_at "
+                    "ON tasks(status, updated_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_source_plan_hash "
+                    "ON tasks(source_plan_hash)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_task_signature "
+                    "ON tasks(task_signature)"
+                )
+            except Exception as e:
+                server_logger.warning(f"Index creation skipped: {e}")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS artifacts (
                 key TEXT PRIMARY KEY,
@@ -858,6 +993,43 @@ def get_po_status():
         server_logger.warning(f"PO status check failed: {e}")
         return "Green", "No pending inputs"
 
+
+def _tail_text_lines(file_path: str, max_lines: int = 50, encoding: str = "utf-8") -> list:
+    """
+    Efficiently reads the last N lines of a text file without loading the whole file.
+    Falls back to a streaming deque approach on failure.
+    """
+    if max_lines <= 0:
+        return []
+
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+
+            block_size = 8192
+            data = b""
+            newlines = 0
+
+            while pos > 0 and newlines <= max_lines:
+                read_size = block_size if pos >= block_size else pos
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                data = chunk + data
+                newlines += chunk.count(b"\n")
+
+            raw_lines = data.splitlines()[-max_lines:]
+            return [ln.decode(encoding, errors="ignore").rstrip("\r") for ln in raw_lines]
+    except Exception:
+        try:
+            from collections import deque
+            with open(file_path, "r", encoding=encoding, errors="ignore") as f:
+                return [line.rstrip("\n").rstrip("\r") for line in deque(f, maxlen=max_lines)]
+        except Exception:
+            return []
+
+
 def get_latest_log_line():
     """
     v9.4 Telemetry: Reads the latest [THOUGHT] from logs for COT display.
@@ -866,9 +1038,8 @@ def get_latest_log_line():
     log_path = os.path.join(BASE_DIR, "logs", "mesh.log")
     if os.path.exists(log_path):
         try:
-            with open(log_path, 'r', encoding='utf-8') as f:
-                # Read last 15 lines for efficiency
-                lines = f.readlines()[-15:]
+            # Bounded tail read (avoid unbounded readlines() on large logs)
+            lines = _tail_text_lines(log_path, max_lines=15, encoding="utf-8")
                 
             # Search backwards for the last [THOUGHT]
             for line in reversed(lines):
@@ -1748,52 +1919,59 @@ def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> 
             "_key": "query_layer"
         })
 
-    # D) Backtest runner core - PRD-derived, trace to PRD-US:US-04 is correct
-    task_counter["B"] += 1
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Implement backtest runner core",
-        "dod": "Given fixture data + strategy, returns trades + equity series deterministically",
-        "trace": "PRD-US:US-04",
-        "priority": "HIGH",
-        "_spine": True,
-        "_key": "runner_core"
-    })
+    # =================================================================
+    # DATA-DEPENDENT SPINE TASKS: Only emit if entities > 0
+    # =================================================================
+    # These tasks fundamentally require a data model / dataset contract.
+    # If entities=0, the Docs lane will have a blocker for "Define Data Model entities".
 
-    # E) Metrics calculation - PRD-derived, trace to PRD-US:US-04 is correct
-    task_counter["B"] += 1
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Compute key metrics (CAGR, Sharpe, MaxDD)",
-        "dod": "Metrics match fixture expected values within tolerance",
-        "trace": "PRD-US:US-04",
-        "priority": "HIGH",
-        "_spine": True,
-        "_key": "metrics"
-    })
+    if len(data_entities) > 0:
+        # D) Backtest runner core - PRD-derived, trace to PRD-US:US-04 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement backtest runner core",
+            "dod": "Given fixture data + strategy, returns trades + equity series deterministically",
+            "trace": "PRD-US:US-04",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "runner_core"
+        })
 
-    # F) Results store/query - PRD-derived, trace to PRD-US:US-07 is correct
-    task_counter["B"] += 1
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Persist and query backtest results",
-        "dod": "backtest_runs table indexed by run_id; can list, fetch, compare two runs",
-        "trace": "PRD-US:US-07",
-        "priority": "HIGH",
-        "_spine": True,
-        "_key": "results_store"
-    })
+        # E) Metrics calculation - PRD-derived, trace to PRD-US:US-04 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Compute key metrics (CAGR, Sharpe, MaxDD)",
+            "dod": "Metrics match fixture expected values within tolerance",
+            "trace": "PRD-US:US-04",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "metrics"
+        })
 
-    # G) Transaction log - PRD-derived, trace to PRD-US:US-06 is correct
-    task_counter["B"] += 1
-    spine_tasks.append({
-        "id": f"T-B{task_counter['B']}",
-        "title": "Generate transaction log view model",
-        "dod": "Trades include entry/exit reason + timestamps; UI can render table",
-        "trace": "PRD-US:US-06",
-        "_spine": True,
-        "_key": "txn_view"
-    })
+        # F) Results store/query - PRD-derived, trace to PRD-US:US-07 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Persist and query backtest results",
+            "dod": "backtest_runs table indexed by run_id; can list, fetch, compare two runs",
+            "trace": "PRD-US:US-07",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "results_store"
+        })
+
+        # G) Transaction log - PRD-derived, trace to PRD-US:US-06 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Generate transaction log view model",
+            "dod": "Trades include entry/exit reason + timestamps; UI can render table",
+            "trace": "PRD-US:US-06",
+            "_spine": True,
+            "_key": "txn_view"
+        })
 
     return spine_tasks
 
@@ -2004,7 +2182,8 @@ def build_plan_from_context(ctx: dict) -> str:
             "title": "Add User Stories to PRD",
             "dod": "PRD contains >= 3 user stories with acceptance criteria",
             "trace": "PRD-US",
-            "priority": "HIGH"
+            "priority": "HIGH",
+            "_key": "user_stories"
         })
 
     if len(data_entities) == 0:
@@ -2014,7 +2193,8 @@ def build_plan_from_context(ctx: dict) -> str:
             "title": "Define Data Model entities",
             "dod": "SPEC Data Model lists >= 3 entities with fields and types",
             "trace": "SPEC-DATA",
-            "priority": "HIGH"
+            "priority": "HIGH",
+            "_key": "data_model_entities"
         })
 
     # Proposed decisions need finalization
@@ -2037,7 +2217,8 @@ def build_plan_from_context(ctx: dict) -> str:
 
     # FIX C: Strategy cartridge interface (unblocks US-02/US-03)
     # TASK 1: Trace to DEC if strategy decision exists, else SPEC-DATA (not PRD-US:US-02)
-    if len(user_stories) > 0:
+    # Gate on entities > 0: strategies operate on data, need data model first
+    if len(user_stories) > 0 and len(data_entities) > 0:
         task_counter["B"] += 1
         strategy_trace = find_decision_trace(["abc", "protocol", "strategy", "cartridge"]) or "SPEC-DATA"
         streams["Backend"].append({
@@ -2050,7 +2231,8 @@ def build_plan_from_context(ctx: dict) -> str:
         })
 
     # TASK 4: If endpoints=0, add Backend implementation task for internal interfaces
-    if len(api_endpoints) == 0 and len(user_stories) > 0:
+    # Gate on entities > 0: internal interfaces need data model to operate on
+    if len(api_endpoints) == 0 and len(user_stories) > 0 and len(data_entities) > 0:
         task_counter["B"] += 1
         streams["Backend"].append({
             "id": f"T-B{task_counter['B']}",
@@ -2089,17 +2271,33 @@ def build_plan_from_context(ctx: dict) -> str:
     frontend_high_count = 0
     MAX_FRONTEND_HIGH = 2
 
-    # TASK 2 + FIX 6: Define story -> backend dependency mappings
-    # Map Frontend stories to actual Backend task keys (must match _key values in spine)
-    story_deps = {
-        "US-01": "Backend:duckdb_ingest",              # Load data -> needs ingest
-        "US-02": "Backend:strategy_interface",          # Select strategy -> needs interface
-        "US-03": "Backend:strategy_interface",          # Adjust params -> needs interface  
-        "US-04": "Backend:metrics,Backend:runner_core", # View metrics -> needs runner+metrics
-        "US-05": "Backend:runner_core,Backend:query_layer",  # Time range filter -> needs runner+query
-        "US-06": "Backend:txn_view",                    # Transaction log -> needs txn view
-        "US-07": "Backend:results_store",               # Compare strategies -> needs results store
+    # TASK 2 + FIX 6: Build story->backend deps ONLY from emitted tasks
+    # Collect all emitted task keys from Backend + Docs lanes
+    emitted_keys = set()
+    for task in streams["Backend"]:
+        if task.get("_key"):
+            emitted_keys.add(f"Backend:{task['_key']}")
+    for task in streams["Docs"]:
+        if task.get("_key"):
+            emitted_keys.add(f"Docs:{task['_key']}")
+
+    # Define ideal deps, then filter to only existing tasks
+    ideal_story_deps = {
+        "US-01": ["Backend:duckdb_ingest"],
+        "US-02": ["Backend:strategy_interface"],
+        "US-03": ["Backend:strategy_interface"],
+        "US-04": ["Backend:metrics", "Backend:runner_core"],
+        "US-05": ["Backend:runner_core", "Backend:query_layer"],
+        "US-06": ["Backend:txn_view"],
+        "US-07": ["Backend:results_store"],
     }
+
+    # Build actual deps only from emitted keys
+    story_deps = {}
+    for story_id, deps in ideal_story_deps.items():
+        valid_deps = [d for d in deps if d in emitted_keys]
+        if valid_deps:
+            story_deps[story_id] = ",".join(valid_deps)
 
     # FIX 3: Deduplicate stories by ID (keep first occurrence)
     seen_story_ids = set()
@@ -2118,25 +2316,35 @@ def build_plan_from_context(ctx: dict) -> str:
         if "acceptance:" in full_story.lower()[:20] or story_id.startswith("ACC-"):
             continue
 
-        short_title = f"{story_id} " + _generate_short_title(full_story, 40)
+        short_title_base = _generate_short_title(full_story, 40)
 
-        task = {
-            "id": f"T-F{task_counter['F']}",
-            "title": short_title,
-            "dod": "Component renders, handles user interaction per story",
-            "trace": f"PRD-US:{story_id}",
-            "detail": full_story
-        }
+        # BOOTSTRAP MODE: Shape Frontend tasks as UI shell + placeholders
+        if len(data_entities) == 0:
+            task = {
+                "id": f"T-F{task_counter['F']}",
+                "title": f"{story_id} [Shell] {short_title_base}",
+                "dod": "UI shell renders; placeholder/loading states; no backend calls",
+                "trace": f"PRD-US:{story_id}",
+                "detail": f"(Bootstrap shell; unblocks after Docs:data_model_entities) {full_story}",
+                "blocked_by": "Docs:data_model_entities"
+            }
+            # No P:HIGH for bootstrap shells
+        else:
+            task = {
+                "id": f"T-F{task_counter['F']}",
+                "title": f"{story_id} {short_title_base}",
+                "dod": "Component renders, handles user interaction per story",
+                "trace": f"PRD-US:{story_id}",
+                "detail": full_story
+            }
+            # TASK 2: Add machine-actionable Dep tag if this story has known dependencies
+            if story_id in story_deps:
+                task["dep"] = story_deps[story_id]
+            # FIX D: Only US-01 and US-04 get P:HIGH (if spine exists)
+            if story_id in high_priority_story_ids and frontend_high_count < MAX_FRONTEND_HIGH:
+                task["priority"] = "HIGH"
+                frontend_high_count += 1
         task_counter["F"] += 1
-
-        # TASK 2: Add machine-actionable Dep tag if this story has known dependencies
-        if story_id in story_deps:
-            task["dep"] = story_deps[story_id]
-
-        # FIX D: Only US-01 and US-04 get P:HIGH (if spine exists)
-        if story_id in high_priority_story_ids and frontend_high_count < MAX_FRONTEND_HIGH:
-            task["priority"] = "HIGH"
-            frontend_high_count += 1
 
         streams["Frontend"].append(task)
 
@@ -2152,29 +2360,77 @@ def build_plan_from_context(ctx: dict) -> str:
     # Add enforcement QA tasks first (they're higher priority)
     streams["QA"].extend(enforcement["qa"])
 
+    # =================================================================
+    # UNIT-LEVEL QA: Backend determinism + schema validation (~88/100)
+    # =================================================================
+    # These verify core backend invariants before integration tests
+
+    # 1) Runner + Metrics Determinism (requires entities)
+    if len(data_entities) > 0:
+        task_counter["Q"] += 1
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": "Runner + Metrics Determinism",
+            "dod": "pytest + golden fixtures; same input yields identical output; tests/test_determinism.py passes",
+            "trace": "Backend:runner_core,Backend:metrics",
+            "level": "UNIT",
+            "priority": "HIGH"
+        })
+
+    # 2) Snapshot Schema Validation + Backward Compat
+    if len(data_entities) > 0:
+        task_counter["Q"] += 1
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": "Snapshot Schema Validation",
+            "dod": "pytest; schema version header present; backward-compat loader works; tests/test_schema_compat.py passes",
+            "trace": "Backend:results_store",
+            "level": "UNIT"
+        })
+
     # FIX 4: Domain-specific edge cases per story type
-    domain_edge_cases = {
-        # Data loading
-        "load": "missing Parquet file, corrupt header, schema mismatch",
-        "ingest": "duplicate rows, null primary key, timezone mismatch",
-        # Strategy/backtest
-        "select": "strategy file not found, invalid params schema",
-        "run": "empty price series, single-day backtest, future leak attempt",
-        "backtest": "zero trades generated, negative position size",
-        # Metrics/results
-        "metrics": "division by zero (no trades), NaN in equity curve",
-        "results": "missing run_id, corrupt JSON, concurrent write",
-        "compare": "same run twice, incompatible date ranges",
-        # UI/display
-        "view": "empty dataset, 10k+ rows pagination, missing columns",
-        "equity": "flat equity line, single data point, extreme drawdown",
-        "transaction": "1000+ trades table, missing reason field",
-        "pipeline": "missing snapshot file, corrupt JSON, stage overflow",
-        "status": "all stages green, mixed red/yellow ordering",
-        # Parameters
-        "adjust": "out-of-range value, non-numeric input, boundary values",
-        "drag": "invalid date range, future dates, pre-data dates",
-    }
+    # BOOTSTRAP MODE: Different edge cases when entities=0 (no dataset to test against)
+    if len(data_entities) > 0:
+        domain_edge_cases = {
+            # Data loading
+            "load": "missing Parquet file, corrupt header, schema mismatch",
+            "ingest": "duplicate rows, null primary key, timezone mismatch",
+            # Strategy/backtest
+            "select": "strategy file not found, invalid params schema",
+            "run": "empty price series, single-day backtest, future leak attempt",
+            "backtest": "zero trades generated, negative position size",
+            # Metrics/results
+            "metrics": "division by zero (no trades), NaN in equity curve",
+            "results": "missing run_id, corrupt JSON, concurrent write",
+            "compare": "same run twice, incompatible date ranges",
+            # UI/display
+            "view": "empty dataset, 10k+ rows pagination, missing columns",
+            "equity": "flat equity line, single data point, extreme drawdown",
+            "transaction": "1000+ trades table, missing reason field",
+            "pipeline": "missing snapshot file, corrupt JSON, stage overflow",
+            "status": "all stages green, mixed red/yellow ordering",
+            # Parameters
+            "adjust": "out-of-range value, non-numeric input, boundary values",
+            "drag": "invalid date range, future dates, pre-data dates",
+        }
+    else:
+        # entities=0: UI scaffolding tests (domain-tuned even without data)
+        domain_edge_cases = {
+            # UI shell states
+            "view": "loading spinner, empty state placeholder, error boundary fallback",
+            "create": "form validation, required fields, invalid strategy path format",
+            "mark": "toggle state debounce, bulk selection edge, undo stack overflow",
+            "filter": "no matches found, clear all filters, filter state persistence",
+            "select": "dropdown empty state, unknown stage name, selection persistence",
+            "adjust": "slider bounds, reset to default, overly long input truncation",
+            # Domain-specific bootstrap edges
+            "status": "unknown pipeline stage, stale timestamp display",
+            "results": "snapshot schema version mismatch, missing run_id placeholder",
+            "pipeline": "malformed stage name, pipeline state corruption recovery",
+            "strategy": "invalid .py path, missing BaseStrategy class stub",
+            # Generic UI
+            "default": "responsive layout, accessibility, keyboard nav",
+        }
 
     # Keywords to determine test level
     backend_keywords = ["load", "run", "compute", "persist", "query", "ingest", "backtest"]
@@ -2197,29 +2453,46 @@ def build_plan_from_context(ctx: dict) -> str:
         story_text = full_story.lower()
 
         # FIX 4: Find domain-specific edge case
-        edge_case = "boundary values, null input, timeout"  # Default fallback
+        # Default fallback is domain-tuned even when no keyword match
+        if len(data_entities) == 0:
+            edge_case = "component mount/unmount, async state race, error boundary"
+        else:
+            edge_case = "empty dataset, malformed input, timeout recovery"
         for kw, ec in domain_edge_cases.items():
             if kw in story_text:
                 edge_case = ec
                 break
 
         # TASK 3: Determine Level and harness
+        # BOOTSTRAP MODE: Different harness when entities=0
         is_backend = any(kw in story_text for kw in backend_keywords)
-        if is_backend:
+        if is_backend and len(data_entities) > 0:
             level = "INTEGRATION"
             harness = "pytest + fixture dataset + deterministic seed"
+            blocked_by = None
+        elif is_backend and len(data_entities) == 0:
+            # Backend test without data - mark as blocked
+            level = "INTEGRATION"
+            harness = "pytest + mock data layer"
+            blocked_by = "Docs:data_model_entities"
         else:
             level = "UI_SMOKE"
             harness = "pytest + Streamlit session state assertions"
+            # BOOTSTRAP MODE: UI_SMOKE also blocked until data model exists
+            blocked_by = "Docs:data_model_entities" if len(data_entities) == 0 else None
 
         task_counter["Q"] += 1
-        streams["QA"].append({
+        qa_task = {
             "id": f"T-Q{task_counter['Q']}",
             "title": f"{story_id} Integration Test",
             "dod": f"{harness}; covers happy path + edge: {edge_case}",
             "trace": f"PRD-US:{story_id}",
             "level": level
-        })
+        }
+        if blocked_by:
+            qa_task["blocked_by"] = blocked_by
+            qa_task["detail"] = "(Bootstrap test shell; unblocks after Docs:data_model_entities)"
+        streams["QA"].append(qa_task)
 
     # API endpoint tests (if any) - TASK 3: Add Level field
     for ep in api_endpoints[:3]:
@@ -2239,6 +2512,67 @@ def build_plan_from_context(ctx: dict) -> str:
     # =================================================================
 
     streams["Ops"].extend(enforcement["ops"])
+
+    # BOOTSTRAP MODE: Mark Ops tasks as Scaffold when entities=0
+    # Scaffold tasks are safe to run without backend/data model (setup configs, etc.)
+    if len(data_entities) == 0:
+        for task in streams["Ops"]:
+            task["scaffold"] = True
+            # Remove P:HIGH from scaffold tasks (they're not critical path)
+            task.pop("priority", None)
+
+    # =================================================================
+    # DEP VALIDATION: Strip invalid deps, add warnings (no asserts in prod)
+    # =================================================================
+    # Collect all emitted task keys across all lanes
+    all_emitted_keys = set()
+    for lane_name, lane_tasks in streams.items():
+        for task in lane_tasks:
+            if task.get("_key"):
+                all_emitted_keys.add(f"{lane_name}:{task['_key']}")
+
+    # Validate and fix deps + blocked_by (scheduler treats both as blocking)
+    invalid_deps_found = []
+    for lane_name, lane_tasks in streams.items():
+        for task in lane_tasks:
+            # Validate dep field
+            if "dep" in task:
+                deps = task["dep"].split(",")
+                valid_deps = []
+                for dep in deps:
+                    dep = dep.strip()
+                    if dep in all_emitted_keys:
+                        valid_deps.append(dep)
+                    else:
+                        invalid_deps_found.append((task.get("id", "?"), dep))
+
+                if valid_deps:
+                    task["dep"] = ",".join(valid_deps)
+                else:
+                    del task["dep"]  # Remove empty dep field
+
+            # Validate blocked_by field (same semantics as dep for scheduler)
+            if "blocked_by" in task:
+                blockers = task["blocked_by"].split(",")
+                valid_blockers = []
+                for blocker in blockers:
+                    blocker = blocker.strip()
+                    if blocker in all_emitted_keys:
+                        valid_blockers.append(blocker)
+                    else:
+                        invalid_deps_found.append((task.get("id", "?"), f"BlockedBy:{blocker}"))
+
+                if valid_blockers:
+                    task["blocked_by"] = ",".join(valid_blockers)
+                else:
+                    del task["blocked_by"]  # Remove invalid blocker
+
+    # Log warnings for invalid deps/blockers (visible in plan metadata)
+    dep_warnings = []
+    if invalid_deps_found:
+        for task_id, bad_dep in invalid_deps_found:
+            dep_warnings.append(f"Stripped invalid dep '{bad_dep}' from {task_id}")
+        _plan_debug(f"DEP VALIDATION: {len(invalid_deps_found)} invalid deps/blockers stripped")
 
     # =================================================================
     # BUILD MARKDOWN OUTPUT
@@ -2271,8 +2605,9 @@ def build_plan_from_context(ctx: dict) -> str:
             trace = task.get("trace", "")
             detail = task.get("detail", "")
             priority = task.get("priority", "")
+            plan_key = task.get("_key", "")
 
-            # Remove internal markers
+            # Remove internal markers (but NOT scaffold yet - needed for rendering below)
             task.pop("_spine", None)
             task.pop("_enforcement", None)
             task.pop("_key", None)
@@ -2286,14 +2621,25 @@ def build_plan_from_context(ctx: dict) -> str:
                     task_line += f" | Trace: {trace}"
                 if detail:
                     task_line += f" | Detail: {detail}"
+                # v19.10: Stable per-plan key (enables Dep/BlockedBy wiring on /accept-plan)
+                if plan_key:
+                    task_line += f" | K:{stream_name}:{plan_key}"
                 # TASK 2: Add Dep field if present
                 dep = task.get("dep", "")
                 if dep:
                     task_line += f" | Dep: {dep}"
+                # BOOTSTRAP MODE: Add BlockedBy field if present (entities=0 case)
+                blocked_by = task.get("blocked_by", "")
+                if blocked_by:
+                    task_line += f" | BlockedBy: {blocked_by}"
                 # TASK 3: Add Level field if present
                 level = task.get("level", "")
                 if level:
                     task_line += f" | Level: {level}"
+                # BOOTSTRAP MODE: Add Scaffold tag if present (safe to run without data)
+                scaffold = task.get("scaffold", False)
+                if scaffold:
+                    task_line += " | Scaffold"
                 if priority:
                     task_line += f" | P:{priority}"
 
@@ -2325,95 +2671,77 @@ def build_plan_from_context_structured(ctx: dict) -> dict:
     Returns:
         dict: {"status": "OK"|"INSUFFICIENT_CONTEXT", "streams": [...]}
     """
-    streams = {
-        "Backend": [],
-        "Frontend": [],
-        "QA": [],
-        "Ops": [],
-        "Docs": []
-    }
-
-    task_counter = {"B": 0, "F": 0, "Q": 0, "O": 0, "D": 0}
-
-    user_stories = ctx.get("user_stories", [])
-    api_endpoints = ctx.get("api_endpoints", [])
-    data_entities = ctx.get("data_entities", [])
-    decisions = ctx.get("decisions", [])
-
-    # Check if context is sufficient
+    # Check if context is sufficient (status only; tasks still generated deterministically)
     is_sufficient, _ = _context_is_sufficient(ctx)
 
-    # Docs lane
-    task_counter["D"] += 1
-    streams["Docs"].append({
-        "id": f"T-D{task_counter['D']}",
-        "title": "Declare API strategy",
-        "dod": "SPEC includes API Strategy section",
-        "trace": "SPEC-API"
-    })
+    plan_md = build_plan_from_context(ctx)
+    streams_list = []
+    current_stream = None
 
-    # Backend lane - from API endpoints
-    for ep in api_endpoints:
-        task_counter["B"] += 1
-        method = ep.get("method", "GET")
-        path = ep.get("path", "/unknown")
-        streams["Backend"].append({
-            "id": f"T-B{task_counter['B']}",
-            "title": f"Implement {method} {path}",
-            "dod": f"Endpoint {method} {path} passes tests",
-            "trace": f"SPEC-API-{path}"
-        })
+    for raw_line in plan_md.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
 
-    # Backend lane - from data entities
-    for entity in data_entities:
-        task_counter["B"] += 1
-        name = entity.get("name", "Entity")
-        streams["Backend"].append({
-            "id": f"T-B{task_counter['B']}",
-            "title": f"Implement {name} model",
-            "dod": f"{name} CRUD operations work",
-            "trace": f"SPEC-DATA-{name}"
-        })
+        # Stream header: "## [Backend]"
+        if line.startswith("## [") and line.endswith("]"):
+            name = line[len("## ["):-1].strip()
+            current_stream = {"name": name, "tasks": []}
+            streams_list.append(current_stream)
+            continue
 
-    # Frontend lane - from user stories
-    for story in user_stories:
-        task_counter["F"] += 1
-        story_id = story.get("id", "US-??")
-        streams["Frontend"].append({
-            "id": f"T-F{task_counter['F']}",
-            "title": f"UI for {story_id}",
-            "dod": f"User can complete {story_id} flow",
-            "trace": story_id
-        })
+        # Task line: "- [ ] Backend: Title — DoD: ... | Trace: ..."
+        if current_stream and line.startswith("- [ ]"):
+            task = {"raw": line}
 
-    # QA lane - test tasks for user stories
-    for story in user_stories:
-        task_counter["Q"] += 1
-        story_id = story.get("id", "US-??")
-        streams["QA"].append({
-            "id": f"T-Q{task_counter['Q']}",
-            "title": f"Test {story_id}",
-            "dod": f"E2E test for {story_id} passes",
-            "trace": story_id
-        })
+            # Lane + title (best-effort)
+            try:
+                # Strip checkbox prefix
+                body = line.split("]", 1)[1].strip()
+                m = re.match(r"^(\w+):\s*(.+?)(?:\s+—\s+|$)", body)
+                if m:
+                    task["lane"] = m.group(1).lower()
+                    task["title"] = m.group(2).strip()
+                else:
+                    task["lane"] = str(current_stream.get("name", "")).lower()
+                    task["title"] = body
+            except Exception:
+                task["lane"] = str(current_stream.get("name", "")).lower()
+                task["title"] = line
 
-    # Ops lane - from decisions
-    for dec in decisions:
-        task_counter["O"] += 1
-        dec_type = dec.get("type", "UNKNOWN")
-        streams["Ops"].append({
-            "id": f"T-O{task_counter['O']}",
-            "title": f"Implement {dec_type} decision",
-            "dod": f"Decision {dec.get('id', '???')} enforced",
-            "trace": f"DEC-{dec.get('id', '???')}"
-        })
+            # Common tags (best-effort; keep raw for anything else)
+            trace_match = re.search(r"\|\s*Trace:\s*([^|]+)", line)
+            if trace_match:
+                task["trace"] = trace_match.group(1).strip()
 
-    # Convert to list format
-    streams_list = [
-        {"name": name, "tasks": tasks}
-        for name, tasks in streams.items()
-        if tasks  # Only include non-empty streams
-    ]
+            detail_match = re.search(r"\|\s*Detail:\s*([^|]+)", line)
+            if detail_match:
+                task["detail"] = detail_match.group(1).strip()
+
+            dep_match = re.search(r"\|\s*Dep:\s*([^|]+)", line)
+            if dep_match:
+                task["dep"] = dep_match.group(1).strip()
+
+            blocked_match = re.search(r"\|\s*BlockedBy:\s*([^|]+)", line)
+            if blocked_match:
+                task["blocked_by"] = blocked_match.group(1).strip()
+
+            level_match = re.search(r"\|\s*Level:\s*([^|]+)", line)
+            if level_match:
+                task["level"] = level_match.group(1).strip()
+
+            priority_match = re.search(r"\|\s*P:([A-Z]+)\b", line)
+            if priority_match:
+                task["priority"] = priority_match.group(1).strip().upper()
+
+            key_match = re.search(r"\|\s*K:\s*([^|]+)", line)
+            if key_match:
+                task["plan_key"] = key_match.group(1).strip()
+
+            if "| Scaffold" in line:
+                task["scaffold"] = True
+
+            current_stream["tasks"].append(task)
 
     return {
         "status": "OK" if is_sufficient else "INSUFFICIENT_CONTEXT",
@@ -3123,6 +3451,7 @@ def accept_plan(path: str) -> str:
 
     Expected format:
         - [ ] Type: Description -- DoD: ... | Trace: ... [| P:URGENT|HIGH] [| X:EXC|PAR|ADD]
+              [| K:<lane:key>] [| Dep:<ref,...>] [| BlockedBy:<ref,...>]
         - [x] Type: Description (already done, skipped)
 
     Returns summary of created tasks with v18.0 fields.
@@ -3165,8 +3494,42 @@ def accept_plan(path: str) -> str:
         # v18.0: Compute source_plan_hash for idempotency
         source_plan_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
 
-        # v18.0: Check if this plan was already accepted
+        def _normalize_key(raw_key: str, default_lane: str) -> str:
+            token = (raw_key or "").strip()
+            if not token:
+                return ""
+            if ":" in token:
+                prefix, rest = token.split(":", 1)
+                prefix = prefix.strip().lower()
+                rest = rest.strip()
+                return f"{prefix}:{rest}" if rest else ""
+            return f"{default_lane.lower()}:{token}"
+
+        def _normalize_dep_ref(raw_ref: str, default_lane: str):
+            token = (raw_ref or "").strip()
+            if not token:
+                return None
+            if token.isdigit():
+                return int(token)
+            return _normalize_key(token, default_lane)
+
+        # v18.0: Enhanced task pattern with optional modifiers
+        # - [ ] Type: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR | K:docs:foo | Dep:docs:bar
+        task_pattern = r"^-\s*\[\s*\]\s*(\w+):\s*(.+)$"
+
+        created = []
+        skipped_duplicates = 0
+        now = int(time.time())
+
+        # Track lane_rank per lane for ordering within lane
+        lane_ranks = {lane: 0 for lane in LANE_ORDER}
+
+        tasks_to_insert = []
+
+        # Single tight transaction: idempotency check + inserts + dep resolution
         with get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
             existing = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE source_plan_hash = ?",
                 (source_plan_hash,)
@@ -3178,125 +3541,172 @@ def accept_plan(path: str) -> str:
                     "message": f"Plan already accepted ({existing} tasks from this plan)"
                 })
 
-        # v18.0: Enhanced task pattern with optional modifiers
-        # - [ ] Type: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR
-        task_pattern = r"^-\s*\[\s*\]\s*(\w+):\s*(.+)$"
-
-        created = []
-        skipped_duplicates = 0
-        now = int(time.time())
-
-        # Track lane_rank per lane for ordering within lane
-        lane_ranks = {lane: 0 for lane in LANE_ORDER}
-
-        # Get existing task signatures to skip duplicates
-        with get_db() as conn:
             existing_sigs = set(
                 row[0] for row in conn.execute(
                     "SELECT task_signature FROM tasks WHERE task_signature != ''"
                 ).fetchall()
             )
 
-        tasks_to_insert = []
+            # Feature-detect optional columns for forward/backward compatibility
+            try:
+                task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            except Exception:
+                task_cols = set()
+            has_plan_key_col = "plan_key" in task_cols
 
-        for line in content.split("\n"):
-            match = re.match(task_pattern, line.strip())
-            if not match:
-                continue
+            for line in content.split("\n"):
+                match = re.match(task_pattern, line.strip())
+                if not match:
+                    continue
 
-            task_type = match.group(1).lower()
-            full_desc = match.group(2).strip()
+                task_type = match.group(1).lower()
+                full_desc = match.group(2).strip()
 
-            # v18.0: Normalize lane
-            lane = task_type if task_type in LANE_WEIGHTS else "backend"
+                # v18.0: Normalize lane
+                lane = task_type if task_type in LANE_WEIGHTS else "backend"
 
-            # v18.0: Parse description components
-            # Format: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR
-            desc = full_desc
-            trace = ""
-            priority_override = None
-            exec_class_override = None
+                # Extract Trace if present
+                trace = ""
+                trace_match = re.search(r'\|\s*Trace:\s*([^\|]+)', full_desc)
+                if trace_match:
+                    trace = trace_match.group(1).strip()
 
-            # Extract Trace if present
-            trace_match = re.search(r'\|\s*Trace:\s*([^\|]+)', full_desc)
-            if trace_match:
-                trace = trace_match.group(1).strip()
+                # Extract priority override (P:URGENT or P:HIGH)
+                priority_override = None
+                priority_match = re.search(r'\|\s*P:(URGENT|HIGH)\b', full_desc, re.IGNORECASE)
+                if priority_match:
+                    priority_override = priority_match.group(1).upper()
 
-            # Extract priority override (P:URGENT or P:HIGH)
-            priority_match = re.search(r'\|\s*P:(URGENT|HIGH)\b', full_desc, re.IGNORECASE)
-            if priority_match:
-                priority_override = priority_match.group(1).upper()
+                # Extract exec_class override (X:EXC, X:PAR, X:ADD)
+                exec_class_override = None
+                exec_match = re.search(r'\|\s*X:(EXC|PAR|ADD)\b', full_desc, re.IGNORECASE)
+                if exec_match:
+                    exec_class_override = exec_match.group(1).upper()
 
-            # Extract exec_class override (X:EXC, X:PAR, X:ADD)
-            exec_match = re.search(r'\|\s*X:(EXC|PAR|ADD)\b', full_desc, re.IGNORECASE)
-            if exec_match:
-                exec_class_override = exec_match.group(1).upper()
+                # Extract optional plan key (K:) for dependency wiring
+                plan_key = ""
+                key_match = re.search(r'\|\s*K:\s*([^\|]+)', full_desc)
+                if key_match:
+                    plan_key = _normalize_key(key_match.group(1), lane)
 
-            # v18.0: Compute priority
-            # URGENT=0, HIGH=5, else lane weight
-            if priority_override == "URGENT":
-                priority = 0
-            elif priority_override == "HIGH":
-                priority = 5
-            else:
-                priority = LANE_WEIGHTS.get(lane, 50)
+                # Remove internal tags from stored description (keep DoD/Trace/etc)
+                desc = re.sub(r'\|\s*K:\s*[^\|]+', '', full_desc).strip()
 
-            # v18.0: Classify exec_class
-            exec_class = classify_exec_class(lane, desc, exec_class_override)
+                # v19.0+: Extract Dep: and BlockedBy:
+                deps_tokens = []
+                dep_match = re.search(r'\|\s*Dep:\s*([^\|]+)', full_desc)
+                if dep_match:
+                    deps_tokens.extend([d.strip() for d in dep_match.group(1).split(',') if d.strip()])
+                blocked_match = re.search(r'\|\s*BlockedBy:\s*([^\|]+)', full_desc)
+                if blocked_match:
+                    deps_tokens.extend([d.strip() for d in blocked_match.group(1).split(',') if d.strip()])
 
-            # v18.0: Compute task_signature = sha1(lane:desc:trace)
-            sig_input = f"{lane}:{desc}:{trace}"
-            task_signature = hashlib.sha1(sig_input.encode("utf-8")).hexdigest()
+                deps_norm = []
+                for tok in deps_tokens:
+                    ref = _normalize_dep_ref(tok, lane)
+                    if ref is not None:
+                        deps_norm.append(ref)
 
-            # v18.0: Skip duplicate tasks (same signature already exists)
-            if task_signature in existing_sigs:
-                skipped_duplicates += 1
-                continue
+                # v18.0: Compute priority
+                # URGENT=0, HIGH=5, else lane weight
+                if priority_override == "URGENT":
+                    priority = 0
+                elif priority_override == "HIGH":
+                    priority = 5
+                else:
+                    priority = LANE_WEIGHTS.get(lane, 50)
 
-            # Add to existing_sigs to catch duplicates within same plan
-            existing_sigs.add(task_signature)
+                # v18.0: Classify exec_class
+                exec_class = classify_exec_class(lane, desc, exec_class_override)
 
-            # v18.0: Compute lane_rank (order within lane)
-            lane_rank = lane_ranks.get(lane, 0)
-            lane_ranks[lane] = lane_rank + 1
+                # v18.0: Compute task_signature = sha1(lane:desc:trace)
+                sig_input = f"{lane}:{desc}:{trace}"
+                task_signature = hashlib.sha1(sig_input.encode("utf-8")).hexdigest()
 
-            tasks_to_insert.append({
-                "type": task_type,
-                "desc": desc,
-                "lane": lane,
-                "priority": priority,
-                "lane_rank": lane_rank,
-                "created_at": now,
-                "exec_class": exec_class,
-                "task_signature": task_signature,
-                "source_plan_hash": source_plan_hash,
-                "trace": trace,
-            })
+                # v18.0: Skip duplicate tasks (same signature already exists)
+                if task_signature in existing_sigs:
+                    skipped_duplicates += 1
+                    continue
 
-        # v18.0: Insert all tasks into SQLite
-        with get_db() as conn:
+                # Add to existing_sigs to catch duplicates within same plan
+                existing_sigs.add(task_signature)
+
+                # v18.0: Compute lane_rank (order within lane)
+                lane_rank = lane_ranks.get(lane, 0)
+                lane_ranks[lane] = lane_rank + 1
+
+                tasks_to_insert.append({
+                    "type": task_type,
+                    "desc": desc,
+                    "lane": lane,
+                    "priority": priority,
+                    "lane_rank": lane_rank,
+                    "created_at": now,
+                    "exec_class": exec_class,
+                    "task_signature": task_signature,
+                    "source_plan_hash": source_plan_hash,
+                    "trace": trace,
+                    "plan_key": plan_key,
+                    "deps_tokens": deps_norm,
+                })
+
+            inserted = []
+            key_to_id = {}
+            unresolved_deps = []
+
             for task in tasks_to_insert:
-                cursor = conn.execute(
-                    """INSERT INTO tasks (
-                        type, desc, status, priority, updated_at,
-                        lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash
-                    ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
-                    (
-                        task["type"],
-                        task["desc"],
-                        task["priority"],
-                        now,
-                        task["lane"],
-                        task["lane_rank"],
-                        task["created_at"],
-                        task["exec_class"],
-                        task["task_signature"],
-                        task["source_plan_hash"],
+                if has_plan_key_col:
+                    cursor = conn.execute(
+                        """INSERT INTO tasks (
+                            type, desc, status, priority, updated_at,
+                            lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash, deps, plan_key
+                        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
+                        (
+                            task["type"],
+                            task["desc"],
+                            task["priority"],
+                            now,
+                            task["lane"],
+                            task["lane_rank"],
+                            task["created_at"],
+                            task["exec_class"],
+                            task["task_signature"],
+                            task["source_plan_hash"],
+                            "[]",  # deps resolved after we know IDs
+                            task.get("plan_key", "") or "",
+                        )
                     )
-                )
-                task["id"] = cursor.lastrowid
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO tasks (
+                            type, desc, status, priority, updated_at,
+                            lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash, deps
+                        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
+                        (
+                            task["type"],
+                            task["desc"],
+                            task["priority"],
+                            now,
+                            task["lane"],
+                            task["lane_rank"],
+                            task["created_at"],
+                            task["exec_class"],
+                            task["task_signature"],
+                            task["source_plan_hash"],
+                            "[]",  # deps resolved after we know IDs
+                        )
+                    )
+
+                task_id = cursor.lastrowid
+                task["id"] = task_id
+                inserted.append(task)
+
+                if task.get("plan_key"):
+                    # Last write wins; ambiguity is surfaced via unresolved deps during resolution.
+                    key_to_id[task["plan_key"]] = task_id
+
                 created.append({
-                    "id": task["id"],
+                    "id": task_id,
                     "type": task["type"],
                     "desc": task["desc"],
                     "lane": task["lane"],
@@ -3306,7 +3716,40 @@ def accept_plan(path: str) -> str:
                     "exec_class": task["exec_class"],
                     "task_signature": task["task_signature"],
                 })
+
+            # Resolve deps: key refs -> task IDs; keep unknown tokens to block + surface.
+            for task in inserted:
+                resolved = []
+                for ref in task.get("deps_tokens", []):
+                    if isinstance(ref, int):
+                        resolved.append(ref)
+                    elif isinstance(ref, str) and ref in key_to_id:
+                        resolved.append(key_to_id[ref])
+                    else:
+                        resolved.append(ref)
+
+                # De-duplicate while preserving order
+                seen = set()
+                deps_final = []
+                for ref in resolved:
+                    if ref in seen:
+                        continue
+                    seen.add(ref)
+                    deps_final.append(ref)
+
+                conn.execute(
+                    "UPDATE tasks SET deps=? WHERE id=?",
+                    (json.dumps(deps_final), task["id"])
+                )
+
+                unresolved = [d for d in deps_final if isinstance(d, str)]
+                if unresolved:
+                    unresolved_deps.append({"id": task["id"], "unresolved": unresolved[:5]})
+
             conn.commit()
+
+        if unresolved_deps:
+            server_logger.warning(f"accept_plan: {len(unresolved_deps)} task(s) have unresolved deps (will remain blocked)")
 
         # v18.0: Create plan_preview.json derived from SQLite
         _write_plan_preview_from_sqlite()
@@ -3317,6 +3760,7 @@ def accept_plan(path: str) -> str:
             "skipped_duplicates": skipped_duplicates,
             "plan_hash": source_plan_hash,
             "tasks": created,
+            "unresolved_deps": unresolved_deps[:10],
             "message": f"Created {len(created)} tasks from {os.path.basename(path)}"
         })
     except Exception as e:
@@ -3380,13 +3824,26 @@ def _write_plan_preview_from_sqlite():
 # v18.0: BRAIDED STREAM SCHEDULER
 # =============================================================================
 
-def _read_lane_pointer() -> dict:
+def _read_lane_pointer(conn=None) -> dict:
     """
     Read the lane pointer state from persistent storage.
 
     Returns:
         dict with "index" key (default 0 if file missing/corrupt)
     """
+    # Prefer SQLite-backed pointer when a connection is available (transactional + concurrent-safe).
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key='scheduler_lane_pointer'"
+            ).fetchone()
+            if row and row[0]:
+                data = json.loads(row[0])
+                if isinstance(data, dict) and isinstance(data.get("index"), int):
+                    return data
+        except Exception:
+            pass  # Fail open to file-backed pointer
+
     pointer_file = _get_lane_pointer_file()
     try:
         if os.path.exists(pointer_file):
@@ -3399,7 +3856,7 @@ def _read_lane_pointer() -> dict:
     return {"index": 0}
 
 
-def _write_lane_pointer(index: int, lane: str = None):
+def _write_lane_pointer(index: int, lane: str = None, conn=None):
     """
     Write lane pointer state atomically (write temp then replace).
 
@@ -3419,8 +3876,19 @@ def _write_lane_pointer(index: int, lane: str = None):
         "updated_at": int(time.time())
     }
 
+    # Persist in SQLite config when possible (keeps pointer in same transaction as scheduling).
+    if conn is not None:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('scheduler_lane_pointer', ?)",
+                (json.dumps(data),)
+            )
+        except Exception:
+            pass  # Fail open to file-backed pointer only
+
     # Atomic write: temp file then replace
-    temp_file = pointer_file + ".tmp"
+    import uuid
+    temp_file = pointer_file + f".tmp.{uuid.uuid4().hex}"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f)
@@ -3429,6 +3897,199 @@ def _write_lane_pointer(index: int, lane: str = None):
         server_logger.warning(f"Failed to write lane pointer: {e}")
         if os.path.exists(temp_file):
             os.remove(temp_file)
+
+def _write_scheduler_last_decision(conn, payload: dict):
+    """Persist last scheduler decision for UI/observability (best-effort)."""
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES ('scheduler_last_decision', ?)",
+            (json.dumps(payload),)
+        )
+    except Exception:
+        pass
+
+
+def _increment_config_counter(conn, key: str, delta: int = 1):
+    """Atomic-ish integer counter using config table (best-effort)."""
+    if conn is None:
+        return
+    try:
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, '0')", (key,))
+        conn.execute(
+            "UPDATE config SET value = CAST(value AS INTEGER) + ? WHERE key = ?",
+            (int(delta), key)
+        )
+    except Exception:
+        # Metrics must never break scheduling.
+        pass
+
+
+def _write_config_json(conn, key: str, payload: dict):
+    """Best-effort JSON value write to config table."""
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            (key, json.dumps(payload)),
+        )
+    except Exception:
+        pass
+
+
+def _normalize_task_lane_fields(conn, now: int) -> dict:
+    """
+    Repair legacy/partial rows so braided scheduling can operate safely.
+    - lane missing -> lane := lower(type) for known lanes
+    - lane_rank missing -> lane_rank := index in LANE_ORDER
+    - created_at missing (0) -> created_at := updated_at (or now)
+    Best-effort; no-op when schema lacks columns.
+    """
+    result = {"lane_filled": 0, "lane_rank_fixed": 0, "created_at_fixed": 0}
+    if conn is None:
+        return result
+
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    except Exception:
+        return result
+
+    if {"lane", "type"} <= cols:
+        try:
+            placeholders = ",".join("?" * len(LANE_ORDER))
+            cursor = conn.execute(
+                f"""UPDATE tasks
+                    SET lane = lower(type)
+                    WHERE (lane IS NULL OR lane = '')
+                      AND lower(type) IN ({placeholders})""",
+                list(LANE_ORDER),
+            )
+            result["lane_filled"] = cursor.rowcount
+        except Exception:
+            pass
+
+    if {"lane_rank", "lane"} <= cols:
+        try:
+            cursor = conn.execute(
+                """UPDATE tasks
+                   SET lane_rank = CASE lower(lane)
+                       WHEN 'backend' THEN 0
+                       WHEN 'frontend' THEN 1
+                       WHEN 'qa' THEN 2
+                       WHEN 'ops' THEN 3
+                       WHEN 'docs' THEN 4
+                       ELSE lane_rank
+                   END
+                   WHERE lower(lane) IN ('backend', 'frontend', 'qa', 'ops', 'docs')
+                     AND (lane_rank IS NULL OR lane_rank < 0 OR lane_rank > 4 OR (lane_rank = 0 AND lower(lane) != 'backend'))"""
+            )
+            result["lane_rank_fixed"] = cursor.rowcount
+        except Exception:
+            pass
+
+    if "created_at" in cols:
+        try:
+            if "updated_at" in cols:
+                cursor = conn.execute(
+                    """UPDATE tasks
+                       SET created_at = COALESCE(NULLIF(updated_at, 0), ?)
+                       WHERE created_at IS NULL OR created_at = 0""",
+                    (now,),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE tasks SET created_at = ? WHERE created_at IS NULL OR created_at = 0",
+                    (now,),
+                )
+            result["created_at_fixed"] = cursor.rowcount
+        except Exception:
+            pass
+
+    return result
+
+
+def _reap_stale_in_progress(conn, now: int) -> dict:
+    """
+    Crash recovery: requeue tasks stuck in_progress beyond a lease window.
+    Uses updated_at as last-seen heartbeat (workers may be killed mid-task).
+    """
+    try:
+        stale_after_s = int(os.getenv("MESH_STALE_IN_PROGRESS_SECS", "1800") or "1800")
+    except Exception:
+        stale_after_s = 1800
+
+    if stale_after_s <= 0:
+        return {"reaped": 0, "stale_after_s": stale_after_s, "cutoff": None}
+
+    cutoff = now - stale_after_s
+
+    sample_ids: list[int] = []
+    oldest_age_s: int | None = None
+    try:
+        rows = conn.execute(
+            """SELECT id, COALESCE(updated_at, 0) AS updated_at
+               FROM tasks
+               WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?
+               ORDER BY COALESCE(updated_at, 0) ASC
+               LIMIT 10""",
+            (cutoff,)
+        ).fetchall()
+        for r in rows[:5]:
+            try:
+                sample_ids.append(int(r["id"]))
+            except Exception:
+                continue
+        if rows:
+            try:
+                oldest_age_s = int(now - int(rows[0]["updated_at"] or 0))
+            except Exception:
+                oldest_age_s = None
+    except Exception:
+        pass
+
+    # Prefer updating retry_count if present, but fail-open on older schemas.
+    try:
+        cursor = conn.execute(
+            """UPDATE tasks
+               SET status='pending', worker_id=NULL, updated_at=?, retry_count=retry_count+1  -- SAFETY-ALLOW: status-write
+               WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
+            (now, cutoff)
+        )
+        return {
+            "reaped": cursor.rowcount,
+            "stale_after_s": stale_after_s,
+            "cutoff": cutoff,
+            "sample_ids": sample_ids,
+            "oldest_age_s": oldest_age_s,
+        }
+    except Exception as e:
+        try:
+            cursor = conn.execute(
+                """UPDATE tasks
+                   SET status='pending', worker_id=NULL, updated_at=?  -- SAFETY-ALLOW: status-write
+                   WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
+                (now, cutoff)
+            )
+            return {
+                "reaped": cursor.rowcount,
+                "stale_after_s": stale_after_s,
+                "cutoff": cutoff,
+                "warning": str(e),
+                "sample_ids": sample_ids,
+                "oldest_age_s": oldest_age_s,
+            }
+        except Exception as e2:
+            server_logger.warning(f"Stale task reaper failed: {e2}")
+            return {
+                "reaped": 0,
+                "stale_after_s": stale_after_s,
+                "cutoff": cutoff,
+                "error": str(e2),
+                "sample_ids": sample_ids,
+                "oldest_age_s": oldest_age_s,
+            }
 
 
 def _check_dependencies_satisfied(task_id: int, deps_json: str, conn) -> bool:
@@ -3449,41 +4110,118 @@ def _check_dependencies_satisfied(task_id: int, deps_json: str, conn) -> bool:
         - All deps completed → True
         - Any dep not completed → False
     """
+    status = _dependency_status(task_id, deps_json, conn)
+    return bool(status.get("satisfied"))
+
+
+def _dependency_status(task_id: int, deps_json: str, conn) -> dict:
+    """
+    Return dependency status + reasons (used by scheduler/UI diagnostics).
+
+    deps is stored as JSON and may contain:
+      - ints (task IDs)
+      - numeric strings (treated as task IDs)
+      - opaque tokens (treated as unknown deps; block)
+    """
     try:
-        deps = json.loads(deps_json) if deps_json else []
-        if not deps:
-            return True
-
-        # Check how many deps exist in DB
-        placeholders = ",".join("?" * len(deps))
-        existing = conn.execute(
-            f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders})",
-            deps
-        ).fetchone()[0]
-
-        # Block if any deps are unknown (safer than ignoring)
-        if existing != len(deps):
-            server_logger.warning(
-                f"Task {task_id}: {len(deps) - existing} unknown dependency IDs in {deps}"
-            )
-            return False
-
-        # Check if all existing dependencies are completed
-        completed = conn.execute(
-            f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders}) AND status='completed'",
-            deps
-        ).fetchone()[0]
-        return completed == len(deps)
-
+        deps_raw = json.loads(deps_json) if deps_json else []
     except json.JSONDecodeError as e:
-        server_logger.warning(f"Task {task_id}: Invalid deps JSON '{deps_json}': {e}")
-        return False  # Block on malformed deps (safer)
-    except Exception as e:
-        server_logger.warning(f"Task {task_id}: Dependency check error: {e}")
-        return False  # Block on errors (safer)
+        return {
+            "satisfied": False,
+            "reason": "INVALID_JSON",
+            "error": str(e),
+            "raw": deps_json,
+            "unknown_tokens": [deps_json] if deps_json else [],
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    if not deps_raw:
+        return {
+            "satisfied": True,
+            "reason": "NO_DEPS",
+            "unknown_tokens": [],
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    dep_ids: list[int] = []
+    unknown_tokens: list[str] = []
+    for item in deps_raw:
+        if isinstance(item, bool):
+            unknown_tokens.append(str(item))
+            continue
+        if isinstance(item, int):
+            dep_ids.append(item)
+            continue
+        if isinstance(item, str):
+            token = item.strip()
+            if token.isdigit():
+                dep_ids.append(int(token))
+            else:
+                unknown_tokens.append(token)
+            continue
+        unknown_tokens.append(str(item))
+
+    # De-duplicate while preserving order (avoid false "unknown" counts)
+    seen = set()
+    dep_ids_unique: list[int] = []
+    for dep_id in dep_ids:
+        if dep_id in seen:
+            continue
+        seen.add(dep_id)
+        dep_ids_unique.append(dep_id)
+
+    if not dep_ids_unique:
+        return {
+            "satisfied": False,
+            "reason": "UNKNOWN_DEPS",
+            "unknown_tokens": unknown_tokens,
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    placeholders = ",".join("?" * len(dep_ids_unique))
+    rows = conn.execute(
+        f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+        dep_ids_unique
+    ).fetchall()
+    status_by_id = {int(r["id"]): (r["status"] or "") for r in rows}
+
+    missing_ids = [dep_id for dep_id in dep_ids_unique if dep_id not in status_by_id]
+    if missing_ids or unknown_tokens:
+        return {
+            "satisfied": False,
+            "reason": "MISSING_DEPS" if missing_ids else "UNKNOWN_DEPS",
+            "unknown_tokens": unknown_tokens,
+            "missing_ids": missing_ids,
+            "incomplete_ids": [],
+        }
+
+    incomplete_ids = [
+        dep_id for dep_id, st in status_by_id.items()
+        if str(st).lower() != "completed"
+    ]
+    if incomplete_ids:
+        return {
+            "satisfied": False,
+            "reason": "INCOMPLETE_DEPS",
+            "unknown_tokens": [],
+            "missing_ids": [],
+            "incomplete_ids": incomplete_ids,
+        }
+
+    return {
+        "satisfied": True,
+        "reason": "OK",
+        "unknown_tokens": [],
+        "missing_ids": [],
+        "incomplete_ids": [],
+    }
 
 
-def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
+@mcp.tool()
+def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, worker_type: str = None) -> str:
     """
     v18.0: Braided stream scheduler - picks next task with round-robin across lanes.
 
@@ -3505,36 +4243,179 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
     Returns:
         JSON with task info or {"status": "NO_WORK"}
     """
-    if blocked_lanes is None:
-        blocked_lanes = set()
+    blocked_lane_set: set[str] = set()
+    if blocked_lanes:
+        if isinstance(blocked_lanes, str):
+            token = blocked_lanes.strip()
+            # Support callers that pass JSON arrays as strings (e.g. CLI wrappers).
+            if token.startswith("[") and token.endswith("]"):
+                try:
+                    data = json.loads(token)
+                    if isinstance(data, list):
+                        blocked_lane_set = {str(x).strip().lower() for x in data if str(x).strip()}
+                    else:
+                        blocked_lane_set = {token.lower()}
+                except json.JSONDecodeError:
+                    blocked_lane_set = {token.lower()}
+            else:
+                blocked_lane_set = {token.lower()}
+        else:
+            try:
+                blocked_lane_set = {str(x).strip().lower() for x in set(blocked_lanes) if x is not None and str(x).strip()}
+            except TypeError:
+                blocked_lane_set = {str(blocked_lanes).strip().lower()}
+
+    # =========================================================================
+    # v20.1: Server-side lane validation (fail closed)
+    # If worker_type is provided, enforce lane restrictions server-side.
+    # This prevents misrouting even if the client doesn't send blocked_lanes.
+    # =========================================================================
+    if worker_type:
+        policy = _resolve_worker_lane_policy(worker_id, worker_type)
+        if not policy.get("ok"):
+            server_logger.warning(
+                f"SCHEDULER_REJECTED | worker_id={worker_id} worker_type={worker_type} "
+                f"error={policy.get('error')}"
+            )
+            return json.dumps({
+                "status": "NO_WORK",
+                "reason": "WORKER_POLICY_ERROR",
+                "error": policy.get("error"),
+                "pending_total": 0,
+            })
+
+        # Compute blocked lanes = all lanes NOT in allowed_lanes
+        allowed_lanes = policy.get("allowed_lanes", set())
+        server_blocked_lanes = set(LANE_ORDER) - allowed_lanes
+        # Merge with client-provided blocked lanes (union)
+        blocked_lane_set = blocked_lane_set | server_blocked_lanes
+        server_logger.debug(
+            f"SCHEDULER_LANE_POLICY | worker_id={worker_id} role={policy.get('role')} "
+            f"allowed={allowed_lanes} server_blocked={server_blocked_lanes} final_blocked={blocked_lane_set}"
+        )
 
     try:
         with get_db() as conn:
             now = int(time.time())
+            _increment_config_counter(conn, "scheduler_pick_calls_total", 1)
+
+            # Repair legacy rows that would otherwise be invisible to braided scheduling.
+            normalized = _normalize_task_lane_fields(conn, now)
+            if any(normalized.values()):
+                _increment_config_counter(conn, "scheduler_lane_normalize_total", 1)
+                _write_config_json(conn, "scheduler_lane_normalize_last", {"ts": now, **normalized})
+                server_logger.info(f"SCHEDULER_NORMALIZE | {json.dumps({'ts': now, **normalized})}")
+
+            policy = _resolve_worker_lane_policy(worker_id, worker_type)
+            if not policy.get("ok"):
+                _increment_config_counter(conn, "scheduler_denied_total", 1)
+                decision = {
+                    "picked_id": None,
+                    "reason": "denied",
+                    "error": policy.get("error"),
+                    "worker_id": worker_id,
+                    "worker_type": worker_type,
+                    "ts": now,
+                }
+                _write_scheduler_last_decision(conn, decision)
+                server_logger.warning(
+                    f"SCHEDULER_DENY | worker_id={worker_id} worker_type={worker_type} error={policy.get('error')}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "message": "Scheduler denied (worker role/lane policy)",
+                    "error": policy.get("error"),
+                })
+
+            worker_role = policy.get("role")
+            allowed_lanes: set[str] = set(policy.get("allowed_lanes") or set())
+            disallowed_lanes = set(LANE_ORDER) - allowed_lanes
+
+            # Merge policy enforcement into the existing blocked-lanes mechanism.
+            client_blocked_lanes = set(blocked_lane_set)
+            blocked_lane_set |= disallowed_lanes
+
+            eligible_lanes = [lane for lane in LANE_ORDER if lane not in blocked_lane_set]
+            if not eligible_lanes:
+                _increment_config_counter(conn, "scheduler_no_work_blocked_by_lanes_total", 1)
+                decision = {
+                    "picked_id": None,
+                    "reason": "no_work",
+                    "no_work_reason": "blocked_by_lanes",
+                    "worker_role": worker_role,
+                    "allowed_lanes": sorted(list(allowed_lanes)),
+                    "client_blocked_lanes": sorted(list(client_blocked_lanes)),
+                    "ts": now,
+                }
+                _write_scheduler_last_decision(conn, decision)
+                return json.dumps({
+                    "status": "NO_WORK",
+                    "message": "No eligible lanes for this worker (blocked by lane policy/preferences)",
+                    "no_work_reason": "blocked_by_lanes",
+                    "allowed_lanes": sorted(list(allowed_lanes)),
+                    "blocked_lanes": sorted(list(blocked_lane_set)),
+                })
+
+            reap = _reap_stale_in_progress(conn, now)
+            _increment_config_counter(conn, "scheduler_reaper_runs_total", 1)
+            if reap.get("reaped", 0):
+                _increment_config_counter(conn, "scheduler_reaper_reaped_total", int(reap.get("reaped", 0)))
+                _write_config_json(conn, "scheduler_reaper_last", {"ts": now, **reap})
+                server_logger.warning(
+                    f"Crash recovery: re-queued {reap['reaped']} stale in_progress task(s) "
+                    f"(cutoff={reap.get('cutoff')}, stale_after_s={reap.get('stale_after_s')}, "
+                    f"oldest_age_s={reap.get('oldest_age_s')}, sample_ids={reap.get('sample_ids')})"
+                )
 
             # =========================================================
             # Step 1: PREEMPTION CHECK (URGENT=0, HIGH=5)
             # =========================================================
-            preempt_task = conn.execute(
-                """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
-                   FROM tasks
-                   WHERE status = 'pending' AND priority IN (0, 5)
-                   ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
-                   LIMIT 10"""
-            ).fetchall()
+            preempt_task = []
+            if eligible_lanes:
+                placeholders = ",".join("?" * len(eligible_lanes))
+                preempt_task = conn.execute(
+                    f"""SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                        FROM tasks
+                        WHERE status = 'pending' AND priority IN (0, 5)
+                          AND lane IN ({placeholders})
+                        ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
+                        LIMIT 10""",
+                    eligible_lanes
+                ).fetchall()
 
             # Find first preempt task with satisfied dependencies
             for task in preempt_task:
-                if _check_dependencies_satisfied(task["id"], task["deps"], conn):
+                if task["lane"] in blocked_lane_set:
+                    continue
+                dep_status = _dependency_status(task["id"], task["deps"], conn)
+                if dep_status.get("satisfied"):
                     # Atomic claim: UPDATE only if still pending (prevents double-claim)
                     cursor = conn.execute(
-                        "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'",
+                        "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
                         (worker_id, now, task["id"])
                     )
                     if cursor.rowcount == 0:
                         # Task was claimed by another worker, try next
                         continue
+                    decision_reason = "urgent" if int(task["priority"]) == 0 else "high"
+                    pointer = _read_lane_pointer(conn)
+                    decision = {
+                        "picked_id": task["id"],
+                        "lane": task["lane"],
+                        "priority": task["priority"],
+                        "reason": decision_reason,
+                        "preempted": True,
+                        "pointer_index": pointer.get("index", 0),
+                        "pointer_lane": pointer.get("lane"),
+                        "worker_id": worker_id,
+                        "ts": now,
+                    }
+                    _write_scheduler_last_decision(conn, decision)
                     conn.commit()
+                    server_logger.info(
+                        f"SCHEDULER_DECISION | picked={task['id']} lane={task['lane']} "
+                        f"reason={decision_reason} preempted=1 pointer={decision.get('pointer_index')}"
+                    )
 
                     return json.dumps({
                         "status": "OK",
@@ -3545,14 +4426,18 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
                         "priority": task["priority"],
                         "lane_rank": task["lane_rank"],
                         "exec_class": task["exec_class"],
-                        "preempted": True
+                        "preempted": True,
+                        "decision_reason": decision_reason,
+                        "pointer_index": decision.get("pointer_index", 0),
                     })
 
             # =========================================================
             # Step 2: BRAID - Round-robin across lanes
             # =========================================================
-            pointer = _read_lane_pointer()
+            pointer = _read_lane_pointer(conn)
             start_index = pointer.get("index", 0)
+
+            lane_debug = {}
 
             # Try each lane starting from pointer position
             for offset in range(len(LANE_ORDER)):
@@ -3560,7 +4445,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
                 lane = LANE_ORDER[lane_index]
 
                 # Skip blocked lanes
-                if lane in blocked_lanes:
+                if lane in blocked_lane_set:
                     continue
 
                 # Find best pending task in this lane
@@ -3575,20 +4460,38 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
 
                 # Find first task with satisfied dependencies
                 for candidate in task:
-                    if _check_dependencies_satisfied(candidate["id"], candidate["deps"], conn):
+                    dep_status = _dependency_status(candidate["id"], candidate["deps"], conn)
+                    if dep_status.get("satisfied"):
                         # Atomic claim: UPDATE only if still pending (prevents double-claim)
                         cursor = conn.execute(
-                            "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'",
+                            "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
                             (worker_id, now, candidate["id"])
                         )
                         if cursor.rowcount == 0:
                             # Task was claimed by another worker, try next
                             continue
-                        conn.commit()
 
                         # Advance pointer to next lane (after the one we picked from)
                         next_index = (lane_index + 1) % len(LANE_ORDER)
-                        _write_lane_pointer(next_index, LANE_ORDER[next_index])
+                        _write_lane_pointer(next_index, LANE_ORDER[next_index], conn=conn)
+
+                        decision = {
+                            "picked_id": candidate["id"],
+                            "lane": candidate["lane"],
+                            "priority": candidate["priority"],
+                            "reason": "rotation",
+                            "preempted": False,
+                            "pointer_start_index": start_index,
+                            "pointer_next_index": next_index,
+                            "worker_id": worker_id,
+                            "ts": now,
+                        }
+                        _write_scheduler_last_decision(conn, decision)
+                        conn.commit()
+                        server_logger.info(
+                            f"SCHEDULER_DECISION | picked={candidate['id']} lane={candidate['lane']} "
+                            f"reason=rotation preempted=0 pointer={next_index}"
+                        )
 
                         return json.dumps({
                             "status": "OK",
@@ -3599,13 +4502,48 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: set = None) -> str:
                             "priority": candidate["priority"],
                             "lane_rank": candidate["lane_rank"],
                             "exec_class": candidate["exec_class"],
-                            "preempted": False
+                            "preempted": False,
+                            "decision_reason": "rotation",
+                            "pointer_index": next_index,
                         })
+                    # Record first blocked reason per lane for diagnostics
+                    if lane not in lane_debug:
+                        lane_debug[lane] = {
+                            "blocked_reason": dep_status.get("reason"),
+                            "unknown_tokens": dep_status.get("unknown_tokens", [])[:3],
+                            "missing_ids": dep_status.get("missing_ids", [])[:3],
+                            "incomplete_ids": dep_status.get("incomplete_ids", [])[:3],
+                        }
 
             # No work found in any lane
+            pending_total = 0
+            try:
+                pending_total = int(conn.execute("SELECT COUNT(*) FROM tasks WHERE status='pending'").fetchone()[0])
+            except Exception:
+                pending_total = 0
+
+            message = "No pending tasks available"
+            if pending_total > 0:
+                message = "No runnable tasks (pending tasks are blocked by dependencies)"
+                server_logger.warning(f"Scheduler idle: {pending_total} pending task(s) blocked by deps")
+
+            decision = {
+                "picked_id": None,
+                "reason": "no_work",
+                "pointer_index": start_index,
+                "pending_total": pending_total,
+                "blocked_lanes": lane_debug,
+                "worker_id": worker_id,
+                "ts": now,
+            }
+            _write_scheduler_last_decision(conn, decision)
+
             return json.dumps({
                 "status": "NO_WORK",
-                "message": "No pending tasks available"
+                "message": message,
+                "pending_total": pending_total,
+                "blocked_lanes": lane_debug,
+                "pointer_index": start_index,
             })
 
     except Exception as e:
@@ -3708,7 +4646,7 @@ def detect_project_profile(project_root: str) -> str:
                     return "node_backend"
                     
                 return "node_general"
-            except:
+            except Exception:
                 return "node_general"
         
         # Check for Python projects
@@ -3724,7 +4662,7 @@ def detect_project_profile(project_root: str) -> str:
                             return "python_backend"
                         if "pandas" in content or "numpy" in content or "scikit" in content:
                             return "python_data"
-                    except:
+                    except Exception:
                         pass
             return "python_backend"
         
@@ -4241,17 +5179,17 @@ def get_release_readiness() -> str:
 
     if os.path.exists(ledger_path):
         try:
-            with open(ledger_path, "r") as f:
-                lines = f.readlines()
-                # Get last 3 valid JSON lines
-                for line in reversed(lines):
-                    if len(last_actions) >= 3:
-                        break
-                    try:
-                        last_actions.append(json.loads(line.strip()))
-                    except:
-                        pass
-        except:
+            # Bounded tail read (avoid unbounded readlines() on large ledgers)
+            lines = _tail_text_lines(ledger_path, max_lines=200, encoding="utf-8")
+            # Get last 3 valid JSON lines
+            for line in reversed(lines):
+                if len(last_actions) >= 3:
+                    break
+                try:
+                    last_actions.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+        except Exception:
             pass
 
     if not last_actions:
@@ -4351,7 +5289,7 @@ def get_ledger_report(days: int = 7) -> str:
                             entry_date = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                             if entry_date.replace(tzinfo=None) < cutoff:
                                 continue
-                        except:
+                        except Exception:
                             pass
 
                     # Actor Stats
@@ -4733,7 +5671,7 @@ def get_drift_report() -> str:
             return None
         try:
             return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except:
+        except Exception:
             return None
 
     now = datetime.now()
@@ -4789,7 +5727,7 @@ def get_drift_report() -> str:
                     dt = parse_iso(ts)
                     if dt:
                         ages.append((now - dt).total_seconds() / 3600)
-                except:
+                except Exception:
                     continue
 
             if ages:
@@ -5057,7 +5995,15 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
 
     # 2. Scan Codebase (multiple directories)
     scan_dirs = [scan_dir, "lib", "app", "api", "services", "core"]
-    code_extensions = [".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"]
+    code_extensions = (".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs")
+
+    # Regex: Find # Implements [ID] or # Implements [ID, ID2]
+    # Also matches // Implements [ID] for JS/TS
+    implements_re = re.compile(r'[#/]+\s*Implements\s*\[([A-Z0-9,\s\-_]+)\]', re.IGNORECASE)
+
+    # Internal caches to keep de-dup O(1) while preserving output format
+    seen_line_entries = {}  # src_id -> set("rel/path:line")
+    seen_orphans = set()    # (src_id, rel_path, line_num)
 
     for scan_path in scan_dirs:
         full_path = os.path.join(BASE_DIR, scan_path)
@@ -5069,7 +6015,7 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
             dirs[:] = [d for d in dirs if d not in ['node_modules', '__pycache__', '.git', 'venv', '.venv']]
 
             for file in files:
-                if not any(file.endswith(ext) for ext in code_extensions):
+                if not file.endswith(code_extensions):
                     continue
 
                 file_path = os.path.join(root, file)
@@ -5077,39 +6023,46 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
 
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+                        for line_num, line in enumerate(f, start=1):
+                            # Fast path: avoid regex work when marker absent
+                            if "implements" not in line.lower():
+                                continue
+
+                            for match in implements_re.finditer(line):
+                                raw_ids = match.group(1)
+
+                                # Split "ID1, ID2"
+                                ids = [i.strip().upper() for i in raw_ids.split(",") if i.strip()]
+
+                                for src_id in ids:
+                                    # Init entry
+                                    if src_id not in provenance_data["sources"]:
+                                        provenance_data["sources"][src_id] = {"files": [], "lines": [], "tasks": []}
+
+                                    # Record hit (avoid duplicates)
+                                    file_entry = f"{rel_path}:{line_num}"
+                                    src_seen = seen_line_entries.get(src_id)
+                                    if src_seen is None:
+                                        src_seen = set()
+                                        seen_line_entries[src_id] = src_seen
+
+                                    if file_entry not in src_seen:
+                                        src_seen.add(file_entry)
+                                        provenance_data["sources"][src_id]["files"].append(rel_path)
+                                        provenance_data["sources"][src_id]["lines"].append(file_entry)
+
+                                    # Orphan check: Code claims source that doesn't exist
+                                    if valid_ids and src_id not in valid_ids:
+                                        orphan_key = (src_id, rel_path, line_num)
+                                        if orphan_key not in seen_orphans:
+                                            seen_orphans.add(orphan_key)
+                                            provenance_data["orphans"].append({
+                                                "id": src_id,
+                                                "file": rel_path,
+                                                "line": line_num
+                                            })
                 except Exception:
                     continue
-
-                # Regex: Find # Implements [ID] or # Implements [ID, ID2]
-                # Also matches // Implements [ID] for JS/TS
-                pattern = r'[#/]+\s*Implements\s*\[([A-Z0-9,\s\-_]+)\]'
-                matches = re.finditer(pattern, content, re.IGNORECASE)
-
-                for match in matches:
-                    raw_ids = match.group(1)
-                    # Find line number
-                    line_num = content[:match.start()].count('\n') + 1
-
-                    # Split "ID1, ID2"
-                    ids = [i.strip().upper() for i in raw_ids.split(",") if i.strip()]
-
-                    for src_id in ids:
-                        # Init entry
-                        if src_id not in provenance_data["sources"]:
-                            provenance_data["sources"][src_id] = {"files": [], "lines": [], "tasks": []}
-
-                        # Record hit (avoid duplicates)
-                        file_entry = f"{rel_path}:{line_num}"
-                        if file_entry not in provenance_data["sources"][src_id]["lines"]:
-                            provenance_data["sources"][src_id]["files"].append(rel_path)
-                            provenance_data["sources"][src_id]["lines"].append(file_entry)
-
-                        # Orphan check: Code claims source that doesn't exist
-                        if valid_ids and src_id not in valid_ids:
-                            orphan_entry = {"id": src_id, "file": rel_path, "line": line_num}
-                            if orphan_entry not in provenance_data["orphans"]:
-                                provenance_data["orphans"].append(orphan_entry)
 
     # 3. Link Tasks (The Intent)
     if STATE_MACHINE_AVAILABLE:
@@ -6689,7 +7642,7 @@ def get_planner_context(goal: str = "") -> str:
             with open(coverage_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 stats = data.get("summary", {})
-        except:
+        except Exception:
             pass
 
     return json.dumps({
@@ -7133,7 +8086,7 @@ def get_safe_librarian_files(files: str) -> str:
     if files.startswith("["):
         try:
             file_list = json.loads(files)
-        except:
+        except json.JSONDecodeError:
             file_list = [f.strip() for f in files.split(",")]
     else:
         file_list = [f.strip() for f in files.split(",")]
@@ -7820,7 +8773,7 @@ def get_mode() -> str:
                 return "converge"
             else:
                 return "vibe"
-        except:
+        except Exception:
             pass
     
     # Fall back to manual mode
@@ -7864,7 +8817,7 @@ def get_current_mode() -> str:
                 milestone = date.fromisoformat(f.read().strip())
             days_left = (milestone - date.today()).days
             auto_msg = f" (Auto: {days_left} days to milestone)"
-        except:
+        except Exception:
             pass
     
     icons = {"vibe": "🟢", "converge": "🟡", "ship": "🔴"}
@@ -7969,7 +8922,13 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
        - If Parent COMPLETED -> Execute Child
     """
     with get_db() as conn:
-        run_watchdog(conn)
+        now = int(time.time())
+        reap = _reap_stale_in_progress(conn, now)
+        if reap.get("reaped", 0):
+            server_logger.warning(
+                f"Crash recovery: re-queued {reap['reaped']} stale in_progress task(s) "
+                f"(cutoff={reap.get('cutoff')}, stale_after_s={reap.get('stale_after_s')})"
+            )
         
         # 1. THROTTLING
         if worker_type == TaskType.BACKEND:
@@ -7986,37 +8945,52 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
         )
         
         for task in cursor.fetchall():
-            deps = json.loads(task['deps'])
-            
-            if deps:
-                # Check status of ALL dependencies
-                placeholders = ','.join('?' for _ in deps)
-                dep_rows = conn.execute(
-                    f"SELECT status FROM tasks WHERE id IN ({placeholders})", deps
-                ).fetchall()
-                
-                statuses = [r[0] for r in dep_rows]
-                
-                # CONDITION 1: CASCADING BLOCK (Partial Halt)
-                # If any parent failed or is blocked, this task must block
-                if 'failed' in statuses or 'blocked' in statuses:
-                    if task['status'] != 'blocked':
+            deps_json = task["deps"]
+            task_status = str(task["status"]).lower() if task["status"] else ""
+            dep_status = _dependency_status(task["id"], deps_json, conn)
+
+            # Dependency hardening: unknown/missing deps block (never runnable).
+            if not dep_status.get("satisfied"):
+                reason = dep_status.get("reason")
+
+                # Structural blockers: keep task blocked (and surface via status)
+                if reason in ("UNKNOWN_DEPS", "MISSING_DEPS", "INVALID_JSON"):
+                    if task_status != "blocked":
                         conn.execute(
                             "UPDATE tasks SET status='blocked', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                            (int(time.time()), task['id'])
+                            (now, task["id"])
                         )
-                    continue  # Skip to next task
+                    continue
 
-                # CONDITION 2: WAIT
-                # If any parent is not completed, we must wait
-                if any(s != 'completed' for s in statuses):
-                    # Auto-recover from blocked if parent was fixed
-                    if task['status'] == 'blocked':  # SAFETY-ALLOW: status-write
+                # Incomplete deps: cascade block on failed/blocked parents; otherwise wait.
+                if reason == "INCOMPLETE_DEPS":
+                    incomplete_ids = dep_status.get("incomplete_ids", []) or []
+                    if incomplete_ids:
+                        placeholders = ",".join("?" * len(incomplete_ids))
+                        dep_rows = conn.execute(
+                            f"SELECT status FROM tasks WHERE id IN ({placeholders})",
+                            incomplete_ids
+                        ).fetchall()
+                        statuses = [str(r[0]).lower() for r in dep_rows]
+
+                        if "failed" in statuses or "blocked" in statuses:
+                            if task_status != "blocked":
+                                conn.execute(
+                                    "UPDATE tasks SET status='blocked', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
+                                    (now, task["id"])
+                                )
+                            continue
+
+                    # Auto-recover from blocked -> pending when deps are no longer failed/blocked
+                    if task_status == "blocked":
                         conn.execute(
                             "UPDATE tasks SET status='pending', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                            (int(time.time()), task['id'])
+                            (now, task["id"])
                         )
-                    continue  # Skip to next task
+                    continue
+
+                # Default: fail closed (don't execute)
+                continue
             
             # v10.5: ALSO check JSON state machine dependencies
             task_id_str = str(task['id'])
@@ -8033,11 +9007,33 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
 
             # Context Injection
             deps_context = ""
-            if deps:
+            dep_ids_for_context: list[int] = []
+            try:
+                deps_raw = json.loads(deps_json) if deps_json else []
+            except Exception:
+                deps_raw = []
+            for item in deps_raw:
+                if isinstance(item, int):
+                    dep_ids_for_context.append(item)
+                elif isinstance(item, str) and item.strip().isdigit():
+                    dep_ids_for_context.append(int(item.strip()))
+
+            if dep_ids_for_context:
+                # De-duplicate while preserving order
+                seen = set()
+                dep_ids_unique: list[int] = []
+                for dep_id in dep_ids_for_context:
+                    if dep_id in seen:
+                        continue
+                    seen.add(dep_id)
+                    dep_ids_unique.append(dep_id)
+
+                placeholders = ",".join("?" * len(dep_ids_unique))
                 rows = conn.execute(
-                    f"SELECT id, output FROM tasks WHERE id IN ({','.join(map(str, deps))})"
+                    f"SELECT id, output FROM tasks WHERE id IN ({placeholders})",
+                    dep_ids_unique
                 ).fetchall()
-                for r in rows: 
+                for r in rows:
                     deps_context += f"\n[Task {r['id']} Output]: {r['output']}"
             
             # Include mode in task context
@@ -8050,17 +9046,20 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
             
             full_desc = f"{task['desc']}\n\n=== CONTEXT ==={deps_context}{mode_context}"
             
-            conn.execute(
-                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                (worker_id, int(time.time()), task['id'])
+            claimed_at = int(time.time())
+            cursor = conn.execute(
+                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status IN ('pending', 'blocked')",  # SAFETY-ALLOW: status-write
+                (worker_id, claimed_at, task["id"])
             )
+            if cursor.rowcount == 0:
+                continue
             # v10.5: Sync in_progress status to JSON state machine
             if STATE_MACHINE_AVAILABLE:
                 try:
-                    update_task_status(str(task['id']), "IN_PROGRESS")
+                    update_task_status(str(task["id"]), "IN_PROGRESS")
                 except Exception:
                     pass  # Non-critical, continue execution
-            return f'{{"id": {task["id"]}, "description": "{full_desc}"}}'
+            return json.dumps({"id": task["id"], "description": full_desc})
 
     return "NO_WORK"
 
@@ -8185,7 +9184,7 @@ def find_paired_test(source_ids: list, task_archetype: str = None) -> dict:
             test_sources_raw = test["source_ids"] if test["source_ids"] else "[]"
             try:
                 test_sources = set(json.loads(test_sources_raw))
-            except:
+            except Exception:
                 test_sources = set()
 
             # Check if they share at least one relevant source
@@ -8233,7 +9232,7 @@ def validate_task_completion(task_id: int) -> dict:
     source_ids_raw = task["source_ids"] if task["source_ids"] else "[]"
     try:
         source_ids = json.loads(source_ids_raw)
-    except:
+    except json.JSONDecodeError:
         source_ids = []
 
     archetype = task["archetype"] if task["archetype"] else "GENERIC"
@@ -8258,7 +9257,7 @@ def validate_task_completion(task_id: int) -> dict:
             with open(prov_path, "r", encoding="utf-8") as f:
                 prov_data = json.load(f)
                 provenance_sources = prov_data.get("sources", {})
-        except:
+        except Exception:
             pass
 
     # 4. Load registry for smart resolution
@@ -8268,7 +9267,7 @@ def validate_task_completion(task_id: int) -> dict:
         try:
             with open(registry_path, "r", encoding="utf-8") as f:
                 registry = json.load(f)
-        except:
+        except Exception:
             pass
 
     # 5. Track if any source requires testing
@@ -8380,7 +9379,7 @@ def validate_registry_alignment() -> str:
                 # Regex to find ## [ID] or [ID] patterns
                 ids = re.findall(r"\[([A-Z0-9_-]+-[A-Z0-9_-]+(?:-\d+)?)\]", content)
                 found_ids.extend(ids)
-            except:
+            except Exception:
                 pass
 
     # 3. Validate each ID against registry
@@ -8755,7 +9754,7 @@ def check_gatekeeper(task_id: int) -> str:
         if task["source_ids"]:
             try:
                 source_ids = json.loads(task["source_ids"])
-            except:
+            except json.JSONDecodeError:
                 pass
         archetype = task["archetype"] if task["archetype"] else "GENERIC"
 
@@ -8766,7 +9765,7 @@ def check_gatekeeper(task_id: int) -> str:
         try:
             with open(registry_path, "r", encoding="utf-8") as f:
                 registry = json.load(f)
-        except:
+        except Exception:
             pass
 
     # Build authority breakdown with smart resolution
@@ -8994,7 +9993,7 @@ def append_ledger_entry(task_id: int, decision: str, notes: str, actor: str = "H
     if task["source_ids"]:
         try:
             source_ids = json.loads(task["source_ids"]) if task["source_ids"].startswith("[") else [task["source_ids"]]
-        except:
+        except (json.JSONDecodeError, TypeError):
             source_ids = [task["source_ids"]]
 
     # 3. Snapshot Authority (The "Constitution" at this moment)
@@ -9209,7 +10208,7 @@ def submit_review_decision(task_id: int, decision: str, notes: str, actor: str) 
         try:
             with open(packet_path, "r", encoding="utf-8") as f:
                 packet_meta = json.load(f).get("meta", {})
-        except:
+        except Exception:
             pass
 
     # Write the immutable ledger entry with explicit actor
@@ -10445,7 +11444,7 @@ def get_project_status() -> str:
             with open(MILESTONE_FILE, 'r') as f:
                 milestone = date.fromisoformat(f.read().strip())
             days_left = (milestone - date.today()).days
-        except:
+        except Exception:
             pass
     
     with get_db() as conn:
@@ -10884,7 +11883,7 @@ def get_jit_context() -> Dict:
                 content = f.read()
                 # Get last 2000 chars for context window efficiency
                 context["decisions"] = content[-2000:] if len(content) > 2000 else content
-        except:
+        except Exception:
             pass
     
     # 2. Resolved decisions from DB
@@ -10917,7 +11916,7 @@ def get_jit_context() -> Dict:
                 "SELECT key, value FROM session_context"
             ).fetchall()
             context["session"] = {s[0]: json.loads(s[1]) for s in session}
-    except:
+    except Exception:
         pass
     
     return context
@@ -11491,7 +12490,7 @@ class CLIBasedLLM:
         if match:
             try:
                 return json.loads(match.group(1))
-            except:
+            except json.JSONDecodeError:
                 pass
         
         # Attempt 3: Naive brace finding (First { to Last })
@@ -11501,7 +12500,7 @@ class CLIBasedLLM:
             if start != -1 and end > start:
                 json_str = text[start:end]
                 return json.loads(json_str)
-        except:
+        except json.JSONDecodeError:
             pass
             
         # Failure - log truncated output for debugging
@@ -12236,7 +13235,7 @@ def answer_question(qid: str, answer: str) -> str:
     # 5. Log
     try:
         log_rigor_action(RigorLevel.BUILD, "ANSWER", f"{qid}: {answer[:40]}")
-    except:
+    except Exception:
         pass
     
     if remaining == 0 or task_ready:
@@ -12314,7 +13313,7 @@ def submit_review(task_id: str, review_content: str) -> str:
     # 4. Log
     try:
         log_rigor_action(RigorLevel.IRONCLAD, "REVIEW", f"Task {task_id}: {status}")
-    except:
+    except Exception:
         pass
     
     if status == "PASS":
@@ -12441,7 +13440,7 @@ def get_review(task_id: str) -> str:
             with open(status["path"], 'r', encoding='utf-8') as f:
                 content = f.read()
             status["content"] = content
-        except:
+        except Exception:
             pass
     
     return json.dumps(status, indent=2)
@@ -12861,7 +13860,7 @@ def system_doctor() -> str:
                 "status": "OK" if mode == "wal" else "WARN",  # SAFETY-ALLOW: status-write
                 "mode": mode
             }
-    except:
+    except Exception:
         health["checks"]["wal_mode"] = {"status": "UNKNOWN"}  # SAFETY-ALLOW: status-write
     
     # Check 3: Required Modules
@@ -12874,7 +13873,7 @@ def system_doctor() -> str:
         try:
             __import__(mod)
             modules[mod] = True
-        except:
+        except Exception:
             pass
     health["checks"]["modules"] = modules
     
@@ -13699,7 +14698,7 @@ def graceful_shutdown(signum, frame):
     try:
         # If there's a global connection pool, close it here
         pass
-    except:
+    except Exception:
         pass
     
     print("   ✅ Atomic Mesh Server stopped cleanly.")

@@ -66,7 +66,7 @@ class TestConstitution(unittest.TestCase):
         gc.collect()  # Force cleanup of connections
         try:
             shutil.rmtree(self.tmp, ignore_errors=True)
-        except:
+        except Exception:
             pass
 
     def _create_registry(self):

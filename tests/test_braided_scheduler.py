@@ -97,12 +97,13 @@ def get_task_ids_in_selection_order(db_path, state_dir, count=10):
     Uses the actual scheduler logic.
     """
     import mesh_server
-    from mesh_server import pick_task_braided, _write_lane_pointer
+    from mesh_server import pick_task_braided, _write_lane_pointer, get_db
 
     selected = []
 
-    # Reset lane pointer
-    _write_lane_pointer(-1, None)
+    # Reset lane pointer (SQLite-backed)
+    with get_db() as conn:
+        _write_lane_pointer(-1, None, conn=conn)
 
     for i in range(count):
         result = pick_task_braided(f"test_worker_{i}")
@@ -116,6 +117,13 @@ def get_task_ids_in_selection_order(db_path, state_dir, count=10):
         selected.append((task_id, lane))
 
     return selected
+
+
+def set_lane_pointer(index: int):
+    """Reset scheduler lane pointer (SQLite-backed)."""
+    from mesh_server import get_db, _write_lane_pointer
+    with get_db() as conn:
+        _write_lane_pointer(index, None, conn=conn)
 
 
 class TestBraidedSchedulerBasics:
@@ -155,7 +163,7 @@ class TestBraidedSchedulerBasics:
         conn.close()
 
         # Reset lane pointer
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # Get selections
         from mesh_server import pick_task_braided
@@ -204,7 +212,7 @@ class TestBraidedSchedulerBasics:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # First selection should be the URGENT task despite being in docs lane
         result = json.loads(pick_task_braided("worker_0"))
@@ -238,7 +246,7 @@ class TestBraidedSchedulerBasics:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # First selection should be HIGH priority despite QA lane default being 30
         result = json.loads(pick_task_braided("worker_0"))
@@ -275,7 +283,7 @@ class TestNoStarvation:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # Get 10 selections
         backend_count = 0
@@ -326,7 +334,7 @@ class TestDeterministicOrdering:
         conn.close()
 
         # Run 1
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
         run1_selections = []
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
@@ -343,7 +351,7 @@ class TestDeterministicOrdering:
         conn.close()
 
         # Run 2 (same initial state)
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
         run2_selections = []
 
         for i in range(3):
@@ -390,7 +398,7 @@ class TestAcceptanceCriteria:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # Get first 10 selections
         selected_lanes = []
@@ -435,7 +443,7 @@ class TestAcceptanceCriteria:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # First two selections should both be URGENT tasks
         result1 = json.loads(pick_task_braided("worker_0"))
@@ -522,7 +530,7 @@ class TestExplicitOrdering:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # Selections should be in priority order (lowest first)
         priorities = []
@@ -560,7 +568,7 @@ class TestExplicitOrdering:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # Should be selected in created_at order
         selected_ids = []
@@ -610,7 +618,7 @@ class TestPriorityPreemption:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(-1, None)
+        set_lane_pointer(-1)
 
         # First selection should be the HIGH frontend (priority=5 < backend's 10)
         result = json.loads(pick_task_braided("worker_0"))
@@ -659,7 +667,7 @@ class TestBlockedLaneHandling:
         conn.close()
 
         # Set lane pointer to backend (index 0) - scheduler should try backend first
-        _write_lane_pointer(0, None)
+        set_lane_pointer(0)
 
         # First selection should skip blocked backend and pick frontend
         result = json.loads(pick_task_braided("worker_0"))
@@ -696,7 +704,7 @@ class TestBlockedLaneHandling:
         conn.close()
 
         # Set lane pointer to backend (index 0) - but backend has no tasks
-        _write_lane_pointer(0, None)
+        set_lane_pointer(0)
 
         # Scheduler should advance past empty backend/frontend and pick QA
         result = json.loads(pick_task_braided("worker_0"))
@@ -737,7 +745,7 @@ class TestAtomicClaim:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(0, None)
+        set_lane_pointer(0)
 
         # Worker 1 claims the task
         result1 = json.loads(pick_task_braided("worker_1"))
@@ -786,7 +794,7 @@ class TestAtomicClaim:
         conn.commit()
         conn.close()
 
-        _write_lane_pointer(0, None)
+        set_lane_pointer(0)
 
         # Two workers claim tasks
         result1 = json.loads(pick_task_braided("worker_1"))
@@ -809,6 +817,373 @@ class TestAtomicClaim:
         assert len(set(worker_ids)) == 2, f"Each task should have different worker: {worker_ids}"
         assert "worker_1" in worker_ids
         assert "worker_2" in worker_ids
+
+
+class TestConcurrencyAndRecovery:
+    """Production-grade hardening: parallel claim + crash recovery + dep diagnostics."""
+
+    def test_two_workers_parallel_no_double_claim_and_pointer_sane(self, scheduler_workspace, monkeypatch):
+        import threading
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import pick_task_braided, get_db
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+        lanes = ["backend", "frontend", "qa", "ops", "docs"]
+        total = 50
+        for i in range(total):
+            lane = lanes[i % len(lanes)]
+            insert_task(conn, lane, f"{lane} task {i}", priority=10, created_at=base_time + i)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(-1)
+
+        claimed = []
+        lock = threading.Lock()
+
+        def worker(wid: str):
+            while True:
+                res = json.loads(pick_task_braided(wid))
+                if res.get("status") != "OK":
+                    break
+                with lock:
+                    claimed.append(res.get("id"))
+
+        t1 = threading.Thread(target=worker, args=("race_worker_1",))
+        t2 = threading.Thread(target=worker, args=("race_worker_2",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert len(claimed) == total, f"Expected {total} claimed tasks, got {len(claimed)}"
+        assert len(set(claimed)) == len(claimed), "No task should be double-claimed"
+
+        # Pointer state should remain valid JSON + in-range
+        with get_db() as pconn:
+            row = pconn.execute(
+                "SELECT value FROM config WHERE key='scheduler_lane_pointer'"
+            ).fetchone()
+            assert row and row[0], "scheduler_lane_pointer should be persisted in config"
+            ptr = json.loads(row[0])
+            assert isinstance(ptr.get("index"), int)
+            assert 0 <= ptr["index"] < len(mesh_server.LANE_ORDER)
+
+    def test_stale_in_progress_is_requeued_then_claimed(self, scheduler_workspace, monkeypatch):
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        now = int(time.time())
+        # Simulate a crashed worker: task stuck in_progress far past the lease window.
+        conn.execute(
+            """INSERT INTO tasks (type, desc, status, priority, lane, lane_rank, created_at, deps, updated_at, worker_id, retry_count)
+               VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("backend", "Stale task", 10, "backend", 0, now - 10_000, "[]", now - 10_000, "dead_worker", 0)
+        )
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        res = json.loads(pick_task_braided("recovery_worker"))
+        assert res.get("status") == "OK", f"Expected recovered task to be claimable, got {res}"
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status, worker_id, retry_count FROM tasks").fetchone()
+        conn.close()
+
+        assert row["status"] == "in_progress"
+        assert row["worker_id"] == "recovery_worker"
+        assert row["retry_count"] >= 1, "Reaper should bump retry_count on stale recovery"
+
+    def test_unknown_deps_block_and_surface_reason(self, scheduler_workspace, monkeypatch):
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        now = int(time.time())
+        # Opaque dep token should block forever until fixed (unknown dep).
+        conn.execute(
+            """INSERT INTO tasks (type, desc, status, priority, lane, lane_rank, created_at, deps, updated_at)
+               VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+            ("backend", "Task with unknown dep", 10, "backend", 0, now, json.dumps(["docs:missing_key"]), now)
+        )
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        res = json.loads(pick_task_braided("worker_0"))
+        assert res.get("status") == "NO_WORK"
+        assert res.get("pending_total") == 1
+        blocked = res.get("blocked_lanes", {}).get("backend", {})
+        assert blocked.get("blocked_reason") in ("UNKNOWN_DEPS", "MISSING_DEPS", "INCOMPLETE_DEPS")
+        assert any("missing_key" in t for t in blocked.get("unknown_tokens", [])), f"Expected unknown token surfaced, got {blocked}"
+
+
+class TestWorkerTypeLaneValidation:
+    """
+    Server-side guardrails: worker_type should prevent claiming tasks in blocked lanes.
+
+    This tests the "fail closed" behavior where the server validates that a worker's
+    declared type matches the task's lane. A TYPE=frontend worker should NOT be able
+    to claim backend tasks, even if it maliciously doesn't send blocked_lanes.
+    """
+
+    def test_frontend_worker_cannot_claim_backend_task(self, scheduler_workspace, monkeypatch):
+        """
+        A TYPE=frontend worker should not be able to claim a backend task.
+        Server should skip/reject the claim based on worker_type even if
+        blocked_lanes is not sent.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert only backend tasks (frontend worker should NOT claim these)
+        insert_task(conn, 'backend', 'Backend task 1', priority=10, created_at=base_time)
+        insert_task(conn, 'backend', 'Backend task 2', priority=10, created_at=base_time+1)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Frontend worker tries to claim - should get NO_WORK (backend not allowed)
+        result = json.loads(pick_task_braided("frontend_worker", worker_type="frontend"))
+
+        assert result.get("status") == "NO_WORK", \
+            f"Frontend worker should not claim backend tasks, got {result}"
+
+    def test_backend_worker_cannot_claim_frontend_task(self, scheduler_workspace, monkeypatch):
+        """
+        A TYPE=backend worker should not be able to claim a frontend task.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert only frontend tasks (backend worker should NOT claim these)
+        insert_task(conn, 'frontend', 'Frontend task 1', priority=20, created_at=base_time)
+        insert_task(conn, 'frontend', 'Frontend task 2', priority=20, created_at=base_time+1)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Backend worker tries to claim - should get NO_WORK (frontend not allowed)
+        result = json.loads(pick_task_braided("backend_worker", worker_type="backend"))
+
+        assert result.get("status") == "NO_WORK", \
+            f"Backend worker should not claim frontend tasks, got {result}"
+
+    def test_frontend_worker_can_claim_frontend_task(self, scheduler_workspace, monkeypatch):
+        """
+        A TYPE=frontend worker SHOULD be able to claim frontend tasks.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert frontend tasks
+        insert_task(conn, 'frontend', 'Frontend task 1', priority=20, created_at=base_time)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Frontend worker should claim frontend task
+        result = json.loads(pick_task_braided("frontend_worker", worker_type="frontend"))
+
+        assert result.get("status") == "OK", \
+            f"Frontend worker should claim frontend tasks, got {result}"
+        assert result.get("lane") == "frontend", \
+            f"Should be frontend lane, got {result.get('lane')}"
+
+    def test_frontend_worker_can_claim_docs_task(self, scheduler_workspace, monkeypatch):
+        """
+        A TYPE=frontend worker SHOULD be able to claim docs tasks (creative role).
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert docs task
+        insert_task(conn, 'docs', 'Docs task 1', priority=40, created_at=base_time)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Frontend worker should claim docs task
+        result = json.loads(pick_task_braided("frontend_worker", worker_type="frontend"))
+
+        assert result.get("status") == "OK", \
+            f"Frontend worker should claim docs tasks, got {result}"
+        assert result.get("lane") == "docs", \
+            f"Should be docs lane, got {result.get('lane')}"
+
+    def test_backend_worker_can_claim_qa_ops_tasks(self, scheduler_workspace, monkeypatch):
+        """
+        A TYPE=backend worker SHOULD be able to claim backend, qa, and ops tasks.
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert one of each allowed lane for backend worker
+        insert_task(conn, 'backend', 'Backend task', priority=10, created_at=base_time)
+        insert_task(conn, 'qa', 'QA task', priority=30, created_at=base_time+1)
+        insert_task(conn, 'ops', 'Ops task', priority=35, created_at=base_time+2)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Backend worker should claim all 3 tasks in order
+        claimed_lanes = []
+        for i in range(3):
+            result = json.loads(pick_task_braided(f"backend_worker_{i}", worker_type="backend"))
+            if result.get("status") == "OK":
+                claimed_lanes.append(result.get("lane"))
+
+        assert len(claimed_lanes) == 3, f"Backend worker should claim all 3 tasks, got {len(claimed_lanes)}"
+        assert set(claimed_lanes) == {"backend", "qa", "ops"}, \
+            f"Should claim backend, qa, ops lanes, got {claimed_lanes}"
+
+    def test_no_worker_type_allows_all_lanes(self, scheduler_workspace, monkeypatch):
+        """
+        If no worker_type is specified, worker should be able to claim any lane
+        (backwards compatibility).
+        """
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import _write_lane_pointer, pick_task_braided
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+
+        # Insert tasks in different lanes
+        insert_task(conn, 'backend', 'Backend task', priority=10, created_at=base_time)
+        insert_task(conn, 'frontend', 'Frontend task', priority=20, created_at=base_time+1)
+
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        # Worker without type should claim any task
+        result = json.loads(pick_task_braided("generic_worker"))
+
+        assert result.get("status") == "OK", \
+            f"Generic worker should claim tasks, got {result}"
 
 
 if __name__ == "__main__":

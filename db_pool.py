@@ -66,7 +66,7 @@ def close_connection():
     if hasattr(_local, 'connection') and _local.connection is not None:
         try:
             _local.connection.close()
-        except:
+        except Exception:
             pass
         _local.connection = None
 
