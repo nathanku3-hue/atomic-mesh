@@ -924,6 +924,1425 @@ def get_system_status() -> str:
     })
 
 # =============================================================================
+# v17.0: DOCUMENT EXTRACTION PIPELINE
+# =============================================================================
+# Extracts structured context from PRD/SPEC/DECISION_LOG for plan generation.
+# Key principle: DETERMINISTIC extraction, no LLM, no guessing.
+
+# Debug flag - set MESH_PLAN_DEBUG=1 to enable extraction logging
+PLAN_DEBUG = os.getenv("MESH_PLAN_DEBUG", "0") == "1"
+
+def _plan_debug(msg: str):
+    """Log to stderr only if MESH_PLAN_DEBUG=1"""
+    if PLAN_DEBUG:
+        import sys
+        print(f"[PLAN_DEBUG] {msg}", file=sys.stderr)
+
+
+def _resolve_doc_path(doc_name: str, base_dir: str = None) -> str:
+    """
+    Resolve document path checking both docs/ and docs/_mesh/ layouts.
+
+    Args:
+        doc_name: Document filename (e.g., "PRD.md", "SPEC.md", "DECISION_LOG.md")
+        base_dir: Project root directory. Defaults to BASE_DIR.
+
+    Returns:
+        Absolute path to document if found, else None.
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    # Primary location: docs/{doc_name}
+    primary_path = os.path.join(base_dir, "docs", doc_name)
+    if os.path.exists(primary_path):
+        _plan_debug(f"Resolved {doc_name} -> {primary_path}")
+        return primary_path
+
+    # Secondary location: docs/_mesh/{doc_name}
+    secondary_path = os.path.join(base_dir, "docs", "_mesh", doc_name)
+    if os.path.exists(secondary_path):
+        _plan_debug(f"Resolved {doc_name} -> {secondary_path} (fallback)")
+        return secondary_path
+
+    _plan_debug(f"Could not resolve {doc_name}")
+    return None
+
+
+def _extract_user_stories(prd_text: str) -> list:
+    """
+    Extract user stories from PRD text.
+
+    Accepted formats:
+    - Lines containing "As a ... I want ..." (case-insensitive)
+    - Bullet/checkbox lines under "User Stories" header
+    - Checkbox formats: "- [ ] ...", "[ ] ...", "- ..."
+
+    Returns:
+        List of dicts: [{"id": "US-01", "story": "...", "raw": "..."}]
+    """
+    stories = []
+    seen = set()
+
+    # Pattern 1: "As a ... I want ..." anywhere in text
+    as_a_pattern = re.compile(
+        r'(?:^|\n)\s*(?:[-*]\s*)?(?:\[[ xX]?\]\s*)?'  # Optional bullet/checkbox
+        r'(?:US[-_]?\d+[:\s]*)?'  # Optional US-01: prefix
+        r'(As an?\s+.+?(?:,\s*)?I\s+(?:want|need|can)\s+.+?)(?:\n|$)',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    for i, match in enumerate(as_a_pattern.finditer(prd_text)):
+        story_text = match.group(1).strip()
+        # Clean up multiline
+        story_text = re.sub(r'\s+', ' ', story_text)
+
+        # Skip template placeholders
+        if '[user]' in story_text.lower() or '[capability]' in story_text.lower():
+            continue
+
+        if story_text not in seen and len(story_text) > 20:
+            seen.add(story_text)
+            # Try to extract ID from preceding text
+            story_id = f"US-{len(stories)+1:02d}"
+            id_match = re.search(r'US[-_]?(\d+)', match.group(0))
+            if id_match:
+                story_id = f"US-{id_match.group(1).zfill(2)}"
+
+            stories.append({
+                "id": story_id,
+                "story": story_text,
+                "raw": match.group(0).strip()[:200]
+            })
+
+    # Pattern 2: Bullets under "User Stories" section
+    section_match = re.search(
+        r'(?:^|\n)(?:#{1,3}\s*)?User\s*Stories?\s*\n(.*?)(?=\n#{1,3}\s|\Z)',
+        prd_text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if section_match:
+        section_text = section_match.group(1)
+        bullet_pattern = re.compile(
+            r'^\s*(?:[-*]|\d+\.)\s*(?:\[[ xX]?\]\s*)?(.+)$',
+            re.MULTILINE
+        )
+
+        for match in bullet_pattern.finditer(section_text):
+            line = match.group(1).strip()
+            # Skip sub-headers, empty, or already captured
+            if line.startswith('#') or len(line) < 15:
+                continue
+            if any(line in s["story"] or s["story"] in line for s in stories):
+                continue
+            # Skip template placeholders
+            if '[user]' in line.lower() or '[capability]' in line.lower():
+                continue
+
+            story_id = f"US-{len(stories)+1:02d}"
+            id_match = re.search(r'US[-_]?(\d+)', line)
+            if id_match:
+                story_id = f"US-{id_match.group(1).zfill(2)}"
+                line = re.sub(r'US[-_]?\d+[:\s]*', '', line).strip()
+
+            if line not in seen:
+                seen.add(line)
+                stories.append({
+                    "id": story_id,
+                    "story": line,
+                    "raw": match.group(0).strip()[:200]
+                })
+
+    _plan_debug(f"Extracted {len(stories)} user stories")
+    return stories
+
+
+def _extract_api_endpoints(spec_text: str) -> list:
+    """
+    Extract API endpoints from SPEC text.
+
+    Accepted formats:
+    - Markdown table rows with endpoint path and method
+    - Prose lines: "GET /api/...", "POST /api/..."
+    - Inline code blocks with method + path
+
+    Returns:
+        List of dicts: [{"method": "GET", "path": "/api/users", "raw": "..."}]
+    """
+    endpoints = []
+    seen = set()
+
+    methods = r'(?:GET|POST|PUT|DELETE|PATCH)'
+
+    # Pattern 1: Table rows with | /api/... | and method
+    table_pattern = re.compile(
+        rf'\|[^|]*({methods})[^|]*\|[^|]*(/[a-zA-Z0-9_/:{{}}.-]+)[^|]*\|'
+        rf'|\|[^|]*(/[a-zA-Z0-9_/:{{}}.-]+)[^|]*\|[^|]*({methods})[^|]*\|',
+        re.IGNORECASE
+    )
+
+    for match in table_pattern.finditer(spec_text):
+        groups = match.groups()
+        if groups[0] and groups[1]:
+            method, path = groups[0].upper(), groups[1]
+        elif groups[2] and groups[3]:
+            path, method = groups[2], groups[3].upper()
+        else:
+            continue
+
+        # Clean path
+        path = path.strip()
+        if not path.startswith('/'):
+            continue
+        # Skip template placeholders
+        if '/resource' in path.lower() and 'api' not in path.lower():
+            continue
+
+        key = f"{method} {path}"
+        if key not in seen:
+            seen.add(key)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "raw": match.group(0).strip()[:150]
+            })
+
+    # Pattern 2: Prose/code lines "GET /api/..."
+    prose_pattern = re.compile(
+        rf'(?:^|\s|`)({methods})\s+(/[a-zA-Z0-9_/:{{}}.-]+)',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    for match in prose_pattern.finditer(spec_text):
+        method = match.group(1).upper()
+        path = match.group(2).strip()
+
+        if not path.startswith('/'):
+            continue
+
+        key = f"{method} {path}"
+        if key not in seen:
+            seen.add(key)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "raw": match.group(0).strip()[:150]
+            })
+
+    _plan_debug(f"Extracted {len(endpoints)} API endpoints")
+    return endpoints
+
+
+def _extract_data_entities(spec_text: str) -> list:
+    """
+    Extract data model entities from SPEC text.
+
+    Accepted formats:
+    - Markdown table under "Data Model" section
+    - Bullet list items with entity names (e.g., "[ ] EntityName (filename)")
+    - Code blocks with class/type/interface/struct definitions
+
+    Returns:
+        List of dicts: [{"name": "User", "fields": "...", "raw": "..."}]
+    """
+    entities = []
+    seen = set()
+
+    # Pattern 1: Table rows under Data Model section
+    section_match = re.search(
+        r'(?:^|\n)(?:#{1,3}\s*)?(?:Data\s*Model|Entities|Schema)\s*\n(.*?)(?=\n#{1,3}\s|\n---|\Z)',
+        spec_text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if section_match:
+        section_text = section_match.group(1)
+
+        # Pattern 1a: Table rows | EntityName | fields |
+        table_row_pattern = re.compile(
+            r'^\s*\|\s*([A-Z][a-zA-Z0-9_]+)\s*\|(.+)\|',
+            re.MULTILINE
+        )
+
+        for match in table_row_pattern.finditer(section_text):
+            name = match.group(1).strip()
+            rest = match.group(2).strip()
+
+            # Skip header rows and common non-entity words
+            skip_words = ('entity', 'table', 'name', 'model', 'field', 'type', 'notes', 'source')
+            if name.lower() in skip_words:
+                continue
+            if '-' * 3 in name:
+                continue
+
+            if name not in seen:
+                seen.add(name)
+                entities.append({
+                    "name": name,
+                    "fields": rest[:100],
+                    "raw": match.group(0).strip()[:200]
+                })
+
+        # Pattern 1b: Bullet list items like "[ ] EntityName (filename.parquet)"
+        bullet_entity_pattern = re.compile(
+            r'^\s*(?:[-*]|\[[ xX]?\])\s*\*?\*?([A-Z][a-zA-Z0-9_]+)\*?\*?\s*(?:\([^)]+\))?[:\s]',
+            re.MULTILINE
+        )
+
+        for match in bullet_entity_pattern.finditer(section_text):
+            name = match.group(1).strip()
+            skip_words = ('key', 'note', 'field', 'type', 'input', 'output', 'description')
+            if name.lower() in skip_words:
+                continue
+
+            if name not in seen:
+                seen.add(name)
+                # Try to extract fields from the rest of the line
+                line_end = spec_text.find('\n', match.end())
+                rest = spec_text[match.end():line_end] if line_end > 0 else ""
+                entities.append({
+                    "name": name,
+                    "fields": rest[:100].strip(),
+                    "raw": match.group(0).strip()[:200]
+                })
+
+    # Pattern 2: Code definitions (class/type/interface/struct)
+    code_pattern = re.compile(
+        r'\b(?:class|type|interface|struct)\s+([A-Z][a-zA-Z0-9_]+)\b',
+        re.MULTILINE
+    )
+
+    for match in code_pattern.finditer(spec_text):
+        name = match.group(1).strip()
+        skip_words = ('entity', 'table', 'model', 'base', 'abstract', 'interface')
+        if name.lower() in skip_words:
+            continue
+
+        if name not in seen:
+            seen.add(name)
+            entities.append({
+                "name": name,
+                "fields": "",
+                "raw": match.group(0).strip()[:100]
+            })
+
+    _plan_debug(f"Extracted {len(entities)} data entities")
+    return entities
+
+
+def _extract_decisions(decision_log_text: str) -> list:
+    """
+    Extract decisions from DECISION_LOG with STRICT 8-column schema.
+
+    Schema: ID | Date | Type | Decision | Rationale | Scope | Task | Status
+
+    Rules:
+    - Only parse rows with exactly 8 columns
+    - Extract Decision column (col[3]) ONLY - do not concatenate other fields
+    - Keep ACCEPTED and PROPOSED status rows
+    - Skip INIT type rows
+
+    Returns:
+        List of dicts: [{"id": "005", "type": "SECURITY", "decision": "...", "status": "ACCEPTED"}]
+    """
+    decisions = []
+
+    lines = decision_log_text.split('\n')
+    in_table = False
+    header_seen = False
+
+    for line in lines:
+        line = line.strip()
+
+        # Detect table start
+        if '|' in line and 'ID' in line and 'Date' in line:
+            in_table = True
+            header_seen = True
+            continue
+
+        # Skip separator row (contains ---)
+        if in_table and '---' in line:
+            continue
+
+        # Process table row
+        if in_table and line.startswith('|') and line.endswith('|'):
+            # Split and clean columns
+            cols = [c.strip() for c in line.split('|')]
+            # Remove empty first/last from split (caused by leading/trailing |)
+            cols = [c for c in cols if c]  # Keep only non-empty
+
+            # Strict 8-column check
+            if len(cols) != 8:
+                _plan_debug(f"Skipping malformed decision row (got {len(cols)} cols): {line[:80]}")
+                continue
+
+            dec_id = cols[0]
+            dec_date = cols[1]
+            dec_type = cols[2].upper()
+            dec_decision = cols[3]  # ONLY the Decision column
+            dec_rationale = cols[4]
+            dec_scope = cols[5]
+            dec_task = cols[6]
+            dec_status = cols[7].upper()
+
+            # Skip INIT rows
+            if dec_type == 'INIT':
+                _plan_debug(f"Skipping INIT decision: {dec_id}")
+                continue
+
+            # Only keep ACCEPTED or PROPOSED (also accept ✅ as ACCEPTED)
+            if '✅' in dec_status or 'ACTIVE' in dec_status:
+                dec_status = 'ACCEPTED'
+            if 'ACCEPTED' not in dec_status and 'PROPOSED' not in dec_status:
+                _plan_debug(f"Skipping decision {dec_id} with status {dec_status}")
+                continue
+
+            # Skip if decision text is empty or placeholder
+            if not dec_decision or dec_decision == '-' or len(dec_decision) < 3:
+                continue
+
+            decisions.append({
+                "id": dec_id,
+                "type": dec_type,
+                "decision": dec_decision,
+                "status": dec_status,
+                "scope": dec_scope,
+                "task_ref": dec_task
+            })
+
+    _plan_debug(f"Extracted {len(decisions)} decisions (strict 8-col)")
+    return decisions
+
+
+def extract_project_context(base_dir: str = None) -> dict:
+    """
+    Assemble full project context from PRD/SPEC/DECISION_LOG.
+
+    Returns:
+        {
+            "paths": {"prd": "...", "spec": "...", "decision_log": "..."},
+            "user_stories": [...],
+            "api_endpoints": [...],
+            "data_entities": [...],
+            "decisions": [...],
+            "debug": {"counts": {...}}
+        }
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    ctx = {
+        "paths": {},
+        "user_stories": [],
+        "api_endpoints": [],
+        "data_entities": [],
+        "decisions": [],
+        "debug": {"counts": {}, "errors": []}
+    }
+
+    # Resolve paths
+    prd_path = _resolve_doc_path("PRD.md", base_dir)
+    spec_path = _resolve_doc_path("SPEC.md", base_dir)
+    decision_log_path = _resolve_doc_path("DECISION_LOG.md", base_dir)
+
+    ctx["paths"] = {
+        "prd": prd_path,
+        "spec": spec_path,
+        "decision_log": decision_log_path
+    }
+
+    # Extract from PRD
+    if prd_path:
+        try:
+            with open(prd_path, 'r', encoding='utf-8', errors='ignore') as f:
+                prd_text = f.read()
+            ctx["user_stories"] = _extract_user_stories(prd_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"PRD read error: {e}")
+
+    # Extract from SPEC
+    if spec_path:
+        try:
+            with open(spec_path, 'r', encoding='utf-8', errors='ignore') as f:
+                spec_text = f.read()
+            ctx["api_endpoints"] = _extract_api_endpoints(spec_text)
+            ctx["data_entities"] = _extract_data_entities(spec_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"SPEC read error: {e}")
+
+    # Extract from DECISION_LOG
+    if decision_log_path:
+        try:
+            with open(decision_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                decision_text = f.read()
+            ctx["decisions"] = _extract_decisions(decision_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"DECISION_LOG read error: {e}")
+
+    # Debug counts
+    ctx["debug"]["counts"] = {
+        "user_stories": len(ctx["user_stories"]),
+        "api_endpoints": len(ctx["api_endpoints"]),
+        "data_entities": len(ctx["data_entities"]),
+        "decisions": len(ctx["decisions"])
+    }
+
+    _plan_debug(f"Context extracted: {ctx['debug']['counts']}")
+    return ctx
+
+
+def _context_is_sufficient(ctx: dict) -> tuple:
+    """
+    Check if extracted context is sufficient for meaningful plan generation.
+
+    Pass condition:
+    - (user_stories > 0 OR api_endpoints > 0) AND (data_entities > 0 OR decisions > 0)
+    - Expected task count >= 10
+
+    Returns:
+        (is_sufficient: bool, reasons: list[str])
+    """
+    counts = ctx.get("debug", {}).get("counts", {})
+    stories = counts.get("user_stories", 0)
+    endpoints = counts.get("api_endpoints", 0)
+    entities = counts.get("data_entities", 0)
+    decisions = counts.get("decisions", 0)
+
+    reasons = []
+
+    # Check anchor types
+    has_work_anchors = stories > 0 or endpoints > 0
+    has_structure_anchors = entities > 0 or decisions > 0
+
+    if not has_work_anchors:
+        reasons.append("missing_user_stories_or_endpoints")
+    if not has_structure_anchors:
+        reasons.append("missing_entities_or_decisions")
+
+    # Estimate task count
+    # Backend: endpoints + entities
+    # Frontend: stories
+    # QA: stories
+    # Ops/Docs: decisions
+    estimated_tasks = endpoints + entities + (stories * 2) + decisions
+
+    if estimated_tasks < 10:
+        reasons.append(f"insufficient_roadmap_size (estimated {estimated_tasks} < 10)")
+
+    is_sufficient = len(reasons) == 0
+    _plan_debug(f"Context sufficient: {is_sufficient}, reasons: {reasons}")
+
+    return (is_sufficient, reasons)
+
+
+def _generate_missing_context_plan(ctx: dict, reasons: list) -> str:
+    """
+    Generate a "missing context" checklist plan when context is insufficient.
+
+    Returns:
+        Markdown string with actionable doc improvement tasks.
+    """
+    counts = ctx.get("debug", {}).get("counts", {})
+
+    lines = [
+        f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "> **Status: INSUFFICIENT_CONTEXT**",
+        "> The documents don't contain enough structured information to generate a meaningful roadmap.",
+        "> Complete the checklist below, then re-run `/draft-plan`.",
+        "",
+        "## [Docs]",
+        ""
+    ]
+
+    # User stories guidance
+    if counts.get("user_stories", 0) < 3:
+        lines.append("- [ ] Docs: Add at least 3 user stories to PRD.md under \"## User Stories\"")
+        lines.append("  - Format: `- [ ] US-01: As a [role], I want [capability] so that [benefit]`")
+        lines.append("")
+
+    # API endpoints guidance
+    if counts.get("api_endpoints", 0) < 3:
+        lines.append("- [ ] Docs: Add at least 3 API endpoints to SPEC.md under \"## API\"")
+        lines.append("  - Format: Table with columns `| Endpoint | Method | Request | Response |`")
+        lines.append("  - Or prose: `GET /api/v1/users` etc.")
+        lines.append("")
+
+    # Data entities guidance
+    if counts.get("data_entities", 0) < 2:
+        lines.append("- [ ] Docs: Add at least 2 data entities to SPEC.md under \"## Data Model\"")
+        lines.append("  - Format: Table with columns `| Entity | Fields | Notes |`")
+        lines.append("")
+
+    # Decisions guidance
+    if counts.get("decisions", 0) < 1:
+        lines.append("- [ ] Docs: Add at least 1 ACCEPTED decision to DECISION_LOG.md")
+        lines.append("  - Schema: `| ID | Date | Type | Decision | Rationale | Scope | Task | Status |`")
+        lines.append("  - Types: ARCH, SECURITY, DATA, API, UX, OPS")
+        lines.append("")
+
+    # Summary
+    lines.extend([
+        "---",
+        "",
+        "## Current Extraction Results",
+        "",
+        f"- User Stories: {counts.get('user_stories', 0)}",
+        f"- API Endpoints: {counts.get('api_endpoints', 0)}",
+        f"- Data Entities: {counts.get('data_entities', 0)}",
+        f"- Decisions: {counts.get('decisions', 0)}",
+        "",
+        f"**Reasons:** {', '.join(reasons)}",
+        ""
+    ])
+
+    return "\n".join(lines)
+
+
+
+def _generate_short_title(text: str, max_len: int = 48) -> str:
+    """
+    Generate a short title (<= max_len chars) from text.
+    Never truncates mid-word; adds no ellipsis.
+    Returns "(untitled)" if input is empty or whitespace-only.
+    """
+    # Guardrail: never return empty
+    if not text or not text.strip():
+        return "(untitled)"
+
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    # Find last space before max_len
+    truncated = text[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > max_len // 2:
+        result = truncated[:last_space].rstrip()
+    else:
+        result = truncated.rstrip()
+
+    # Final guardrail: ensure non-empty result
+    return result if result else "(untitled)"
+
+
+def _generate_decision_action(dec_type: str, dec_text: str, dec_id: str) -> dict:
+    """
+    Generate concrete action title and DoD for a decision based on type.
+    Returns dict with 'title', 'dod'.
+    """
+    dec_type_upper = dec_type.upper()
+
+    # Generate short title from decision text
+    short_title = _generate_short_title(dec_text, 40)
+
+    if dec_type_upper == "SECURITY" or dec_type_upper == "SEC":
+        return {
+            "title": f"Enable {short_title}",
+            "dod": "Config toggle added; validation check passes; docs/_mesh/SECURITY updated"
+        }
+    elif dec_type_upper == "DATA":
+        return {
+            "title": f"Setup {short_title}",
+            "dod": "Schema/storage validated; sample query runs; docs/_mesh/DATA_LAYER updated"
+        }
+    elif dec_type_upper == "ARCH":
+        return {
+            "title": f"Bootstrap {short_title}",
+            "dod": "Package installed; hello-world smoke test passes; docs/_mesh/TECH_STACK updated"
+        }
+    elif dec_type_upper == "PERF":
+        return {
+            "title": f"Optimize {short_title}",
+            "dod": "Performance baseline measured; optimization applied; benchmark documented"
+        }
+    elif dec_type_upper == "API":
+        return {
+            "title": f"Configure {short_title}",
+            "dod": "API pattern implemented; contract test passes; docs/_mesh/API_DESIGN updated"
+        }
+    elif dec_type_upper == "UX":
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "UX pattern applied; visual test passes; docs/_mesh/UX_PATTERNS updated"
+        }
+    elif dec_type_upper == "ALGO":
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "Algorithm coded; unit test with known input/output passes"
+        }
+    else:
+        # Generic fallback
+        return {
+            "title": f"Configure {short_title}",
+            "dod": f"Decision {dec_id} implemented; smoke test passes"
+        }
+
+
+
+# =============================================================================
+# PLAN GENERATION HELPERS (v18.0 - Production Execution Grade)
+# =============================================================================
+# INVARIANT A: Backend Spine Must Exist
+# INVARIANT B: Decision-Driven Enforcement + Tests (SECURITY/DATA/ARCH)
+# INVARIANT C: Priority is Dependency-Aware (blockers/spine/enforcement = HIGH)
+
+
+def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> list:
+    """
+    INVARIANT A: Build backend workflow spine tasks.
+
+    Creates 4-7 core backend tasks that form the throughput + correctness backbone:
+    1. Define DuckDB schema & tables (consolidates entity persistence)
+    2. Ingest Parquet -> DuckDB
+    3. Implement query layer for backtest runner
+    4. Backtest runner core
+    5. Compute key metrics
+    6. Persist/query results (with schema/table details)
+    7. Transaction log view model
+
+    Entity persistence is collapsed into schema definition - no per-entity CRUD.
+    Each task has a _key for dependency tracking.
+    Returns list of task dicts.
+    """
+    spine_tasks = []
+    decisions = ctx.get("decisions", [])
+    user_stories = ctx.get("user_stories", [])
+    data_entities = ctx.get("data_entities", [])
+
+    # Only create spine if we have something to build
+    if len(data_entities) == 0 and len(user_stories) == 0:
+        return spine_tasks
+
+    # Get entity names for traceability
+    entity_names = [e.get("name", "Unknown") for e in data_entities]
+    entity_list = ", ".join(entity_names) if entity_names else "none"
+
+    # A) DuckDB schema definition (consolidates entity persistence)
+    # TASK 1: Trace to DEC or SPEC-DATA, never PRD-US
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        schema_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Define DuckDB schema & tables",
+            "dod": "schema.sql exists; tables created for all entities; smoke query works",
+            "trace": schema_trace,
+            "detail": f"Entities: {entity_list}",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "duckdb_schema"
+        })
+
+    # B) Data ingest pipeline
+    # TASK 1: Trace to DEC or SPEC-DATA, not PRD-US
+    task_counter["B"] += 1
+    ingest_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Implement ingest pipeline Parquet to DuckDB",
+        "dod": "Loads prices/fundamentals from ./data; mapping defined; idempotent load works",
+        "trace": ingest_trace,
+        "priority": "HIGH",
+        "_spine": True,
+        "_key": "duckdb_ingest"
+    })
+
+    # C) Query layer for backtest runner
+    # TASK 1: This is data-layer, trace to SPEC-DATA not PRD-US:US-02
+    task_counter["B"] += 1
+    query_trace = find_decision_trace(["duckdb", "query"]) or "SPEC-DATA"
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Implement query layer for backtest runner",
+        "dod": "Functions for fetching price/fund slices, joins, time range filters",
+        "trace": query_trace,
+        "priority": "HIGH",
+        "_spine": True,
+        "_key": "query_layer"
+    })
+
+    # D) Backtest runner core - PRD-derived, trace to PRD-US:US-04 is correct
+    task_counter["B"] += 1
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Implement backtest runner core",
+        "dod": "Given fixture data + strategy, returns trades + equity series deterministically",
+        "trace": "PRD-US:US-04",
+        "priority": "HIGH",
+        "_spine": True,
+        "_key": "runner_core"
+    })
+
+    # E) Metrics calculation - PRD-derived, trace to PRD-US:US-04 is correct
+    task_counter["B"] += 1
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Compute key metrics (CAGR, Sharpe, MaxDD)",
+        "dod": "Metrics match fixture expected values within tolerance",
+        "trace": "PRD-US:US-04",
+        "priority": "HIGH",
+        "_spine": True,
+        "_key": "metrics"
+    })
+
+    # F) Results store/query - PRD-derived, trace to PRD-US:US-07 is correct
+    task_counter["B"] += 1
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Persist and query backtest results",
+        "dod": "backtest_runs table indexed by run_id; can list, fetch, compare two runs",
+        "trace": "PRD-US:US-07",
+        "priority": "HIGH",
+        "_spine": True,
+        "_key": "results_store"
+    })
+
+    # G) Transaction log - PRD-derived, trace to PRD-US:US-06 is correct
+    task_counter["B"] += 1
+    spine_tasks.append({
+        "id": f"T-B{task_counter['B']}",
+        "title": "Generate transaction log view model",
+        "dod": "Trades include entry/exit reason + timestamps; UI can render table",
+        "trace": "PRD-US:US-06",
+        "_spine": True,
+        "_key": "txn_view"
+    })
+
+    return spine_tasks
+
+
+
+def _decision_enforcement_tasks(ctx: dict, task_counter: dict) -> dict:
+    """
+    INVARIANT B: Generate enforcement tasks for decisions.
+
+    For SECURITY decisions: Creates implementation task + QA enforcement test (P:HIGH)
+    For DATA decisions: Creates correctness QA task
+    For ARCH decisions: Creates setup + smoke test task
+
+    Returns dict with 'ops', 'qa', 'backend' task lists.
+    """
+    result = {"ops": [], "qa": [], "backend": []}
+    decisions = ctx.get("decisions", [])
+    processed = set()
+
+    for dec in decisions:
+        dec_id = dec.get("id", "???")
+        dec_type = dec.get("type", "").upper()
+        dec_text = dec.get("decision", "")
+        dec_text_lower = dec_text.lower()
+        dec_status = dec.get("status", "")
+
+        # Skip PROPOSED decisions (handled separately as Docs tasks)
+        if "PROPOSED" in dec_status.upper():
+            continue
+
+        # === SECURITY decisions: implement + QA enforce (both P:HIGH) ===
+        if dec_type == "SEC" or dec_type == "SECURITY":
+            if f"sec_{dec_id}" not in processed:
+                # Implementation/enforcement task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text,
+                    "priority": "HIGH"
+                })
+
+                # QA enforcement test (P:HIGH per INVARIANT B)
+                task_counter["Q"] += 1
+                # Determine specific enforcement test
+                if "read-only" in dec_text_lower or "read only" in dec_text_lower:
+                    qa_title = "Read-only mode enforcement"
+                    qa_dod = "Write attempts blocked when read-only enabled; test proves no DB mutation"
+                else:
+                    qa_title = f"Security enforcement: {_generate_short_title(dec_text, 30)}"
+                    qa_dod = "Security control verified; unauthorized action blocked"
+
+                result["qa"].append({
+                    "id": f"T-Q{task_counter['Q']}",
+                    "title": qa_title,
+                    "dod": f"pytest + fixture dataset + deterministic seed; {qa_dod}",
+                    "trace": f"DEC-{dec_id}",
+                    "priority": "HIGH",
+                    "level": "INTEGRATION",
+                    "_enforcement": True
+                })
+                processed.add(f"sec_{dec_id}")
+
+        # === DATA decisions: correctness QA task ===
+        elif dec_type == "DATA":
+            if f"data_{dec_id}" not in processed:
+                # Implementation task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+
+                # Correctness QA for specific DATA patterns
+                if "duckdb" in dec_text_lower or "parquet" in dec_text_lower:
+                    task_counter["Q"] += 1
+                    result["qa"].append({
+                        "id": f"T-Q{task_counter['Q']}",
+                        "title": "DuckDB + Parquet parity",
+                        "dod": "pytest + fixture dataset + deterministic seed; same dataset yields identical results from Parquet baseline vs DuckDB query",
+                        "trace": f"DEC-{dec_id}",
+                        "level": "INTEGRATION"
+                    })
+                processed.add(f"data_{dec_id}")
+
+        # === ALGO decisions: correctness QA (e.g., PIT) ===
+        elif dec_type == "ALGO":
+            if f"algo_{dec_id}" not in processed:
+                # Implementation task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+
+                # PIT correctness test
+                if "merge_asof" in dec_text_lower or "pit" in dec_text_lower or "point-in-time" in dec_text_lower:
+                    task_counter["Q"] += 1
+                    result["qa"].append({
+                        "id": f"T-Q{task_counter['Q']}",
+                        "title": "PIT merge_asof correctness",
+                        "dod": "pytest + fixture dataset + deterministic seed; demonstrates correct point-in-time join; fails if leakage occurs",
+                        "trace": f"DEC-{dec_id}",
+                        "priority": "HIGH",
+                        "level": "INTEGRATION"
+                    })
+                processed.add(f"algo_{dec_id}")
+
+        # === ARCH/API/UX/PERF decisions: standard Ops task ===
+        else:
+            if f"other_{dec_id}" not in processed:
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+                processed.add(f"other_{dec_id}")
+
+    return result
+
+
+def build_plan_from_context(ctx: dict) -> str:
+    """
+    Generate production execution-grade multi-stream plan markdown.
+
+    Implements three hard invariants:
+    - INVARIANT A: Backend Spine Must Exist (throughput + correctness backbone)
+    - INVARIANT B: Decision-Driven Enforcement + Tests (SECURITY/DATA/ARCH)
+    - INVARIANT C: Priority is Dependency-Aware (blockers/spine/enforcement = HIGH)
+
+    Target streams: Docs, Backend, Frontend, QA, Ops
+
+    Returns:
+        Markdown string with task checklist.
+    """
+    streams = {
+        "Backend": [],
+        "Frontend": [],
+        "QA": [],
+        "Ops": [],
+        "Docs": []
+    }
+
+    task_counter = {"B": 0, "F": 0, "Q": 0, "O": 0, "D": 0}
+
+    user_stories = ctx.get("user_stories", [])
+    api_endpoints = ctx.get("api_endpoints", [])
+    data_entities = ctx.get("data_entities", [])
+    decisions = ctx.get("decisions", [])
+
+    # Helper to find decision by type keyword
+    def find_decision_trace(keywords):
+        for dec in decisions:
+            dec_text = dec.get("decision", "").lower()
+            dec_type = dec.get("type", "").upper()
+            for kw in keywords:
+                if kw.lower() in dec_text or kw.upper() == dec_type:
+                    return f"DEC-{dec.get('id', '???')}"
+        return None
+
+    # =================================================================
+    # DOCS LANE: API Strategy + Internal Contract (FIX A)
+    # =================================================================
+    # Always generate API strategy task - removes false pressure for endpoints
+
+    task_counter["D"] += 1
+    streams["Docs"].append({
+        "id": f"T-D{task_counter['D']}",
+        "title": "Declare API strategy",
+        "dod": "SPEC includes API Strategy section with one of: No API (Streamlit local), Local API only, or Remote API",
+        "trace": "SPEC-API",
+        "priority": "HIGH",
+        "_key": "api_strategy"
+    })
+
+    # TASK 4: If endpoints=0, also require internal interface contract + implementation
+    if len(api_endpoints) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Define internal interface contract",
+            "dod": "SPEC Internal Interfaces lists >= 5 function signatures with return types and error semantics",
+            "trace": "SPEC-API",
+            "priority": "HIGH",
+            "_key": "internal_interface_contract"
+        })
+
+    # Additional docs blockers if truly missing
+    if len(user_stories) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Add User Stories to PRD",
+            "dod": "PRD contains >= 3 user stories with acceptance criteria",
+            "trace": "PRD-US",
+            "priority": "HIGH"
+        })
+
+    if len(data_entities) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Define Data Model entities",
+            "dod": "SPEC Data Model lists >= 3 entities with fields and types",
+            "trace": "SPEC-DATA",
+            "priority": "HIGH"
+        })
+
+    # Proposed decisions need finalization
+    for dec in decisions:
+        if "PROPOSED" in dec.get("status", "").upper():
+            task_counter["D"] += 1
+            streams["Docs"].append({
+                "id": f"T-D{task_counter['D']}",
+                "title": f"Finalize {dec.get('type', 'UNKNOWN')} decision {dec.get('id', '???')}",
+                "dod": "Decision reviewed and marked ACCEPTED or REJECTED",
+                "trace": f"DEC-{dec.get('id', '???')}"
+            })
+
+    # =================================================================
+    # BACKEND LANE: Spine First (INVARIANT A)
+    # =================================================================
+
+    spine_tasks = _build_backend_spine(ctx, task_counter, find_decision_trace)
+    streams["Backend"].extend(spine_tasks)
+
+    # FIX C: Strategy cartridge interface (unblocks US-02/US-03)
+    # TASK 1: Trace to DEC if strategy decision exists, else SPEC-DATA (not PRD-US:US-02)
+    if len(user_stories) > 0:
+        task_counter["B"] += 1
+        strategy_trace = find_decision_trace(["abc", "protocol", "strategy", "cartridge"]) or "SPEC-DATA"
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Define strategy cartridge interface",
+            "dod": "Abstract base class or protocol; required methods; params schema; example strategy passes contract test",
+            "trace": strategy_trace,
+            "priority": "HIGH",
+            "_key": "strategy_interface"
+        })
+
+    # TASK 4: If endpoints=0, add Backend implementation task for internal interfaces
+    if len(api_endpoints) == 0 and len(user_stories) > 0:
+        task_counter["B"] += 1
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement internal interfaces v1",
+            "dod": "Implements all SPEC Internal Interfaces signatures; typed errors; unit tests for each signature",
+            "trace": "SPEC-API",
+            "priority": "HIGH",
+            "dep": "Docs:internal_interface_contract",
+            "_key": "internal_interfaces_impl"
+        })
+
+    # From API endpoints (if any)
+    for ep in api_endpoints:
+        task_counter["B"] += 1
+        method = ep.get("method", "GET")
+        path = ep.get("path", "/unknown")
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": f"Implement {method} {path}",
+            "dod": "Endpoint returns correct response, validated against schema",
+            "trace": f"SPEC-API:{method} {path}"
+        })
+
+    # FIX B: Entity persistence consolidated into schema definition task
+    # No per-entity CRUD explosion - entity list is in spine schema task Detail field
+
+    # =================================================================
+    # FRONTEND LANE: Dependency-Aware Priority (INVARIANT C + FIX D)
+    # =================================================================
+    # FIX D: Limit P:HIGH to max 2 tasks (prioritize US-01 data load + US-04 metrics)
+    # TASK 2: Add machine-actionable Dep tags for schedulability
+
+    high_priority_story_ids = {"US-01", "US-04"}  # Data load + metrics view
+    frontend_high_count = 0
+    MAX_FRONTEND_HIGH = 2
+
+    # TASK 2: Define story -> backend dependency mappings
+    story_deps = {
+        "US-04": "Backend:metrics,Backend:results_store",
+        "US-06": "Backend:txn_view",
+        "US-07": "Backend:results_store",
+    }
+
+    for story in user_stories:
+        task_counter["F"] += 1
+        story_id = story.get("id", "US-??")
+        full_story = story.get("story", "")
+        short_title = f"{story_id} " + _generate_short_title(full_story, 40)
+
+        task = {
+            "id": f"T-F{task_counter['F']}",
+            "title": short_title,
+            "dod": "Component renders, handles user interaction per story",
+            "trace": f"PRD-US:{story_id}",
+            "detail": full_story
+        }
+
+        # TASK 2: Add machine-actionable Dep tag if this story has known dependencies
+        if story_id in story_deps:
+            task["dep"] = story_deps[story_id]
+
+        # FIX D: Only US-01 and US-04 get P:HIGH (if spine exists)
+        if story_id in high_priority_story_ids and frontend_high_count < MAX_FRONTEND_HIGH:
+            task["priority"] = "HIGH"
+            frontend_high_count += 1
+
+        streams["Frontend"].append(task)
+
+    # =================================================================
+    # QA LANE: Decision Enforcement (INVARIANT B) + Story Tests
+    # =================================================================
+    # TASK 3: Add Level field and normalize harness language
+
+    # Get decision-driven QA tasks
+    enforcement = _decision_enforcement_tasks(ctx, task_counter)
+
+    # Add enforcement QA tasks first (they're higher priority)
+    streams["QA"].extend(enforcement["qa"])
+
+    # TASK 3: Story integration tests with Level field and consistent harness
+    edge_cases = {
+        "load": "missing file",
+        "select": "invalid strategy",
+        "adjust": "out-of-range parameter",
+        "view": "empty dataset",
+        "drag": "invalid date range",
+        "compare": "same strategy twice",
+    }
+
+    # Keywords to determine test level
+    backend_keywords = ["load", "run", "compute", "persist", "query", "ingest"]
+
+    for story in user_stories:
+        task_counter["Q"] += 1
+        story_id = story.get("id", "US-??")
+        story_text = story.get("story", "").lower()
+
+        edge_case = "empty input"
+        for kw, ec in edge_cases.items():
+            if kw in story_text:
+                edge_case = ec
+                break
+
+        # TASK 3: Determine Level and harness
+        is_backend = any(kw in story_text for kw in backend_keywords)
+        if is_backend:
+            level = "INTEGRATION"
+            harness = "pytest + fixture dataset + deterministic seed"
+        else:
+            level = "UI_SMOKE"
+            harness = "pytest + Streamlit session state assertions"
+
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": f"{story_id} Integration Test",
+            "dod": f"{harness}; covers happy path + edge: {edge_case}",
+            "trace": f"PRD-US:{story_id}",
+            "level": level
+        })
+
+    # API endpoint tests (if any) - TASK 3: Add Level field
+    for ep in api_endpoints[:3]:
+        task_counter["Q"] += 1
+        method = ep.get("method", "GET")
+        path = ep.get("path", "/unknown")
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": f"API test {method} {path}",
+            "dod": "pytest + fixture dataset + deterministic seed; validates response schema and status codes",
+            "trace": f"SPEC-API:{method} {path}",
+            "level": "INTEGRATION"
+        })
+
+    # =================================================================
+    # OPS LANE: Decision Implementation Tasks
+    # =================================================================
+
+    streams["Ops"].extend(enforcement["ops"])
+
+    # =================================================================
+    # BUILD MARKDOWN OUTPUT
+    # =================================================================
+
+    lines = [
+        f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "> Edit this file, then run `/accept-plan` to hydrate the database.",
+        "> Format: `- [ ] Lane: Title — DoD: ... | Trace: ... | Detail: ... | P:HIGH`",
+        ""
+    ]
+
+    total_tasks = 0
+    lanes_with_tasks = 0
+
+    for stream_name in ["Docs", "Backend", "Frontend", "QA", "Ops"]:
+        tasks = streams[stream_name]
+        if not tasks:
+            continue
+
+        lanes_with_tasks += 1
+        lines.append(f"## [{stream_name}]")
+        lines.append("")
+
+        for task in tasks:
+            total_tasks += 1
+            title = task.get("title", task.get("desc", ""))
+            dod = task.get("dod", "")
+            trace = task.get("trace", "")
+            detail = task.get("detail", "")
+            priority = task.get("priority", "")
+
+            # Remove internal markers
+            task.pop("_spine", None)
+            task.pop("_enforcement", None)
+            task.pop("_key", None)
+
+            task_line = f"- [ ] {stream_name}: {title}"
+            if dod or trace or detail or priority:
+                task_line += " —"
+                if dod:
+                    task_line += f" DoD: {dod}"
+                if trace:
+                    task_line += f" | Trace: {trace}"
+                if detail:
+                    task_line += f" | Detail: {detail}"
+                # TASK 2: Add Dep field if present
+                dep = task.get("dep", "")
+                if dep:
+                    task_line += f" | Dep: {dep}"
+                # TASK 3: Add Level field if present
+                level = task.get("level", "")
+                if level:
+                    task_line += f" | Level: {level}"
+                if priority:
+                    task_line += f" | P:{priority}"
+
+            lines.append(task_line)
+
+        lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        f"<!-- Plan generated: {datetime.now().isoformat()} -->",
+        f"<!-- Tasks: {total_tasks} | Lanes: {lanes_with_tasks} -->",
+        f"<!-- Anchors: stories={len(user_stories)}, endpoints={len(api_endpoints)}, entities={len(data_entities)}, decisions={len(decisions)} -->",
+        ""
+    ])
+
+    _plan_debug(f"Built plan: {total_tasks} tasks across {lanes_with_tasks} lanes")
+
+    return "\n".join(lines)
+
+
+def build_plan_from_context_structured(ctx: dict) -> dict:
+    """
+    Generate a structured plan dict with status and streams.
+
+    This is a structured alternative to build_plan_from_context() which
+    returns markdown. Use this when you need programmatic access to plan data.
+
+    Returns:
+        dict: {"status": "OK"|"INSUFFICIENT_CONTEXT", "streams": [...]}
+    """
+    streams = {
+        "Backend": [],
+        "Frontend": [],
+        "QA": [],
+        "Ops": [],
+        "Docs": []
+    }
+
+    task_counter = {"B": 0, "F": 0, "Q": 0, "O": 0, "D": 0}
+
+    user_stories = ctx.get("user_stories", [])
+    api_endpoints = ctx.get("api_endpoints", [])
+    data_entities = ctx.get("data_entities", [])
+    decisions = ctx.get("decisions", [])
+
+    # Check if context is sufficient
+    is_sufficient, _ = _context_is_sufficient(ctx)
+
+    # Docs lane
+    task_counter["D"] += 1
+    streams["Docs"].append({
+        "id": f"T-D{task_counter['D']}",
+        "title": "Declare API strategy",
+        "dod": "SPEC includes API Strategy section",
+        "trace": "SPEC-API"
+    })
+
+    # Backend lane - from API endpoints
+    for ep in api_endpoints:
+        task_counter["B"] += 1
+        method = ep.get("method", "GET")
+        path = ep.get("path", "/unknown")
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": f"Implement {method} {path}",
+            "dod": f"Endpoint {method} {path} passes tests",
+            "trace": f"SPEC-API-{path}"
+        })
+
+    # Backend lane - from data entities
+    for entity in data_entities:
+        task_counter["B"] += 1
+        name = entity.get("name", "Entity")
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": f"Implement {name} model",
+            "dod": f"{name} CRUD operations work",
+            "trace": f"SPEC-DATA-{name}"
+        })
+
+    # Frontend lane - from user stories
+    for story in user_stories:
+        task_counter["F"] += 1
+        story_id = story.get("id", "US-??")
+        streams["Frontend"].append({
+            "id": f"T-F{task_counter['F']}",
+            "title": f"UI for {story_id}",
+            "dod": f"User can complete {story_id} flow",
+            "trace": story_id
+        })
+
+    # QA lane - test tasks for user stories
+    for story in user_stories:
+        task_counter["Q"] += 1
+        story_id = story.get("id", "US-??")
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": f"Test {story_id}",
+            "dod": f"E2E test for {story_id} passes",
+            "trace": story_id
+        })
+
+    # Ops lane - from decisions
+    for dec in decisions:
+        task_counter["O"] += 1
+        dec_type = dec.get("type", "UNKNOWN")
+        streams["Ops"].append({
+            "id": f"T-O{task_counter['O']}",
+            "title": f"Implement {dec_type} decision",
+            "dod": f"Decision {dec.get('id', '???')} enforced",
+            "trace": f"DEC-{dec.get('id', '???')}"
+        })
+
+    # Convert to list format
+    streams_list = [
+        {"name": name, "tasks": tasks}
+        for name, tasks in streams.items()
+        if tasks  # Only include non-empty streams
+    ]
+
+    return {
+        "status": "OK" if is_sufficient else "INSUFFICIENT_CONTEXT",
+        "streams": streams_list
+    }
+
+
+def _assess_plan_quality(plan: dict, context: dict) -> dict:
+    """
+    Assess the quality of a generated plan.
+
+    Args:
+        plan: dict with "streams" key containing task lists
+        context: dict with extracted context (user_stories, api_endpoints, etc.)
+
+    Returns:
+        dict: {"level": "OK"|"BAD"|"THIN", "reason": "..."}
+
+    Thresholds:
+        - MIN_TASKS: 10
+        - MIN_STREAMS: 3
+    """
+    MIN_TASKS = 10
+    MIN_STREAMS = 3
+
+    streams = plan.get("streams", [])
+    total_tasks = sum(len(s.get("tasks", [])) for s in streams)
+    stream_count = len(streams)
+
+    # Check task count
+    if total_tasks < MIN_TASKS:
+        return {
+            "level": "BAD",
+            "reason": "TOO_FEW_TASKS",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    # Check stream count
+    if stream_count < MIN_STREAMS:
+        return {
+            "level": "BAD",
+            "reason": "TOO_FEW_STREAMS",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    # Check if thin (passes thresholds but barely)
+    # THIN = meets minimum but not comfortable margin
+    if total_tasks < MIN_TASKS + 2 or stream_count < MIN_STREAMS:
+        return {
+            "level": "THIN",
+            "reason": "MEETS_MINIMUM",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    return {
+        "level": "OK",
+        "reason": "SUFFICIENT",
+        "task_count": total_tasks,
+        "stream_count": stream_count
+    }
+
+
 # PLAN-AS-CODE SYSTEM (v13.5.5)
 # =============================================================================
 # Tools for cached plan preview on startup and plan file workflow:
@@ -1321,12 +2740,15 @@ A task is "reviewable" when:
 @mcp.tool()
 def refresh_plan_preview() -> str:
     """
-    Regenerates the plan preview by reading ACTIVE_SPEC.md and tasks.
-    This is the SLOW operation - may involve LLM calls.
-    Use sparingly (e.g., after spec changes).
+    v17.0: Regenerates the plan preview from document extraction.
 
-    Returns the newly generated plan preview JSON.
+    Uses deterministic extraction from PRD/SPEC/DECISION_LOG.
+    Updates the cache with extraction counts and quality status.
+
+    Returns JSON with extraction results and quality assessment.
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -1341,46 +2763,42 @@ def refresh_plan_preview() -> str:
         pass  # Fail open if readiness check fails
 
     cache_path = get_plan_preview_path()
-    
+
     try:
-        # Load current tasks from state
-        state = load_state()
-        tasks = state.get("tasks", {})
-        
-        # Group tasks by type (workstream)
-        streams = {}
-        for task_id, task in tasks.items():
-            task_type = task.get("type", "unknown")
-            stream_name = task_type.capitalize()
-            
-            if stream_name not in streams:
-                streams[stream_name] = []
-            
-            # Only include pending/in_progress tasks
-            if task.get("status") in ["pending", "in_progress", "blocked"]:
-                streams[stream_name].append({
-                    "id": task_id,
-                    "desc": task.get("desc", "No description"),
-                    "status": task.get("status", "pending"),
-                    "priority": task.get("priority", 1)
-                })
-        
-        # Sort tasks by priority within each stream
-        for stream_name in streams:
-            streams[stream_name].sort(key=lambda t: t.get("priority", 1), reverse=True)
-        
-        # Build the plan preview structure
+        # v17.0: Extract context from documents
+        ctx = extract_project_context(base_dir=BASE_DIR)
+        _plan_debug(f"Refresh extraction: {ctx['debug']['counts']}")
+
+        # Check sufficiency
+        is_sufficient, reasons = _context_is_sufficient(ctx)
+
+        # Estimate task/lane counts
+        counts = ctx["debug"]["counts"]
+        estimated_tasks = (
+            counts["api_endpoints"] +
+            counts["data_entities"] +
+            (counts["user_stories"] * 2) +
+            counts["decisions"]
+        )
+        estimated_lanes = sum([
+            1 if counts["api_endpoints"] > 0 or counts["data_entities"] > 0 else 0,  # Backend
+            1 if counts["user_stories"] > 0 else 0,  # Frontend
+            1 if counts["user_stories"] > 0 or counts["api_endpoints"] > 0 else 0,  # QA
+            1 if counts["decisions"] > 0 else 0,  # Ops/Docs
+        ])
+
+        # Build cache structure
         plan = {
-            "status": "FRESH",
+            "status": "FRESH" if is_sufficient else "INSUFFICIENT_CONTEXT",
             "generated_at": time.time(),
-            "source": "tasks.json",
-            "streams": [
-                {"name": name, "tasks": tasks_list}
-                for name, tasks_list in streams.items()
-                if tasks_list  # Only include non-empty streams
-            ]
+            "source": "doc_extraction",
+            "counts": counts,
+            "estimated_tasks": estimated_tasks,
+            "estimated_lanes": estimated_lanes,
+            "is_sufficient": is_sufficient,
+            "reasons": reasons
         }
-        
+
         # Write to cache
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
@@ -1392,14 +2810,15 @@ def refresh_plan_preview() -> str:
             plan["active_spec_updated"] = hydration_result.get("path")
             plan["hydration_note"] = f"ACTIVE_SPEC updated: {hydration_result.get('reason')}"
         else:
-            # Log warning but don't block
             plan["hydration_warning"] = hydration_result.get("reason", "Unknown error")
 
         return json.dumps(plan)
+
     except Exception as e:
         return json.dumps({
             "status": "ERROR",
             "reason": f"Failed to refresh plan: {e}",
+            "traceback": tb.format_exc(),
             "streams": []
         })
 
@@ -1407,11 +2826,19 @@ def refresh_plan_preview() -> str:
 @mcp.tool()
 def draft_plan() -> str:
     """
-    Creates a draft plan markdown file from the cached plan preview.
-    Opens the file for user editing.
+    v17.0: Creates a draft plan from document extraction (PRD/SPEC/DECISION_LOG).
 
-    Returns the path to the created file.
+    Uses deterministic extraction to generate multi-stream roadmap.
+    Falls back to "missing context" checklist if docs are insufficient.
+
+    Returns JSON with:
+    - status: OK | INSUFFICIENT_CONTEXT | BLOCKED | ERROR
+    - path: Path to generated draft file
+    - plan_quality: OK | INSUFFICIENT_CONTEXT
+    - counts: Extraction statistics
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -1425,76 +2852,73 @@ def draft_plan() -> str:
     except Exception:
         pass  # Fail open if readiness check fails
 
-    cache_path = get_plan_preview_path()
-    
     try:
-        # Load cached plan
-        if os.path.exists(cache_path):
-            with open(cache_path, "r", encoding="utf-8") as f:
-                plan = json.load(f)
-        else:
-            plan = {"streams": []}
-        
+        # v17.0: Extract context from documents
+        ctx = extract_project_context(base_dir=BASE_DIR)
+        _plan_debug(f"Extraction complete: {ctx['debug']['counts']}")
+
+        # Check if context is sufficient
+        is_sufficient, reasons = _context_is_sufficient(ctx)
+
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         plans_dir = os.path.join(DOCS_DIR, "PLANS")
         os.makedirs(plans_dir, exist_ok=True)
-        
         draft_path = os.path.join(plans_dir, f"draft_{timestamp}.md")
-        
-        # Generate markdown content
-        lines = [
-            f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "",
-            "> Edit this file, then run `/accept-plan` to hydrate the database.",
-            "> Format: `- [ ] Type: Description`",
-            "",
-        ]
-        
-        for stream in plan.get("streams", []):
-            stream_name = stream.get("name", "Unknown")
-            lines.append(f"## [{stream_name}]")
-            lines.append("")
-            
-            for task in stream.get("tasks", []):
-                task_id = task.get("id", "")
-                desc = task.get("desc", "")
-                status = task.get("status", "pending")
-                
-                # Use checkbox format
-                checkbox = "[x]" if status == "completed" else "[ ]"
-                lines.append(f"- {checkbox} {stream_name}: {desc}")
-            
-            lines.append("")
-        
-        # If no streams, add a template
-        if not plan.get("streams"):
-            lines.extend([
-                "## [Backend]",
-                "",
-                "- [ ] Backend: API endpoint for user authentication",
-                "- [ ] Backend: Rate limiting middleware",
-                "",
-                "## [Frontend]",
-                "",
-                "- [ ] Frontend: Login form component",
-                "- [ ] Frontend: Dashboard layout",
-                "",
-            ])
-        
+
+        if not is_sufficient:
+            # Generate missing-context checklist (NOT generic auth/login template)
+            plan_content = _generate_missing_context_plan(ctx, reasons)
+            plan_quality = "INSUFFICIENT_CONTEXT"
+            _plan_debug(f"Generated INSUFFICIENT_CONTEXT plan: {reasons}")
+        else:
+            # Generate full multi-stream plan from context
+            plan_content = build_plan_from_context(ctx)
+            plan_quality = "OK"
+            _plan_debug("Generated OK plan from context")
+
         # Write the file
         with open(draft_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        
+            f.write(plan_content)
+
+        # Count tasks in generated plan
+        task_count = plan_content.count("- [ ]")
+        lane_count = plan_content.count("## [")
+
+        # Also update the cache for refresh_plan_preview compatibility
+        cache_path = get_plan_preview_path()
+        cache_data = {
+            "status": plan_quality,
+            "generated_at": time.time(),
+            "source": "doc_extraction",
+            "counts": ctx["debug"]["counts"],
+            "task_count": task_count,
+            "lane_count": lane_count
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+
         return json.dumps({
             "status": "OK",
             "path": draft_path,
-            "message": f"Draft created: {draft_path}"
+            "message": f"Draft created: {draft_path}",
+            "plan_quality": plan_quality,
+            "task_count": task_count,
+            "lane_count": lane_count,
+            "anchors": ctx["debug"]["counts"],
+            "reasons": reasons if not is_sufficient else []
         })
+
     except Exception as e:
+        # Return valid JSON with traceback for debugging
         return json.dumps({
             "status": "ERROR",
-            "message": f"Failed to create draft: {e}"
+            "message": f"Failed to create draft: {e}",
+            "traceback": tb.format_exc(),
+            "paths": {
+                "base_dir": BASE_DIR,
+                "docs_dir": DOCS_DIR
+            }
         })
 
 
