@@ -40,7 +40,7 @@ $TotalWidth = 77
 
 $Global:Commands = [ordered]@{
     # EXECUTION
-    "go"             = @{ Desc = "execute the next pending task"; Alias = @("continue", "c", "run"); Template = "/go" }
+    "go"             = @{ Desc = "execute the next pending task"; Alias = @("continue", "c", "g", "run"); Template = "/go" }
     
     # TASK MANAGEMENT
     "add"            = @{ Desc = "add task: /add backend|frontend <description>"; HasArgs = $true; Template = "/add <type> <desc>"; Placeholder = "<type>"; MiniGuide = "backend/frontend"; Options = @("backend", "frontend") }
@@ -107,8 +107,8 @@ $Global:Commands = [ordered]@{
     "status"         = @{ Desc = "show system status dashboard"; Template = "/status" }
     "plan"           = @{ Desc = "show project roadmap"; Template = "/plan" }
     "tasks"          = @{ Desc = "list all tasks"; Template = "/tasks" }
-    "help"           = @{ Desc = "show Golden Path (/help --all for full registry)"; Alias = @("?"); Template = "/help" }
-    "commands"       = @{ Desc = "[LEGACY] use /help instead"; Template = "/commands" }
+    "help"           = @{ Desc = "v20.0: /help topics • /help <topic> • /help <query>"; Alias = @("?"); Template = "/help" }
+    "commands"       = @{ Desc = "v20.0: P0 commands (/commands all for full registry)"; Template = "/commands" }
     "refresh"        = @{ Desc = "refresh the display"; Template = "/refresh" }
     "clear"          = @{ Desc = "clear the console screen"; Template = "/clear" }
     "quit"           = @{ Desc = "exit Atomic Mesh"; Alias = @("q", "exit"); Template = "/quit" }
@@ -141,6 +141,601 @@ $Global:Commands = [ordered]@{
     "accept-plan"    = @{ Desc = "v18.4: hydrate DB from plan file (defaults to latest draft)"; Template = "/accept-plan" }
 }
 
+# ============================================================================
+# COMMAND METADATA (v20.0) - Single source of truth for discovery surfaces
+# ============================================================================
+
+# P0 Commands: Curated allowlist for /commands (grouped by workflow)
+$Global:P0Commands = [ordered]@{
+    "Plan" = @(
+        @{ Canonical = "draft-plan"; Desc = "create editable plan file in docs/PLANS/" }
+        @{ Canonical = "accept-plan"; Desc = "hydrate DB from plan file" }
+        @{ Canonical = "tasks"; Desc = "list all tasks" }
+    )
+    "Execute" = @(
+        @{ Canonical = "go"; Desc = "execute the next pending task"; Aliases = @("g", "run", "c", "continue") }
+    )
+    "Manage" = @(
+        @{ Canonical = "add"; Desc = "add task: /add backend|frontend <desc>" }
+        @{ Canonical = "skip"; Desc = "skip a task by ID" }
+        @{ Canonical = "reset"; Desc = "reset failed task by ID" }
+        @{ Canonical = "drop"; Desc = "delete a task by ID" }
+    )
+    "QA/Ship" = @(
+        @{ Canonical = "preflight"; Desc = "run local pre-flight tests" }
+        @{ Canonical = "verify"; Desc = "run QA audit on task" }
+        @{ Canonical = "ship"; Desc = "commit and push (trusts local QA)" }
+    )
+    "Navigate" = @(
+        @{ Canonical = "status"; Desc = "show system status dashboard" }
+        @{ Canonical = "help"; Desc = "show help (topics, search)" }
+        @{ Canonical = "clear"; Desc = "clear the console screen" }
+        @{ Canonical = "quit"; Desc = "exit Atomic Mesh"; Aliases = @("q", "exit") }
+    )
+}
+
+# Help Topics: Topic pages with commands and examples
+$Global:HelpTopics = @{
+    "tasks" = @{
+        Summary = "Create, manage, and execute work items"
+        Commands = @(
+            @{ Name = "go"; Desc = "Pick and start the next pending task (braided scheduler)" }
+            @{ Name = "add"; Desc = "Add a task: /add backend|frontend <description>" }
+            @{ Name = "skip"; Desc = "Skip a task: /skip <task-id>" }
+            @{ Name = "reset"; Desc = "Reset failed task: /reset <task-id>" }
+            @{ Name = "drop"; Desc = "Delete a task: /drop <task-id>" }
+            @{ Name = "tasks"; Desc = "List all tasks with status" }
+        )
+        Examples = @(
+            "/go              # Pick next task from queue"
+            "/add backend Add user auth endpoint"
+            "/tasks           # View all tasks"
+        )
+    }
+    "plan" = @{
+        Summary = "Create and manage project roadmaps"
+        Commands = @(
+            @{ Name = "draft-plan"; Desc = "Create editable plan file in docs/PLANS/" }
+            @{ Name = "accept-plan"; Desc = "Hydrate database from plan file" }
+            @{ Name = "refresh-plan"; Desc = "Regenerate plan preview from tasks" }
+            @{ Name = "plan"; Desc = "Show project roadmap" }
+        )
+        Examples = @(
+            "/draft-plan      # Create new plan file"
+            "/accept-plan     # Load latest draft into DB"
+            "/plan            # View current roadmap"
+        )
+    }
+    "ops" = @{
+        Summary = "Monitor system health, drift, and operations"
+        Commands = @(
+            @{ Name = "ops"; Desc = "Health + Drift + Backups overview" }
+            @{ Name = "health"; Desc = "System health check" }
+            @{ Name = "drift"; Desc = "Staleness and queue drift check" }
+            @{ Name = "doctor"; Desc = "Run system diagnostics" }
+            @{ Name = "status"; Desc = "Show system status dashboard" }
+        )
+        Examples = @(
+            "/ops             # Quick health overview"
+            "/doctor          # Full system diagnostics"
+        )
+    }
+    "agents" = @{
+        Summary = "Interact with autonomous agents (auditor, librarian)"
+        Commands = @(
+            @{ Name = "audit"; Desc = "Open auditor status and log" }
+            @{ Name = "lib"; Desc = "Librarian: scan|status|approve|execute" }
+            @{ Name = "ingest"; Desc = "Compile raw PRDs from inbox to specs" }
+            @{ Name = "snippets"; Desc = "Search reusable code snippets" }
+            @{ Name = "dupcheck"; Desc = "Detect duplicate helpers" }
+        )
+        Examples = @(
+            "/audit           # View audit log"
+            "/lib scan        # Start librarian scan"
+            "/snippets auth   # Search auth-related snippets"
+        )
+    }
+    "qa" = @{
+        Summary = "Quality assurance and shipping"
+        Commands = @(
+            @{ Name = "preflight"; Desc = "Run local pre-flight tests" }
+            @{ Name = "verify"; Desc = "Run QA audit on task: /verify <task-id>" }
+            @{ Name = "ship"; Desc = "Commit and push (requires --confirm)" }
+            @{ Name = "review"; Desc = "View review status: /review [task-id]" }
+            @{ Name = "simplify"; Desc = "Check task for bloat" }
+        )
+        Examples = @(
+            "/preflight       # Run all pre-flight checks"
+            "/verify T-123    # QA audit for task T-123"
+            "/ship --confirm  # Ship with confirmation"
+        )
+    }
+    "streams" = @{
+        Summary = "View worker output streams"
+        Commands = @(
+            @{ Name = "stream"; Desc = "View worker output: /stream backend|frontend" }
+        )
+        Examples = @(
+            "/stream backend  # View backend worker logs"
+            "/stream frontend # View frontend worker logs"
+        )
+    }
+    "diagnostics" = @{
+        Summary = "System diagnostics and debugging"
+        Commands = @(
+            @{ Name = "doctor"; Desc = "Run system health check" }
+            @{ Name = "rigor"; Desc = "Show Phase x Risk matrix" }
+            @{ Name = "refine"; Desc = "Analyze ACTIVE_SPEC.md for ambiguities" }
+            @{ Name = "router-debug"; Desc = "Toggle router debug overlay" }
+        )
+        Examples = @(
+            "/doctor          # Full system diagnostics"
+            "/router-debug    # Toggle debug overlay"
+        )
+    }
+    "session" = @{
+        Summary = "Session management commands"
+        Commands = @(
+            @{ Name = "clear"; Desc = "Clear the console screen" }
+            @{ Name = "refresh"; Desc = "Refresh the display" }
+            @{ Name = "quit"; Desc = "Exit Atomic Mesh (aliases: /q, /exit)" }
+            @{ Name = "dash"; Desc = "Force full dashboard view" }
+            @{ Name = "compact"; Desc = "Force compact view" }
+        )
+        Examples = @(
+            "/clear           # Clear screen"
+            "/quit            # Exit"
+        )
+    }
+}
+
+# Command keywords for fuzzy search
+$Global:CommandKeywords = @{
+    "go"           = @("execute", "run", "start", "next", "continue", "pick", "work")
+    "add"          = @("create", "new", "task", "todo")
+    "skip"         = @("bypass", "ignore", "postpone")
+    "reset"        = @("retry", "redo", "restart", "failed")
+    "drop"         = @("delete", "remove", "cancel")
+    "nuke"         = @("clear", "wipe", "all", "pending")
+    "draft-plan"   = @("create", "new", "plan", "roadmap", "draft")
+    "accept-plan"  = @("load", "hydrate", "import", "plan")
+    "refresh-plan" = @("update", "regenerate", "sync", "plan")
+    "plan"         = @("roadmap", "backlog", "view")
+    "tasks"        = @("list", "queue", "todos", "backlog")
+    "status"       = @("dashboard", "overview", "state")
+    "help"         = @("commands", "docs", "guide", "usage")
+    "ops"          = @("health", "drift", "operations", "monitor")
+    "health"       = @("status", "check", "diagnostics")
+    "drift"        = @("staleness", "queue", "lag")
+    "doctor"       = @("diagnostics", "troubleshoot", "debug")
+    "preflight"    = @("test", "check", "qa", "validate")
+    "verify"       = @("qa", "audit", "check", "validate")
+    "ship"         = @("deploy", "release", "push", "commit")
+    "audit"        = @("log", "history", "review")
+    "lib"          = @("librarian", "scan", "snippets")
+    "stream"       = @("logs", "output", "worker")
+    "quit"         = @("exit", "close", "bye")
+    "clear"        = @("cls", "reset", "screen")
+}
+
+# ============================================================================
+# COMMAND DISCOVERY FUNCTIONS (v20.0)
+# ============================================================================
+
+function Show-CuratedCommands {
+    <#
+    .SYNOPSIS
+        Shows P0 commands grouped by workflow with collapsed aliases.
+        Output is ≤25 lines, deterministic, no duplicates.
+        Handles narrow terminals by truncating descriptions.
+    #>
+    $width = try { $Host.UI.RawUI.WindowSize.Width } catch { 80 }
+    if ($width -lt 40) { $width = 80 }  # Fallback for non-interactive
+
+    Write-Host ""
+    Write-Host "  ═══ COMMANDS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    foreach ($group in $Global:P0Commands.Keys) {
+        Write-Host "  $group" -ForegroundColor Yellow
+        foreach ($cmd in $Global:P0Commands[$group]) {
+            $name = $cmd.Canonical
+            $desc = $cmd.Desc
+            $aliasStr = ""
+
+            # Collapse aliases onto the same line
+            if ($cmd.Aliases -and $cmd.Aliases.Count -gt 0) {
+                $aliasStr = " (/$($cmd.Aliases -join ', /'))"
+            }
+
+            $cmdDisplay = "/$name".PadRight(16)
+            # 4 (indent) + 16 (cmd) + desc + alias = width
+            $availForDesc = $width - 4 - 16 - $aliasStr.Length - 2
+            if ($availForDesc -lt 10) { $availForDesc = 10 }
+
+            $displayDesc = $desc
+            if ($displayDesc.Length -gt $availForDesc) {
+                $displayDesc = $displayDesc.Substring(0, $availForDesc - 3) + "..."
+            }
+
+            Write-Host "    $cmdDisplay" -NoNewline -ForegroundColor Cyan
+            Write-Host "$displayDesc" -NoNewline -ForegroundColor Gray
+            if ($aliasStr) {
+                Write-Host $aliasStr -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+            }
+        }
+        Write-Host ""
+    }
+
+    # Adaptive footer based on width
+    if ($width -ge 70) {
+        Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host "  More: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/commands all" -NoNewline -ForegroundColor Cyan
+        Write-Host " • Help: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -NoNewline -ForegroundColor Cyan
+        Write-Host " • Search: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help <query>" -ForegroundColor Cyan
+    } else {
+        Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host "  /commands all" -NoNewline -ForegroundColor Cyan
+        Write-Host " | " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -ForegroundColor Cyan
+    }
+    Write-Host ""
+}
+
+function Show-AllCommands {
+    <#
+    .SYNOPSIS
+        Shows complete command registry (deterministic, includes aliases).
+    #>
+    Write-Host ""
+    Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Sort commands alphabetically for deterministic output
+    $sortedKeys = $Global:Commands.Keys | Sort-Object
+
+    foreach ($key in $sortedKeys) {
+        $cmd = $Global:Commands[$key]
+        $desc = $cmd.Desc
+        $cmdDisplay = "/$key".PadRight(18)
+
+        # Get aliases if any
+        $aliasStr = ""
+        if ($cmd.Alias -and $cmd.Alias.Count -gt 0) {
+            $aliasStr = " (aliases: /$($cmd.Alias -join ', /'))"
+        }
+
+        Write-Host "  $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host "$desc" -NoNewline -ForegroundColor Gray
+        if ($aliasStr) {
+            Write-Host $aliasStr -ForegroundColor DarkGray
+        } else {
+            Write-Host ""
+        }
+    }
+
+    Write-Host ""
+}
+
+function Show-HelpTopics {
+    <#
+    .SYNOPSIS
+        Lists all available help topics.
+    #>
+    Write-Host ""
+    Write-Host "  ═══ HELP TOPICS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    $topics = $Global:HelpTopics.Keys | Sort-Object
+    foreach ($topic in $topics) {
+        $info = $Global:HelpTopics[$topic]
+        $topicDisplay = "/help $topic".PadRight(22)
+        Write-Host "  $topicDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $info.Summary -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  Search any term: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/help <query>" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Show-HelpTopic {
+    <#
+    .SYNOPSIS
+        Shows detailed help for a specific topic.
+    #>
+    param([string]$Topic)
+
+    $topicLower = $Topic.ToLower()
+    if (-not $Global:HelpTopics.ContainsKey($topicLower)) {
+        Write-Host ""
+        Write-Host "  Unknown topic: $Topic" -ForegroundColor Yellow
+        Write-Host "  Available topics: $($Global:HelpTopics.Keys -join ', ')" -ForegroundColor Gray
+        Write-Host ""
+        return
+    }
+
+    $info = $Global:HelpTopics[$topicLower]
+
+    Write-Host ""
+    Write-Host "  ═══ HELP: $($topicLower.ToUpper()) ═══" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  $($info.Summary)" -ForegroundColor White
+    Write-Host ""
+
+    Write-Host "  Commands:" -ForegroundColor Yellow
+    foreach ($cmd in $info.Commands) {
+        $cmdDisplay = "/$($cmd.Name)".PadRight(18)
+        Write-Host "    $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $cmd.Desc -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    Write-Host "  Examples:" -ForegroundColor Yellow
+    foreach ($ex in $info.Examples) {
+        Write-Host "    $ex" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+function Show-HelpSearch {
+    <#
+    .SYNOPSIS
+        Searches commands by name, alias, description, or keywords.
+    #>
+    param([string]$Query)
+
+    $queryLower = $Query.ToLower()
+    $matches = @()
+
+    # Search command names
+    foreach ($key in $Global:Commands.Keys) {
+        $cmd = $Global:Commands[$key]
+        $score = 0
+        $matchReason = ""
+
+        # Exact command match
+        if ($key -eq $queryLower) {
+            $score = 100
+            $matchReason = "exact"
+        }
+        # Command starts with query
+        elseif ($key.StartsWith($queryLower)) {
+            $score = 80
+            $matchReason = "prefix"
+        }
+        # Command contains query
+        elseif ($key.Contains($queryLower)) {
+            $score = 60
+            $matchReason = "contains"
+        }
+        # Alias match
+        elseif ($cmd.Alias) {
+            foreach ($alias in $cmd.Alias) {
+                if ($alias -eq $queryLower) {
+                    $score = 90
+                    $matchReason = "alias:$alias"
+                    break
+                }
+                elseif ($alias.StartsWith($queryLower)) {
+                    $score = 70
+                    $matchReason = "alias:$alias"
+                    break
+                }
+            }
+        }
+
+        # Keyword match
+        if ($score -eq 0 -and $Global:CommandKeywords.ContainsKey($key)) {
+            foreach ($kw in $Global:CommandKeywords[$key]) {
+                if ($kw.Contains($queryLower) -or $queryLower.Contains($kw)) {
+                    $score = 50
+                    $matchReason = "keyword:$kw"
+                    break
+                }
+            }
+        }
+
+        # Description match
+        if ($score -eq 0 -and $cmd.Desc.ToLower().Contains($queryLower)) {
+            $score = 40
+            $matchReason = "desc"
+        }
+
+        if ($score -gt 0) {
+            $matches += @{
+                Name = $key
+                Desc = $cmd.Desc
+                Score = $score
+                Reason = $matchReason
+                Aliases = $cmd.Alias
+            }
+        }
+    }
+
+    # Sort by score descending
+    $matches = $matches | Sort-Object -Property Score -Descending
+
+    Write-Host ""
+    if ($matches.Count -eq 0) {
+        Write-Host "  No matches for '$Query'" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Try: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -NoNewline -ForegroundColor Cyan
+        Write-Host " to browse categories" -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+
+    Write-Host "  ═══ SEARCH: '$Query' ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Show top 8 results
+    $shown = 0
+    foreach ($match in $matches) {
+        if ($shown -ge 8) { break }
+
+        $cmdDisplay = "/$($match.Name)".PadRight(18)
+        Write-Host "  $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $match.Desc -ForegroundColor Gray
+
+        # Show aliases if present
+        if ($match.Aliases -and $match.Aliases.Count -gt 0) {
+            Write-Host "    Aliases: /$($match.Aliases -join ', /')" -ForegroundColor DarkGray
+        }
+
+        $shown++
+    }
+
+    if ($matches.Count -gt 8) {
+        Write-Host ""
+        Write-Host "  ... and $($matches.Count - 8) more results" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+function Resolve-CommandAlias {
+    <#
+    .SYNOPSIS
+        Resolves a command name or alias to its canonical command.
+    .RETURNS
+        @{ Canonical = "cmd"; IsAlias = $bool; OriginalAlias = "alias" } or $null if not found
+    #>
+    param([string]$Name)
+
+    $nameLower = $Name.ToLower()
+
+    # Check if it's a canonical command
+    if ($Global:Commands.Contains($nameLower)) {
+        return @{ Canonical = $nameLower; IsAlias = $false; OriginalAlias = $null }
+    }
+
+    # Check if it's an alias
+    foreach ($key in $Global:Commands.Keys) {
+        $cmd = $Global:Commands[$key]
+        if ($cmd.Alias -and $cmd.Alias -contains $nameLower) {
+            return @{ Canonical = $key; IsAlias = $true; OriginalAlias = $nameLower }
+        }
+    }
+
+    return $null
+}
+
+function Show-CommandHelp {
+    <#
+    .SYNOPSIS
+        Shows detailed help for a specific command (canonical or alias).
+    #>
+    param([string]$CommandName)
+
+    $resolved = Resolve-CommandAlias -Name $CommandName
+    if (-not $resolved) {
+        Write-Host ""
+        Write-Host "  Unknown command: /$CommandName" -ForegroundColor Yellow
+        Write-Host ""
+        return $false
+    }
+
+    $canonical = $resolved.Canonical
+    $cmd = $Global:Commands[$canonical]
+
+    Write-Host ""
+    Write-Host "  ═══ HELP: /$canonical ═══" -ForegroundColor Cyan
+
+    # Show if this was accessed via an alias
+    if ($resolved.IsAlias) {
+        Write-Host "  (/$($resolved.OriginalAlias) is an alias for /$canonical)" -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Write-Host "  $($cmd.Desc)" -ForegroundColor White
+    Write-Host ""
+
+    # Show usage template
+    if ($cmd.Template) {
+        Write-Host "  Usage:" -ForegroundColor Yellow
+        Write-Host "    $($cmd.Template)" -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    # Show aliases if any
+    if ($cmd.Alias -and $cmd.Alias.Count -gt 0) {
+        Write-Host "  Aliases:" -ForegroundColor Yellow
+        Write-Host "    /$($cmd.Alias -join ', /')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Show options if any
+    if ($cmd.Options -and $cmd.Options.Count -gt 0) {
+        Write-Host "  Options:" -ForegroundColor Yellow
+        Write-Host "    $($cmd.Options -join ', ')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Find which topic(s) this command belongs to
+    $relatedTopics = @()
+    foreach ($topic in $Global:HelpTopics.Keys) {
+        $topicCmds = $Global:HelpTopics[$topic].Commands | ForEach-Object { $_.Name }
+        if ($topicCmds -contains $canonical) {
+            $relatedTopics += $topic
+        }
+    }
+    if ($relatedTopics.Count -gt 0) {
+        Write-Host "  Related topics:" -ForegroundColor Yellow
+        Write-Host "    /help $($relatedTopics -join ', /help ')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    return $true
+}
+
+function Show-GoldenPathHelp {
+    <#
+    .SYNOPSIS
+        Shows the default /help output with golden path scenarios.
+    #>
+    Write-Host ""
+    Write-Host "  What do you want to do?" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  1) " -NoNewline -ForegroundColor White
+    Write-Host "Start a new project" -ForegroundColor Yellow
+    Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/init" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  2) " -NoNewline -ForegroundColor White
+    Write-Host "Plan and execute work" -ForegroundColor Yellow
+    Write-Host "     " -NoNewline
+    Write-Host "/draft-plan" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/accept-plan" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/go" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  3) " -NoNewline -ForegroundColor White
+    Write-Host "Ship a release" -ForegroundColor Yellow
+    Write-Host "     " -NoNewline
+    Write-Host "/preflight" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/ship --confirm" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  /help topics" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Browse by category" -ForegroundColor DarkGray
+    Write-Host "  /help <query>" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Search commands" -ForegroundColor DarkGray
+    Write-Host "  /commands" -NoNewline -ForegroundColor Cyan
+    Write-Host "     P0 command reference" -ForegroundColor DarkGray
+    Write-Host "  /commands all" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Full registry" -ForegroundColor DarkGray
+    Write-Host ""
+}
 
 # ============================================================================
 # DATABASE HELPER
@@ -158,10 +753,12 @@ function Invoke-Query {
         }
     }
     
+    # Escape backslashes for Python (Windows paths)
+    $SafeDbPath = $DB_FILE.Replace('\', '/')
     $script = @"
 import sqlite3, json
 try:
-    conn = sqlite3.connect('$DB_FILE')
+    conn = sqlite3.connect('$SafeDbPath')
     conn.row_factory = sqlite3.Row
     rows = conn.execute('''$Query''').fetchall()
     print(json.dumps([dict(r) for r in rows]))
@@ -397,13 +994,17 @@ function Get-CommandCatalog {
     param([bool]$ShowAll = $false)
 
     # Tier 1: Golden Path - Beginner-safe essentials (max 9)
-    $goldenPath = @("help", "init", "ops", "plan", "run", "status", "ship", "snapshots", "restore")
+    $goldenPath = @(
+        "help", "init", "ops",
+        "draft-plan", "accept-plan", "refresh-plan",
+        "plan", "go", "status", "ship"
+    )
 
     # Tier 2: Advanced/Maintenance (shown with --all)
     $advanced = @("work", "approve", "approve_source", "snapshot", "restore_confirm", "review", "rules", "questions", "answer", "unlock", "lock", "mode", "milestone", "preflight", "doctor", "refine", "stream", "decide", "note", "blocker", "profile", "standard", "standards", "multi", "projects", "patterns", "incident", "mine")
 
     # Tier 3: Deprecated/Legacy (shown with --all, marked deprecated)
-    $deprecated = @("go", "add", "skip", "drop", "reset", "nuke", "audit", "lib", "ingest", "rigor", "commands")
+    $deprecated = @("add", "skip", "drop", "reset", "nuke", "audit", "lib", "ingest", "rigor", "commands")
 
     # Session commands (shown with --all)
     $session = @("quit", "clear", "refresh", "tasks", "dash", "compact")
@@ -453,15 +1054,15 @@ function Get-PickerCommands {
 
     $priorityOrder = if (-not $initStatus.initialized) {
         # Not initialized: /init is top priority
-        @("help", "init", "ops", "plan", "run", "ship")
+        @("help", "init", "ops", "plan", "go", "ship")
     }
     elseif ($hasDraft) {
         # Initialized + draft exists: /accept-plan is priority
-        @("help", "accept-plan", "draft-plan", "ops", "plan", "run", "ship")
+        @("help", "accept-plan", "draft-plan", "ops", "plan", "go", "ship")
     }
     else {
         # Initialized + no draft: /draft-plan is priority
-        @("help", "draft-plan", "accept-plan", "ops", "plan", "run", "ship")
+        @("help", "draft-plan", "accept-plan", "ops", "plan", "go", "ship")
     }
 
     if ($Filter -eq "") {
@@ -477,6 +1078,7 @@ function Get-PickerCommands {
                 $result += $cmd
             }
         }
+        # v18.5: Caller uses [array] cast to ensure array type
         return $result
     }
     else {
@@ -493,13 +1095,14 @@ function Get-PickerCommands {
                 }
             }
         }
-        $sortedOthers = $otherMatches | Sort-Object -Property Name
+        $sortedOthers = @($otherMatches | Sort-Object -Property Name)
         $sortedPriority = @()
         foreach ($cmd in $priorityOrder) {
             $match = $priorityMatches | Where-Object { $_.Name -eq $cmd }
             if ($match) { $sortedPriority += $match }
         }
-        return $sortedPriority + $sortedOthers
+        # v18.5: Caller uses [array] cast to ensure array type
+        return @($sortedPriority) + @($sortedOthers)
     }
 }
 
@@ -937,7 +1540,7 @@ function Invoke-Continue {
         Write-Host "     Use: /decide $($dec.id) <your answer>" -ForegroundColor Gray
         return
     }
-    
+
     # Check for stuck tasks
     $stuckTasks = Invoke-Query "SELECT id, desc FROM tasks WHERE auditor_status='escalated' OR retry_count >= 3 LIMIT 1"
     if ($stuckTasks.Count -gt 0) {
@@ -947,20 +1550,53 @@ function Invoke-Continue {
         Write-Host "     Use: /reset $($stuck.id) after fixing manually" -ForegroundColor Gray
         return
     }
-    
-    # Get next pending task
-    $nextTask = Invoke-Query "SELECT id, type, desc, strictness FROM tasks WHERE status='pending' ORDER BY priority DESC, id LIMIT 1"
-    if ($nextTask.Count -eq 0) {
-        Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
-        return
+
+    # v18.5: Use braided scheduler for task selection (round-robin across lanes)
+    try {
+        $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import pick_task_braided; print(pick_task_braided('control_panel'))" 2>&1
+        $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+        $result = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "pick_task_braided"
+
+        if ($result._parseError) {
+            Write-Host "  ❌ Scheduler error - see logs" -ForegroundColor Red
+            return
+        }
+
+        if ($result.status -eq "NO_WORK") {
+            # Check if any tasks exist at all
+            $taskCount = Invoke-Query "SELECT COUNT(*) as c FROM tasks" -Silent
+            $count = if ($taskCount -and $taskCount.Count -gt 0) { $taskCount[0].c } else { 0 }
+
+            if ($count -eq 0) {
+                Write-Host "  📋 No tasks yet. Run /accept-plan first." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
+            }
+            return
+        }
+
+        if ($result.status -eq "OK") {
+            $task = $result
+            $laneLabel = if ($task.lane) { "[$($task.lane)]" } else { "" }
+            $preemptLabel = if ($task.preempted) { " [PREEMPT]" } else { "" }
+
+            Write-Host ""
+            Write-Host "  ▶ Picked task via braided scheduler$preemptLabel" -ForegroundColor Cyan
+            Write-Host "     ID:   T-$($task.id)" -ForegroundColor White
+            Write-Host "     Lane: $laneLabel" -ForegroundColor Gray
+            Write-Host "     Desc: $($task.description)" -ForegroundColor White
+            Write-Host ""
+            Write-Host "  Task is now IN_PROGRESS. Worker can claim it." -ForegroundColor DarkGray
+            return
+        }
+
+        # Unexpected status
+        Write-Host "  ⚠️ Unexpected scheduler response: $($result.status)" -ForegroundColor Yellow
     }
-    
-    $task = $nextTask[0]
-    $strictness = if ($task.strictness) { $task.strictness.ToUpper() } else { "NORMAL" }
-    $icon = switch ($strictness) { "CRITICAL" { "🔴" } "RELAXED" { "🟢" } default { "🟡" } }
-    
-    Write-Host "  ▶ Executing [$icon $strictness]: [$($task.id)] $($task.desc)" -ForegroundColor Cyan
-    Invoke-Query "UPDATE tasks SET status='in_progress', updated_at=strftime('%s','now') WHERE id=$($task.id)" | Out-Null
+    catch {
+        Write-Host "  ❌ Failed to pick task: $_" -ForegroundColor Red
+    }
 }
 
 function Show-Stream {
@@ -1122,112 +1758,53 @@ function Invoke-SlashCommand {
             return "refresh"
         }
         "help" {
-            # v13.3.1: Scenario-first help
+            # v20.0: Topic-based help with search
+            # Precedence: --all > topics > exact command > exact topic > search
             if ($cmdArgs -eq "--all") {
-                $catalog = Get-CommandCatalog -ShowAll $true
-                Write-Host ""
-                Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  GOLDEN PATH" -ForegroundColor Yellow
-                foreach ($cmd in $catalog.GoldenPath) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor Yellow
-                    Write-Host $cmd.Desc -ForegroundColor Gray
+                # Legacy: redirect to /commands all
+                Show-AllCommands
+            }
+            elseif ($cmdArgs -eq "topics") {
+                # List all help topics
+                Show-HelpTopics
+            }
+            elseif ($cmdArgs -and $cmdArgs.Trim() -ne "") {
+                $query = $cmdArgs.Trim().TrimStart("/")
+
+                # Check for exact command match (canonical or alias)
+                $resolved = Resolve-CommandAlias -Name $query
+                if ($resolved) {
+                    Show-CommandHelp -CommandName $query
                 }
-                Write-Host ""
-                Write-Host "  ADVANCED" -ForegroundColor DarkYellow
-                foreach ($cmd in $catalog.Advanced) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkGray
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
+                # Check for exact topic match
+                elseif ($Global:HelpTopics.ContainsKey($query.ToLower())) {
+                    Show-HelpTopic -Topic $query
                 }
-                Write-Host ""
-                Write-Host "  SESSION" -ForegroundColor DarkCyan
-                foreach ($cmd in $catalog.Session) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkGray
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
+                # Fall back to search
+                else {
+                    Show-HelpSearch -Query $query
                 }
-                Write-Host ""
-                Write-Host "  DEPRECATED" -ForegroundColor DarkRed
-                foreach ($cmd in $catalog.Deprecated) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkRed
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
-                }
-                Write-Host ""
             }
             else {
-                # Default: Scenario-first help (use-cases, not command catalog)
-                Write-Host ""
-                Write-Host "  What do you want to do?" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  1) " -NoNewline -ForegroundColor White
-                Write-Host "Start a new project" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/init" -ForegroundColor Cyan
-                Write-Host "     Or type: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "'start a payments service'" -ForegroundColor Gray
-                Write-Host ""
-                Write-Host "  2) " -NoNewline -ForegroundColor White
-                Write-Host "Continue working" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/ops" -NoNewline -ForegroundColor Cyan
-                Write-Host " (status) → " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/plan" -NoNewline -ForegroundColor Cyan
-                Write-Host " (roadmap) → " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/run" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  3) " -NoNewline -ForegroundColor White
-                Write-Host "Ship a release" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/ship" -NoNewline -ForegroundColor Cyan
-                Write-Host " (preflight, no auto-deploy)" -ForegroundColor DarkGray
-                Write-Host ""
-                Write-Host "  ─────────────────────────────────────────" -ForegroundColor DarkGray
-                Write-Host "  /help --all" -NoNewline -ForegroundColor DarkCyan
-                Write-Host "  Full command registry" -ForegroundColor DarkGray
-                Write-Host ""
+                # Default: Golden path help
+                Show-GoldenPathHelp
             }
         }
 
-        # === LEGACY ALIAS ===
+        # === COMMANDS (v20.0) ===
         "commands" {
-            Write-Host ""
-            Write-Host "  ⚠️  /commands is legacy. Use /help or /help --all" -ForegroundColor DarkYellow
-            Write-Host ""
-            # Show /help --all output
-            $catalog = Get-CommandCatalog -ShowAll $true
-            Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
-            Write-Host ""
-            Write-Host "  GOLDEN PATH (beginner-safe)" -ForegroundColor Yellow
-            foreach ($c in $catalog.GoldenPath) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor Yellow
-                Write-Host $c.Desc -ForegroundColor Gray
+            if ($cmdArgs -eq "all") {
+                # Full registry dump
+                Show-AllCommands
             }
-            Write-Host ""
-            Write-Host "  ADVANCED" -ForegroundColor DarkYellow
-            foreach ($c in $catalog.Advanced) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkGray
-                Write-Host $c.Desc -ForegroundColor DarkGray
+            else {
+                # Curated P0 commands (default)
+                Show-CuratedCommands
             }
-            Write-Host ""
-            Write-Host "  SESSION" -ForegroundColor DarkCyan
-            foreach ($c in $catalog.Session) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkGray
-                Write-Host $c.Desc -ForegroundColor DarkGray
-            }
-            Write-Host ""
-            Write-Host "  DEPRECATED" -ForegroundColor DarkRed
-            foreach ($c in $catalog.Deprecated) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkRed
-                Write-Host $c.Desc -ForegroundColor DarkGray
-            }
-            Write-Host ""
         }
 
         # === EXECUTION ===
         "go" {
-            # Only show deprecation if user typed /go (not /run or /c)
-            if ($originalCmd -eq "go") {
-                Write-Host "  ⚠️  Deprecated: prefer /run or natural language" -ForegroundColor DarkYellow
-            }
             Invoke-Continue
         }
 
@@ -2674,22 +3251,22 @@ print(consult_standard('$cmdArgs', '$profile'))
             Write-Host "  Project Type: $projectType" -ForegroundColor Gray
             Write-Host ""
 
-            # Run tests based on project type
+            # Run tests based on project type (avoid Invoke-Expression; use argv arrays)
             $testCmd = $null
             switch ($projectType) {
                 "python_backend" {
                     if ((Test-Path "tests") -or (Test-Path "pytest.ini")) {
-                        $testCmd = "pytest -x -q --tb=short"
+                        $testCmd = @("pytest", "-x", "-q", "--tb=short")
                     }
                 }
                 "typescript_next" {
                     if (Test-Path "package.json") {
-                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                        $testCmd = @("npm", "test", "--", "--passWithNoTests", "--watchAll=false")
                     }
                 }
                 "typescript_node" {
                     if (Test-Path "package.json") {
-                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                        $testCmd = @("npm", "test", "--", "--passWithNoTests", "--watchAll=false")
                     }
                 }
             }
@@ -2699,12 +3276,16 @@ print(consult_standard('$cmdArgs', '$profile'))
                 return
             }
 
-            Write-Host "  Running: $testCmd" -ForegroundColor Gray
+            $testCmdDisplay = ($testCmd -join " ")
+            Write-Host "  Running: $testCmdDisplay" -ForegroundColor Gray
             Write-Host ""
 
             # Execute tests
             try {
-                $result = Invoke-Expression $testCmd 2>&1
+                $exe = $testCmd[0]
+                $argsList = @()
+                if ($testCmd.Count -gt 1) { $argsList = @($testCmd[1..($testCmd.Count - 1)]) }
+                $result = & $exe @argsList 2>&1
 
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host ""
@@ -3099,56 +3680,137 @@ print(consult_standard('$cmdArgs', '$profile'))
                 } catch { }
             }
 
-            # Open in editor (silent)
+            # Open in editor (silent, fully detached to prevent log leaks)
             if ($draftPath) {
                 try {
-                    $codeCmd = Get-Command code -ErrorAction SilentlyContinue
+                    # v19.11: Use cmd /c start to fully detach and suppress all output
                     $psi = New-Object System.Diagnostics.ProcessStartInfo
-                    if ($codeCmd) {
-                        # Use full path to VS Code
-                        $psi.FileName = $codeCmd.Source
-                        $psi.Arguments = "`"$draftPath`""
-                    } else {
-                        # Fall back to default .md handler
-                        $psi.FileName = $draftPath
-                    }
-                    $psi.UseShellExecute = $true
-                    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+                    $psi.FileName = "cmd.exe"
+                    $psi.Arguments = "/c start `"`" `"$draftPath`""
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
                     [void][System.Diagnostics.Process]::Start($psi)
                 } catch { }
             }
+
+            # Update "Next:" line in dashboard (minimal, no full refresh)
+            $width = $Host.UI.RawUI.WindowSize.Width
+            $halfWidth = [Math]::Floor($width / 2)
+            $rightWidth = $halfWidth - 4
+            $nextRow = $Global:RowDashStart + 10  # Row where "Next:" is displayed
+            $nextCmd = if ($draftPath) { "/accept-plan" } else { "/draft-plan" }
+            $nextAvail = $rightWidth - 6
+            Set-Pos $nextRow $halfWidth
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host "Next: " -NoNewline -ForegroundColor Yellow
+            Write-Host $nextCmd.PadRight($nextAvail) -NoNewline -ForegroundColor White
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
 
             Redraw-PromptRegion
             Set-Pos ($Global:RowInput + 2) 2
             if ($draftPath) {
                 Write-Host "Draft: $draftPath" -ForegroundColor White -NoNewline
             } else {
-                Write-Host "Draft: failed to create (check mesh_server.py)" -ForegroundColor Red -NoNewline
+                Write-Host "Draft: failed (check mesh_server.py)" -ForegroundColor Red -NoNewline
             }
             Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+            # v19.11: Force Read-StableInput to redraw input bar (clears any artifacts)
+            $Global:SkipNextPromptDraw = $false
         }
 
         "accept-plan" {
-            # v19.9: Silent operation - no clearing needed, preserves dashboard
+            # v20.0: Fixed silent failure - now displays result to user
             # v18.4: Default to latest draft when no argument provided
             $planPath = $cmdArgs
             if (-not $planPath) {
                 $latestDraft = Get-LatestDraftPlan
                 if (-not $latestDraft) {
-                    Redraw-PromptRegion  # No -AboveFooter, preserves dashboard
+                    Redraw-PromptRegion
+                    Set-Pos ($Global:RowInput + 2) 2
+                    Write-Host "  No draft plan found. Run /draft-plan first." -ForegroundColor Yellow
+                    Set-Pos $Global:RowInput ($Global:InputLeft + 4)
                     break
                 }
                 $planPath = Split-Path $latestDraft -Leaf
             }
 
+            $response = $null
             try {
                 $escapedPath = $planPath -replace "'", "''"
                 $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import accept_plan; print(accept_plan('$escapedPath'))" 2>&1
                 $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
                 $response = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "accept_plan"
             }
-            catch { }
-            Redraw-PromptRegion  # No -AboveFooter, preserves dashboard
+            catch {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  Error calling accept_plan: $_" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
+
+            # v20.0: Handle response status explicitly
+            if ($response -and -not $response._parseError) {
+                $status = $response.status
+                switch ($status) {
+                    "OK" {
+                        $count = $response.created_count
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Accepted: $count task(s) created from $planPath" -ForegroundColor Green
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        return "refresh"
+                    }
+                    "BLOCKED" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  BLOCKED: $($response.message)" -ForegroundColor Red
+                        if ($response.blocking_files) {
+                            Set-Pos ($Global:RowInput + 3) 2
+                            Write-Host "  Missing: $($response.blocking_files -join ', ')" -ForegroundColor Yellow
+                        }
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    "ALREADY_ACCEPTED" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Plan already accepted ($($response.message))" -ForegroundColor Yellow
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    "ERROR" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Error: $($response.message)" -ForegroundColor Red
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    default {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Unknown response: $status" -ForegroundColor Yellow
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                }
+            }
+            elseif ($response -and $response._parseError) {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  Parse error: $($response._cause)" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
+            else {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  No response from accept_plan" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
         }
 
         # === UNKNOWN ===
@@ -3213,7 +3875,7 @@ function Invoke-ModalRoute {
             $Global:LastRunNote = $Text
             Write-Host "  ⚙️ Steering note staged: $Text" -ForegroundColor Magenta
             Write-Host ""
-            $result = Invoke-SlashCommand -UserInput "/run"
+            $result = Invoke-SlashCommand -UserInput "/go"
             if ($result -eq "refresh") { Initialize-Screen }
         }
 
@@ -3252,8 +3914,8 @@ function Invoke-DefaultAction {
         "RUN" {
             # Default: show run status (tasks)
             Write-Host ""
-            Write-Host "  ▶ /run" -ForegroundColor Magenta
-            $result = Invoke-SlashCommand -UserInput "/run"
+            Write-Host "  ▶ /go" -ForegroundColor Magenta
+            $result = Invoke-SlashCommand -UserInput "/go"
             if ($result -eq "refresh") { Initialize-Screen }
         }
 
@@ -3309,7 +3971,7 @@ $termHeight = $Host.UI.RawUI.WindowSize.Height
 $Global:RowInput = [Math]::Floor($termHeight * 0.75)
 $Global:RowInputBottom = $Global:RowInput + 1    # Bottom border of input box
 $Global:RowHint = $Global:RowInput + 2           # Hint row below input box
-$Global:RowDropdown = $Global:RowInput + 1
+$Global:RowDropdown = $Global:RowInput + 2  # v19.11: Fixed - below bottom border, not on it
 
 # v13.3.6: Shared left offset for input area alignment
 # Aligns input bar with "  Next:" label (2-space indent)
@@ -3406,6 +4068,9 @@ function Get-WorkerStatus {
         po_status_color  = "Green"
         po_next_decision = "No pending inputs"
         worker_cot       = "Idling..."
+        scheduler_pointer       = $null
+        scheduler_last_decision = $null
+        pending_by_lane         = @{}
     }
     
     # Get active tasks
@@ -3466,6 +4131,35 @@ function Get-WorkerStatus {
             $status.worker_cot = $cot
         }
     }
+
+    # Braided scheduler diagnostics (from SQLite config)
+    try {
+        $ptrRow = Invoke-Query "SELECT value FROM config WHERE key='scheduler_lane_pointer' LIMIT 1" -Silent
+        if ($ptrRow -and $ptrRow[0].value) {
+            $status.scheduler_pointer = $ptrRow[0].value | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+
+    try {
+        $decRow = Invoke-Query "SELECT value FROM config WHERE key='scheduler_last_decision' LIMIT 1" -Silent
+        if ($decRow -and $decRow[0].value) {
+            $status.scheduler_last_decision = $decRow[0].value | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+
+    # Pending counts per lane (used to explain "idle" vs "blocked" vs "rotation")
+    try {
+        $laneExpr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+        $rows = Invoke-Query "SELECT $laneExpr as lane, COUNT(*) as c FROM tasks WHERE status='pending' GROUP BY $laneExpr" -Silent
+        $map = @{}
+        foreach ($r in $rows) {
+            if ($r.lane) { $map[$r.lane] = [int]$r.c }
+        }
+        $status.pending_by_lane = $map
+    }
+    catch {}
     
     return $status
 }
@@ -4145,7 +4839,12 @@ function Build-PipelineStatus {
         $suggestedNext.reason = "Work=YELLOW (ready to start)"
     }
     elseif ($workState -eq "RED") {
-        $suggestedNext.command = "/unblock"
+        if ($firstBlockedId) {
+            $suggestedNext.command = "/reset $firstBlockedId"
+        }
+        else {
+            $suggestedNext.command = "/tasks"
+        }
         $suggestedNext.reason = "Work=RED (tasks blocked)"
     }
     elseif ($optimizeState -eq "YELLOW" -and $optimizeTaskId) {
@@ -4750,6 +5449,60 @@ function Get-StreamStatusLine {
                 $result.SummaryColor = "DarkGray"
             }
 
+            # v20.0: Explain IDLE (no tasks vs deps-blocked vs rotation wait)
+            if ($result.State -eq "IDLE") {
+                $pending = 0
+                try {
+                    if ($WorkerData.pending_by_lane -and $WorkerData.pending_by_lane.ContainsKey("backend")) {
+                        $pending = [int]$WorkerData.pending_by_lane["backend"]
+                    }
+                }
+                catch {}
+
+                if ($pending -gt 0) {
+                    $blocked = $null
+                    try {
+                        $bl = $WorkerData.scheduler_last_decision.blocked_lanes
+                        if ($bl -and ($bl.PSObject.Properties.Name -contains "backend")) {
+                            $blocked = $bl.backend
+                        }
+                    }
+                    catch {}
+
+                    if ($blocked) {
+                        $reason = $blocked.blocked_reason
+                        $ex = $null
+                        try { if ($blocked.unknown_tokens -and $blocked.unknown_tokens.Count -gt 0) { $ex = $blocked.unknown_tokens[0] } } catch {}
+                        $result.State = "BLOCKED"
+                        $result.Bar = "■□□□□"
+                        $result.BarColor = "Red"
+                        $result.SummaryColor = "Red"
+                        $result.Summary = if ($ex) { "deps ($reason) e.g. $ex" } else { "deps ($reason)" }
+                    }
+                    else {
+                        $ptrLane = $null
+                        try { $ptrLane = $WorkerData.scheduler_pointer.lane } catch { $ptrLane = $null }
+                        if ($ptrLane -and $ptrLane -ne "backend") {
+                            $result.State = "WAIT"
+                            $result.Bar = "■■□□□"
+                            $result.BarColor = "Cyan"
+                            $result.SummaryColor = "Cyan"
+                            $result.Summary = "pending ($pending), ptr:$ptrLane"
+                        }
+                        else {
+                            $result.State = "READY"
+                            $result.Bar = "■■■■□"
+                            $result.BarColor = "Green"
+                            $result.SummaryColor = "Green"
+                            $result.Summary = "pending ($pending)"
+                        }
+                    }
+                }
+                else {
+                    $result.Summary = "no tasks"
+                }
+            }
+
             # Format task summary: "[T-123] desc" -> "desc (T-123)"
             if ($task -and $task -ne "(none)" -and $result.State -eq "RUNNING") {
                 if ($task -match "^\[([^\]]+)\]\s*(.*)$") {
@@ -4797,6 +5550,60 @@ function Get-StreamStatusLine {
                 $result.Bar = "□□□□□"
                 $result.BarColor = "DarkGray"
                 $result.SummaryColor = "DarkGray"
+            }
+
+            # v20.0: Explain IDLE (no tasks vs deps-blocked vs rotation wait)
+            if ($result.State -eq "IDLE") {
+                $pending = 0
+                try {
+                    if ($WorkerData.pending_by_lane -and $WorkerData.pending_by_lane.ContainsKey("frontend")) {
+                        $pending = [int]$WorkerData.pending_by_lane["frontend"]
+                    }
+                }
+                catch {}
+
+                if ($pending -gt 0) {
+                    $blocked = $null
+                    try {
+                        $bl = $WorkerData.scheduler_last_decision.blocked_lanes
+                        if ($bl -and ($bl.PSObject.Properties.Name -contains "frontend")) {
+                            $blocked = $bl.frontend
+                        }
+                    }
+                    catch {}
+
+                    if ($blocked) {
+                        $reason = $blocked.blocked_reason
+                        $ex = $null
+                        try { if ($blocked.unknown_tokens -and $blocked.unknown_tokens.Count -gt 0) { $ex = $blocked.unknown_tokens[0] } } catch {}
+                        $result.State = "BLOCKED"
+                        $result.Bar = "■□□□□"
+                        $result.BarColor = "Red"
+                        $result.SummaryColor = "Red"
+                        $result.Summary = if ($ex) { "deps ($reason) e.g. $ex" } else { "deps ($reason)" }
+                    }
+                    else {
+                        $ptrLane = $null
+                        try { $ptrLane = $WorkerData.scheduler_pointer.lane } catch { $ptrLane = $null }
+                        if ($ptrLane -and $ptrLane -ne "frontend") {
+                            $result.State = "WAIT"
+                            $result.Bar = "■■□□□"
+                            $result.BarColor = "Cyan"
+                            $result.SummaryColor = "Cyan"
+                            $result.Summary = "pending ($pending), ptr:$ptrLane"
+                        }
+                        else {
+                            $result.State = "READY"
+                            $result.Bar = "■■■■□"
+                            $result.BarColor = "Green"
+                            $result.SummaryColor = "Green"
+                            $result.Summary = "pending ($pending)"
+                        }
+                    }
+                }
+                else {
+                    $result.Summary = "no tasks"
+                }
             }
 
             # Format task summary: "[T-123] desc" -> "desc (T-123)"
@@ -6605,19 +7412,52 @@ function Draw-Dashboard {
             $R++
         }
 
-        # v19.6: LIVE AUDIT LOG header (left side only)
+        # v20.0: LAST SCHEDULER DECISION (left side only)
         Set-Pos $R 0
         Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host "LIVE AUDIT LOG".PadRight($ContentWidth) -NoNewline -ForegroundColor Yellow
+        Write-Host "SCHEDULER".PadRight($ContentWidth) -NoNewline -ForegroundColor Yellow
         Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
 
-        # v19.6: Log content (left side only)
-        $L1 = if ($AuditLog.Count -ge 1) { "  " + $AuditLog[-1] } else { "  (no logs)" }
+        # v20.0: Scheduler content (fall back to audit log if scheduler hasn't run yet)
+        $L1 = "  (no scheduler data)"
+        $L1Color = "DarkGray"
+        try {
+            $dec = $Data.scheduler_last_decision
+            if ($dec) {
+                $picked = $dec.picked_id
+                $lane = $dec.lane
+                $reason = $dec.reason
+
+                $ptr = $null
+                try { $ptr = $dec.pointer_next_index } catch { $ptr = $null }
+                if ($null -eq $ptr) { try { $ptr = $dec.pointer_index } catch { $ptr = $null } }
+                if ($null -eq $ptr -and $Data.scheduler_pointer) { try { $ptr = $Data.scheduler_pointer.index } catch { $ptr = $null } }
+
+                $pickedTxt = if ($null -ne $picked) { "$picked" } else { "—" }
+                $laneTxt = if ($lane) { "$lane" } else { "—" }
+                $reasonTxt = if ($reason) { "$reason" } else { "—" }
+                $ptrTxt = if ($null -ne $ptr) { "$ptr" } else { "—" }
+
+                $L1 = "  picked=$pickedTxt lane=$laneTxt reason=$reasonTxt ptr=$ptrTxt"
+                $L1Color = switch ($reasonTxt) {
+                    "urgent" { "Red" }
+                    "high" { "Yellow" }
+                    "rotation" { "Cyan" }
+                    "no_work" { "DarkYellow" }
+                    default { "DarkGray" }
+                }
+            }
+            elseif ($AuditLog.Count -ge 1) {
+                $L1 = "  " + $AuditLog[-1]
+            }
+        }
+        catch {}
+
         if ($L1.Length -gt $ContentWidth) { $L1 = $L1.Substring(0, $ContentWidth) }
         Set-Pos $R 0
         Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host $L1.PadRight($ContentWidth) -NoNewline -ForegroundColor DarkGray
+        Write-Host $L1.PadRight($ContentWidth) -NoNewline -ForegroundColor $L1Color
         Write-Host " |" -NoNewline -ForegroundColor DarkGray
         $R++
 
@@ -6693,8 +7533,11 @@ function Print-Row-With-Hint-Left($Row, $LeftTxt, $RightTxt, $HalfWidth, $ColorL
 # --- CLEAR DROPDOWN ZONE ---
 function Clear-DropdownZone {
     $width = $Host.UI.RawUI.WindowSize.Width
+    # v19.11: Guard - ensure we never clear the border row
+    $borderRow = $Global:RowInput + 1
+    $startRow = [Math]::Max($Global:RowDropdown, $borderRow + 1)
     for ($i = 0; $i -lt $Global:MaxDropdownRows + 2; $i++) {
-        Set-Pos ($Global:RowDropdown + $i) 0
+        Set-Pos ($startRow + $i) 0
         Write-Host (" " * $width) -NoNewline
     }
     # Restore cursor to input row (at left edge of input frame)
@@ -6710,7 +7553,14 @@ function Draw-Dropdown {
     )
     
     if ($Commands.Count -eq 0) { return }
-    
+
+    # v19.11: Guard - never draw on input bar border row (RowInput + 1)
+    $borderRow = $Global:RowInput + 1
+    if ($Global:RowDropdown -le $borderRow) {
+        # Safety: force dropdown below border if misconfigured
+        $Global:RowDropdown = $borderRow + 1
+    }
+
     $windowWidth = $Host.UI.RawUI.WindowSize.Width
     $midPoint = [Math]::Floor($windowWidth / 2)
     $colWidth = $midPoint - 1
@@ -6812,6 +7662,12 @@ function Draw-InputBar {
     $bottomRow = $rowInput + 1
     $boxWidth = $width - $left - 1  # width of box from InputLeft to right edge
     $innerWidth = $boxWidth - 2      # space between left and right borders
+
+    # v19.11: Clear columns 0-1 on all three rows to prevent stale artifacts
+    $leftPad = " " * $left
+    Set-Pos $topRow 0; Write-Host $leftPad -NoNewline
+    Set-Pos $rowInput 0; Write-Host $leftPad -NoNewline
+    Set-Pos $bottomRow 0; Write-Host $leftPad -NoNewline
 
     # Top border: ┌───────────┐
     Set-Pos $topRow $left
@@ -7426,6 +8282,8 @@ function Read-StableInput {
     # v19.9: Skip draw if Redraw-PromptRegion just drew (prevents drift)
     if ($Global:SkipNextPromptDraw) {
         $Global:SkipNextPromptDraw = $false
+        # v19.11: Still need to position cursor even when skipping draw
+        Set-Pos $Global:RowInput $cursorStart
     } else {
         # v13.3.5: Draw footer first (above input)
         Draw-FooterBar
@@ -7894,6 +8752,9 @@ function Read-StableInput {
         if ($buffer.Length -eq 0 -and $char -eq '/') {
             Write-Host "/" -NoNewline -ForegroundColor Yellow
             $pickerResult = Show-CommandPicker
+            # v19.11: Always redraw input bar after picker to clear any stale artifacts
+            Draw-InputBar -width $width -rowInput $Global:RowInput
+            Set-Pos $Global:RowInput $cursorStart
             if ($pickerResult.Kind -eq "select") {
                 return $pickerResult.Command
             }
@@ -8119,7 +8980,7 @@ function Show-CommandPicker {
 
     # Draw dropdown (below the bottom border)
     function DrawPickerDropdown {
-        $cmdList = Get-PickerCommands -Filter $script:pickerFilter
+        [array]$cmdList = Get-PickerCommands -Filter $script:pickerFilter
 
         # Update input line content (inside the frame): │ > /filter │
         # Clear and redraw the middle of the frame
@@ -8182,12 +9043,12 @@ function Show-CommandPicker {
         return $cmdList
     }
 
-    $filteredCmds = @(DrawPickerDropdown)
+    [array]$filteredCmds = DrawPickerDropdown
 
     while ($true) {
         # v15.4.1: AllowCtrlC lets us intercept Ctrl+C instead of immediate termination
         $keyPress = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown,AllowCtrlC")
-        $filteredCmds = @(Get-PickerCommands -Filter $script:pickerFilter)
+        [array]$filteredCmds = Get-PickerCommands -Filter $script:pickerFilter
 
         # v15.4.1: Auto-clear Ctrl+C warning after 2 seconds
         if ($Global:CtrlCWarningShownUtc) {
@@ -8844,16 +9705,8 @@ while ($true) {
 
     # Slash commands (explicit)
     if ($userInput.StartsWith("/")) {
-        $parts = $userInput.TrimStart("/").Split(" ", 2)
-        $cmdName = $parts[0].ToLower()
-
-        if ($Global:Commands.Contains($cmdName)) {
-            $result = Invoke-SlashCommand -UserInput $userInput
-            if ($result -eq "refresh") { Initialize-Screen }
-        }
-        else {
-            Write-Host "  Unknown command: /$cmdName" -ForegroundColor Yellow
-        }
+        $result = Invoke-SlashCommand -UserInput $userInput
+        if ($result -eq "refresh") { Initialize-Screen }
     }
     else {
         # v13.2: Plain text → modal routing (no backend calls)
