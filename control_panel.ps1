@@ -3081,11 +3081,13 @@ print(consult_standard('$cmdArgs', '$profile'))
                 try {
                     $psi = New-Object System.Diagnostics.ProcessStartInfo
                     $psi.FileName = "python"
-                    $psi.Arguments = "-c `"import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())`""
+                    $pyCode = "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())"
+                    $psi.Arguments = "-c `"$pyCode`""
                     $psi.RedirectStandardOutput = $true
                     $psi.RedirectStandardError = $true
                     $psi.UseShellExecute = $false
                     $psi.CreateNoWindow = $true
+                    $psi.WorkingDirectory = $RepoRoot
                     $proc = [System.Diagnostics.Process]::Start($psi)
                     $rawResult = $proc.StandardOutput.ReadToEnd()
                     $proc.WaitForExit()
@@ -3097,24 +3099,33 @@ print(consult_standard('$cmdArgs', '$profile'))
                 } catch { }
             }
 
-            # Open in editor using cmd /c start (silent and reliable)
+            # Open in editor (silent)
             if ($draftPath) {
                 try {
+                    $codeCmd = Get-Command code -ErrorAction SilentlyContinue
                     $psi = New-Object System.Diagnostics.ProcessStartInfo
-                    $psi.FileName = "cmd.exe"
-                    $psi.Arguments = "/c start `"`" `"code`" `"$draftPath`""
-                    $psi.UseShellExecute = $false
-                    $psi.CreateNoWindow = $true
+                    if ($codeCmd) {
+                        # Use full path to VS Code
+                        $psi.FileName = $codeCmd.Source
+                        $psi.Arguments = "`"$draftPath`""
+                    } else {
+                        # Fall back to default .md handler
+                        $psi.FileName = $draftPath
+                    }
+                    $psi.UseShellExecute = $true
+                    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
                     [void][System.Diagnostics.Process]::Start($psi)
                 } catch { }
             }
 
             Redraw-PromptRegion
+            Set-Pos ($Global:RowInput + 2) 2
             if ($draftPath) {
-                Set-Pos ($Global:RowInput + 2) 2
                 Write-Host "Draft: $draftPath" -ForegroundColor White -NoNewline
-                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+            } else {
+                Write-Host "Draft: failed to create (check mesh_server.py)" -ForegroundColor Red -NoNewline
             }
+            Set-Pos $Global:RowInput ($Global:InputLeft + 4)
         }
 
         "accept-plan" {
