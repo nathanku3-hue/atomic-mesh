@@ -8,6 +8,7 @@ import re
 import hashlib
 import json
 import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -93,12 +94,22 @@ SECRET_PATTERNS = [
     (r"Bearer\s+[a-zA-Z0-9\-_.]+", "Bearer Token"),
 ]
 
+# Precompile secret patterns once to avoid per-call regex compilation
+_COMPILED_SECRET_PATTERNS = [
+    (re.compile(pattern, re.IGNORECASE), secret_type, pattern)
+    for pattern, secret_type in SECRET_PATTERNS
+]
+
 # Files that should NEVER be touched
 PROTECTED_PATTERNS = [
     ".git/*", ".gitignore", ".env*", "*.key", "*.pem", "*.crt",
     "package.json", "package-lock.json", "requirements.txt",
     "Cargo.toml", "go.mod", "*.lock", "node_modules/*"
 ]
+
+# TTL cache for recent file scans (reduce churn on dashboard refresh)
+_RECENT_CACHE_TTL = int(os.getenv("LIBRARIAN_RECENT_TTL", "13"))  # seconds
+_recent_cache = {}
 
 # Safe to delete patterns (with conditions)
 TEMP_PATTERNS = [
@@ -364,20 +375,32 @@ def scan_for_secrets(file_path: str) -> Dict:
             chunk = f.read(1024)
             if b'\x00' in chunk:
                 return result  # Binary file, skip
-        
+
+        # Stream file; short-circuit on first hit to minimize IO on large files
+        tail = ""
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        for pattern, secret_type in SECRET_PATTERNS:
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            if matches:
-                result["blocked"] = True
-                result["secrets_found"].append({
-                    "type": secret_type,
-                    "pattern": pattern,
-                    "count": len(matches)
-                })
-    
+            for line in f:
+                window = tail + line
+
+                for regex, secret_type, pattern in _COMPILED_SECRET_PATTERNS:
+                    if not regex.search(window):
+                        continue
+
+                    match_count = 0
+                    for _ in regex.finditer(window):
+                        match_count += 1
+
+                    result["blocked"] = True
+                    result["secrets_found"].append({
+                        "type": secret_type,
+                        "pattern": pattern,
+                        "count": match_count or 1
+                    })
+                    return result
+
+                # Keep a small tail to catch secrets spanning a newline
+                tail = window[-2048:] if len(window) > 2048 else window
+
     except Exception as e:
         result["error"] = str(e)
     
@@ -391,7 +414,11 @@ def check_file_references(file_path: str, project_root: str) -> Dict:
     """
     file_name = os.path.basename(file_path)
     file_stem = os.path.splitext(file_name)[0]
-    
+
+    # Precompile patterns once per invocation
+    compiled_imports = [re.compile(p, re.IGNORECASE) for p in (p.format(file_name=file_stem) for p in IMPORT_PATTERNS)]
+    compiled_literals = [re.compile(p, re.IGNORECASE) for p in (p.format(file_name=file_name) for p in LITERAL_PATTERNS)]
+
     result = {
         "file": file_path,
         "import_refs": [],
@@ -399,49 +426,61 @@ def check_file_references(file_path: str, project_root: str) -> Dict:
         "can_auto_update": True,
         "total_refs": 0
     }
-    
-    # Build search patterns
-    import_pats = [p.format(file_name=file_stem) for p in IMPORT_PATTERNS]
-    literal_pats = [p.format(file_name=file_name) for p in LITERAL_PATTERNS]
-    
+
+    skip_dirs = {'.git', 'node_modules', '__pycache__', '.next', '.venv', 'venv', 'dist', 'build', '.tox', '.pytest_cache', '.mypy_cache'}
+
     try:
         for root, dirs, files in os.walk(project_root, followlinks=False):
             # Skip common non-source dirs
-            dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__', '.next']]
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
             
             for f in files:
                 if not f.endswith(('.py', '.js', '.ts', '.tsx', '.jsx', '.md', '.html', '.css')):
                     continue
-                
+
                 check_path = os.path.join(root, f)
                 if check_path == file_path:
                     continue
-                
+
+                found_import = False
+                found_literal = False
+
+                # Quick binary check
                 try:
-                    with open(check_path, 'r', encoding='utf-8', errors='ignore') as fh:
-                        content = fh.read()
-                    
-                    # Check imports
-                    for pat in import_pats:
-                        if re.search(pat, content, re.IGNORECASE):
-                            result["import_refs"].append(check_path)
-                            result["total_refs"] += 1
-                            break
-                    
-                    # Check literals (dangerous)
-                    for pat in literal_pats:
-                        if re.search(pat, content, re.IGNORECASE):
-                            result["literal_refs"].append({
-                                "file": check_path,
-                                "pattern": pat
-                            })
-                            result["can_auto_update"] = False
-                            result["total_refs"] += 1
-                            break
-                
+                    with open(check_path, 'rb') as fh:
+                        if b'\x00' in fh.read(512):
+                            continue
                 except Exception:
                     continue
-    
+
+                try:
+                    with open(check_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                        for line in fh:
+                            if not found_import:
+                                for regex in compiled_imports:
+                                    if regex.search(line):
+                                        result["import_refs"].append(check_path)
+                                        result["total_refs"] += 1
+                                        found_import = True
+                                        break
+
+                            if not found_literal:
+                                for regex in compiled_literals:
+                                    if regex.search(line):
+                                        result["literal_refs"].append({
+                                            "file": check_path,
+                                            "pattern": regex.pattern
+                                        })
+                                        result["can_auto_update"] = False
+                                        result["total_refs"] += 1
+                                        found_literal = True
+                                        break
+
+                            if found_import and found_literal:
+                                break
+                except Exception:
+                    continue
+
     except Exception as e:
         result["error"] = str(e)
     
@@ -531,7 +570,7 @@ def generate_restore_script(manifest_id: str, operations: List[Dict], output_dir
     # Make executable on Unix
     try:
         os.chmod(script_path, 0o755)
-    except:
+    except Exception:
         pass
     
     return script_path
@@ -716,7 +755,7 @@ def get_locked_files(db_path: str, project_root: str) -> List[str]:
     """
     import sqlite3
     
-    locked = []
+    locked = set()
     
     try:
         conn = sqlite3.connect(db_path)
@@ -728,8 +767,8 @@ def get_locked_files(db_path: str, project_root: str) -> List[str]:
             if row[0]:
                 try:
                     files = json.loads(row[0])
-                    locked.extend(files)
-                except:
+                    locked.update(files)
+                except json.JSONDecodeError:
                     pass
         
         # 2. Files being audited
@@ -738,8 +777,8 @@ def get_locked_files(db_path: str, project_root: str) -> List[str]:
             if row[0]:
                 try:
                     files = json.loads(row[0])
-                    locked.extend(files)
-                except:
+                    locked.update(files)
+                except json.JSONDecodeError:
                     pass
         
         conn.close()
@@ -748,30 +787,52 @@ def get_locked_files(db_path: str, project_root: str) -> List[str]:
     
     # 3. Files modified in last 5 minutes (safety buffer)
     recent_files = get_recently_modified_files(project_root, minutes=5)
-    locked.extend(recent_files)
+    locked.update(recent_files)
     
-    return list(set(locked))
+    return list(locked)
 
 
-def get_recently_modified_files(project_root: str, minutes: int = 5) -> List[str]:
-    """Get files modified within the last N minutes."""
-    threshold = datetime.now().timestamp() - (minutes * 60)
-    recent = []
-    
-    try:
-        for root, dirs, files in os.walk(project_root, followlinks=False):
-            dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__']]
-            for f in files:
-                file_path = os.path.join(root, f)
-                try:
-                    if os.stat(file_path).st_mtime > threshold:
-                        recent.append(file_path)
-                except:
-                    pass
-    except:
-        pass
-    
-    return recent
+def get_recently_modified_files(project_root: str, minutes: int = 5, bypass_cache: bool = False) -> List[str]:
+    """
+    Get files modified within the last N minutes.
+    Uses a short TTL cache to reduce churn on frequent dashboard refreshes.
+    """
+    key = (os.path.abspath(project_root), minutes)
+
+    now_ts = time.time()
+    cached = _recent_cache.get(key)
+    if cached and not bypass_cache:
+        age = now_ts - cached["ts"]
+        if age <= _RECENT_CACHE_TTL:
+            logger.debug(f"recent-files: cached (age={age:.1f}s, ttl={_RECENT_CACHE_TTL}s)")
+            return list(cached["files"])
+
+    threshold = now_ts - (minutes * 60)
+    recent_set = set()
+    skip_dirs = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.next', 'dist', 'build'}
+
+    def scan_dir(path: str):
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        if entry.name in skip_dirs:
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            scan_dir(entry.path)
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            if entry.stat(follow_symlinks=False).st_mtime > threshold:
+                                recent_set.add(entry.path)
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+    scan_dir(project_root)
+
+    _recent_cache[key] = {"ts": now_ts, "files": recent_set}
+    return list(recent_set)
 
 
 # === PATCH 4: DEEP IMPORT REFACTOR ===
@@ -950,7 +1011,7 @@ def execute_move_with_import_fix(from_path: str, to_path: str, project_root: str
     try:
         with open(from_path, 'r', encoding='utf-8') as f:
             backup_content = f.read()
-    except:
+    except OSError:
         pass
     
     # 4. Move the file

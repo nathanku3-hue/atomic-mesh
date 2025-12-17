@@ -80,7 +80,7 @@ def get_latest_log():
         if not files:
             return None
         return max(files, key=os.path.getctime)
-    except:
+    except Exception:
         return None
 
 def get_status_icon(status):
@@ -249,7 +249,7 @@ with col2:
                 with open(log_file, "r", encoding="utf-8") as f:
                     lines = f.readlines()[-25:]
                 st.code("".join(lines), language="bash")
-            except:
+            except Exception:
                 st.warning("Log file busy or empty.")
         
         if st.button("📂 Open Full Log File"):
@@ -296,7 +296,7 @@ with col3:
                     st.code(f"{row['key']}: {row['value']}", language="yaml")
             else:
                 st.caption("No artifacts stored yet.")
-        except:
+        except Exception:
             st.caption("Artifacts table not ready.")
 
 # --- FOOTER ---

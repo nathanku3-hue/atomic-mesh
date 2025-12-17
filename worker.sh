@@ -6,17 +6,34 @@ ID="${TYPE}_$(date +%s)"
 
 echo "🛡️ Worker $ID ($TYPE) online via $TOOL."
 
+# Mirror worker.ps1 role-based lane isolation (avoid role leakage).
+blocked_lanes_json="[]"
+case "$(echo "$TYPE" | tr '[:upper:]' '[:lower:]')" in
+  # Codex/generalist: owns backend/qa/ops by default (leave docs/frontend to Claude worker)
+  backend)
+    blocked_lanes_json='["frontend","docs"]'
+    ;;
+  # Claude/creative: owns frontend/docs by default (leave backend/qa/ops to Codex worker)
+  frontend)
+    blocked_lanes_json='["backend","qa","ops"]'
+    ;;
+  # Explicit QA worker (if launched): restrict to qa lane only
+  qa)
+    blocked_lanes_json='["backend","frontend","ops","docs"]'
+    ;;
+esac
+
 while true; do
   # 1. POLL (Using uvx to run mcp-cli without global install)
-  TASK_JSON=$(uvx mcp-cli call pick_task --config-file server_config.json --server atomic-mesh --arg worker_type "$TYPE" --arg worker_id "$ID")
+  TASK_JSON=$(uvx mcp-cli call pick_task_braided --config-file server_config.json --server atomic-mesh --arg worker_id "$ID" --arg blocked_lanes "$blocked_lanes_json")
   
   if [[ "$TASK_JSON" == *"NO_WORK"* ]]; then
     sleep 3; continue
   fi
 
-  # 2. PARSE (Minimalist grep/cut extraction)
-  TASK_ID=$(echo "$TASK_JSON" | grep -o '"id": [0-9]*' | cut -d: -f2 | tr -d ' ')
-  DESC=$(echo "$TASK_JSON" | grep -o '"description": ".*"' | cut -d: -f2- | sed 's/^ "//;s/"$//')
+  # 2. PARSE (JSON-safe)
+  TASK_ID=$(python -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('id',''))" <<< "$TASK_JSON")
+  DESC=$(python -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('description',''))" <<< "$TASK_JSON")
   
   echo "⚡ Executing Task $TASK_ID: $DESC"
 

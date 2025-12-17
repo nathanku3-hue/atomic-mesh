@@ -40,7 +40,7 @@ $TotalWidth = 77
 
 $Global:Commands = [ordered]@{
     # EXECUTION
-    "go"             = @{ Desc = "execute the next pending task"; Alias = @("continue", "c", "run"); Template = "/go" }
+    "go"             = @{ Desc = "execute the next pending task"; Alias = @("continue", "c", "g", "run"); Template = "/go" }
     
     # TASK MANAGEMENT
     "add"            = @{ Desc = "add task: /add backend|frontend <description>"; HasArgs = $true; Template = "/add <type> <desc>"; Placeholder = "<type>"; MiniGuide = "backend/frontend"; Options = @("backend", "frontend") }
@@ -83,7 +83,7 @@ $Global:Commands = [ordered]@{
     "projects"       = @{ Desc = "list available projects"; Template = "/projects" }
     
     # LIBRARY (v7.6)
-    "init"           = @{ Desc = "start a new project (bootstrap + /work)"; Template = "/init" }
+    "init"           = @{ Desc = "start a new project [--force to re-scaffold]"; Template = "/init" }
     "profile"        = @{ Desc = "show/set project profile: /profile [name]"; HasArgs = $true; Template = "/profile <name>"; Placeholder = "<name>"; MiniGuide = "profile name" }
     "standard"       = @{ Desc = "view a standard: /standard security|architecture"; HasArgs = $true; Template = "/standard <name>"; Placeholder = "<name>"; MiniGuide = "standard name" }
     "standards"      = @{ Desc = "list all standards for current profile"; Template = "/standards" }
@@ -107,8 +107,8 @@ $Global:Commands = [ordered]@{
     "status"         = @{ Desc = "show system status dashboard"; Template = "/status" }
     "plan"           = @{ Desc = "show project roadmap"; Template = "/plan" }
     "tasks"          = @{ Desc = "list all tasks"; Template = "/tasks" }
-    "help"           = @{ Desc = "show Golden Path (/help --all for full registry)"; Alias = @("?"); Template = "/help" }
-    "commands"       = @{ Desc = "[LEGACY] use /help instead"; Template = "/commands" }
+    "help"           = @{ Desc = "v20.0: /help topics • /help <topic> • /help <query>"; Alias = @("?"); Template = "/help" }
+    "commands"       = @{ Desc = "v20.0: P0 commands (/commands all for full registry)"; Template = "/commands" }
     "refresh"        = @{ Desc = "refresh the display"; Template = "/refresh" }
     "clear"          = @{ Desc = "clear the console screen"; Template = "/clear" }
     "quit"           = @{ Desc = "exit Atomic Mesh"; Alias = @("q", "exit"); Template = "/quit" }
@@ -138,9 +138,604 @@ $Global:Commands = [ordered]@{
     # v13.5.5 PLAN-AS-CODE
     "refresh-plan"   = @{ Desc = "v13.5.5: regenerate plan preview from tasks"; Template = "/refresh-plan" }
     "draft-plan"     = @{ Desc = "v13.5.5: create editable plan file in docs/PLANS/"; Template = "/draft-plan" }
-    "accept-plan"    = @{ Desc = "v13.5.5: hydrate DB from plan file: /accept-plan <path>"; HasArgs = $true; Template = "/accept-plan <path>"; Placeholder = "<path>"; MiniGuide = "plan file path"; Lookup = "plans" }
+    "accept-plan"    = @{ Desc = "v18.4: hydrate DB from plan file (defaults to latest draft)"; Template = "/accept-plan" }
 }
 
+# ============================================================================
+# COMMAND METADATA (v20.0) - Single source of truth for discovery surfaces
+# ============================================================================
+
+# P0 Commands: Curated allowlist for /commands (grouped by workflow)
+$Global:P0Commands = [ordered]@{
+    "Plan" = @(
+        @{ Canonical = "draft-plan"; Desc = "create editable plan file in docs/PLANS/" }
+        @{ Canonical = "accept-plan"; Desc = "hydrate DB from plan file" }
+        @{ Canonical = "tasks"; Desc = "list all tasks" }
+    )
+    "Execute" = @(
+        @{ Canonical = "go"; Desc = "execute the next pending task"; Aliases = @("g", "run", "c", "continue") }
+    )
+    "Manage" = @(
+        @{ Canonical = "add"; Desc = "add task: /add backend|frontend <desc>" }
+        @{ Canonical = "skip"; Desc = "skip a task by ID" }
+        @{ Canonical = "reset"; Desc = "reset failed task by ID" }
+        @{ Canonical = "drop"; Desc = "delete a task by ID" }
+    )
+    "QA/Ship" = @(
+        @{ Canonical = "preflight"; Desc = "run local pre-flight tests" }
+        @{ Canonical = "verify"; Desc = "run QA audit on task" }
+        @{ Canonical = "ship"; Desc = "commit and push (trusts local QA)" }
+    )
+    "Navigate" = @(
+        @{ Canonical = "status"; Desc = "show system status dashboard" }
+        @{ Canonical = "help"; Desc = "show help (topics, search)" }
+        @{ Canonical = "clear"; Desc = "clear the console screen" }
+        @{ Canonical = "quit"; Desc = "exit Atomic Mesh"; Aliases = @("q", "exit") }
+    )
+}
+
+# Help Topics: Topic pages with commands and examples
+$Global:HelpTopics = @{
+    "tasks" = @{
+        Summary = "Create, manage, and execute work items"
+        Commands = @(
+            @{ Name = "go"; Desc = "Pick and start the next pending task (braided scheduler)" }
+            @{ Name = "add"; Desc = "Add a task: /add backend|frontend <description>" }
+            @{ Name = "skip"; Desc = "Skip a task: /skip <task-id>" }
+            @{ Name = "reset"; Desc = "Reset failed task: /reset <task-id>" }
+            @{ Name = "drop"; Desc = "Delete a task: /drop <task-id>" }
+            @{ Name = "tasks"; Desc = "List all tasks with status" }
+        )
+        Examples = @(
+            "/go              # Pick next task from queue"
+            "/add backend Add user auth endpoint"
+            "/tasks           # View all tasks"
+        )
+    }
+    "plan" = @{
+        Summary = "Create and manage project roadmaps"
+        Commands = @(
+            @{ Name = "draft-plan"; Desc = "Create editable plan file in docs/PLANS/" }
+            @{ Name = "accept-plan"; Desc = "Hydrate database from plan file" }
+            @{ Name = "refresh-plan"; Desc = "Regenerate plan preview from tasks" }
+            @{ Name = "plan"; Desc = "Show project roadmap" }
+        )
+        Examples = @(
+            "/draft-plan      # Create new plan file"
+            "/accept-plan     # Load latest draft into DB"
+            "/plan            # View current roadmap"
+        )
+    }
+    "ops" = @{
+        Summary = "Monitor system health, drift, and operations"
+        Commands = @(
+            @{ Name = "ops"; Desc = "Health + Drift + Backups overview" }
+            @{ Name = "health"; Desc = "System health check" }
+            @{ Name = "drift"; Desc = "Staleness and queue drift check" }
+            @{ Name = "doctor"; Desc = "Run system diagnostics" }
+            @{ Name = "status"; Desc = "Show system status dashboard" }
+        )
+        Examples = @(
+            "/ops             # Quick health overview"
+            "/doctor          # Full system diagnostics"
+        )
+    }
+    "agents" = @{
+        Summary = "Interact with autonomous agents (auditor, librarian)"
+        Commands = @(
+            @{ Name = "audit"; Desc = "Open auditor status and log" }
+            @{ Name = "lib"; Desc = "Librarian: scan|status|approve|execute" }
+            @{ Name = "ingest"; Desc = "Compile raw PRDs from inbox to specs" }
+            @{ Name = "snippets"; Desc = "Search reusable code snippets" }
+            @{ Name = "dupcheck"; Desc = "Detect duplicate helpers" }
+        )
+        Examples = @(
+            "/audit           # View audit log"
+            "/lib scan        # Start librarian scan"
+            "/snippets auth   # Search auth-related snippets"
+        )
+    }
+    "qa" = @{
+        Summary = "Quality assurance and shipping"
+        Commands = @(
+            @{ Name = "preflight"; Desc = "Run local pre-flight tests" }
+            @{ Name = "verify"; Desc = "Run QA audit on task: /verify <task-id>" }
+            @{ Name = "ship"; Desc = "Commit and push (requires --confirm)" }
+            @{ Name = "review"; Desc = "View review status: /review [task-id]" }
+            @{ Name = "simplify"; Desc = "Check task for bloat" }
+        )
+        Examples = @(
+            "/preflight       # Run all pre-flight checks"
+            "/verify T-123    # QA audit for task T-123"
+            "/ship --confirm  # Ship with confirmation"
+        )
+    }
+    "streams" = @{
+        Summary = "View worker output streams"
+        Commands = @(
+            @{ Name = "stream"; Desc = "View worker output: /stream backend|frontend" }
+        )
+        Examples = @(
+            "/stream backend  # View backend worker logs"
+            "/stream frontend # View frontend worker logs"
+        )
+    }
+    "diagnostics" = @{
+        Summary = "System diagnostics and debugging"
+        Commands = @(
+            @{ Name = "doctor"; Desc = "Run system health check" }
+            @{ Name = "rigor"; Desc = "Show Phase x Risk matrix" }
+            @{ Name = "refine"; Desc = "Analyze ACTIVE_SPEC.md for ambiguities" }
+            @{ Name = "router-debug"; Desc = "Toggle router debug overlay" }
+        )
+        Examples = @(
+            "/doctor          # Full system diagnostics"
+            "/router-debug    # Toggle debug overlay"
+        )
+    }
+    "session" = @{
+        Summary = "Session management commands"
+        Commands = @(
+            @{ Name = "clear"; Desc = "Clear the console screen" }
+            @{ Name = "refresh"; Desc = "Refresh the display" }
+            @{ Name = "quit"; Desc = "Exit Atomic Mesh (aliases: /q, /exit)" }
+            @{ Name = "dash"; Desc = "Force full dashboard view" }
+            @{ Name = "compact"; Desc = "Force compact view" }
+        )
+        Examples = @(
+            "/clear           # Clear screen"
+            "/quit            # Exit"
+        )
+    }
+}
+
+# Command keywords for fuzzy search
+$Global:CommandKeywords = @{
+    "go"           = @("execute", "run", "start", "next", "continue", "pick", "work")
+    "add"          = @("create", "new", "task", "todo")
+    "skip"         = @("bypass", "ignore", "postpone")
+    "reset"        = @("retry", "redo", "restart", "failed")
+    "drop"         = @("delete", "remove", "cancel")
+    "nuke"         = @("clear", "wipe", "all", "pending")
+    "draft-plan"   = @("create", "new", "plan", "roadmap", "draft")
+    "accept-plan"  = @("load", "hydrate", "import", "plan")
+    "refresh-plan" = @("update", "regenerate", "sync", "plan")
+    "plan"         = @("roadmap", "backlog", "view")
+    "tasks"        = @("list", "queue", "todos", "backlog")
+    "status"       = @("dashboard", "overview", "state")
+    "help"         = @("commands", "docs", "guide", "usage")
+    "ops"          = @("health", "drift", "operations", "monitor")
+    "health"       = @("status", "check", "diagnostics")
+    "drift"        = @("staleness", "queue", "lag")
+    "doctor"       = @("diagnostics", "troubleshoot", "debug")
+    "preflight"    = @("test", "check", "qa", "validate")
+    "verify"       = @("qa", "audit", "check", "validate")
+    "ship"         = @("deploy", "release", "push", "commit")
+    "audit"        = @("log", "history", "review")
+    "lib"          = @("librarian", "scan", "snippets")
+    "stream"       = @("logs", "output", "worker")
+    "quit"         = @("exit", "close", "bye")
+    "clear"        = @("cls", "reset", "screen")
+}
+
+# ============================================================================
+# COMMAND DISCOVERY FUNCTIONS (v20.0)
+# ============================================================================
+
+function Show-CuratedCommands {
+    <#
+    .SYNOPSIS
+        Shows P0 commands grouped by workflow with collapsed aliases.
+        Output is ≤25 lines, deterministic, no duplicates.
+        Handles narrow terminals by truncating descriptions.
+    #>
+    $width = try { $Host.UI.RawUI.WindowSize.Width } catch { 80 }
+    if ($width -lt 40) { $width = 80 }  # Fallback for non-interactive
+
+    Write-Host ""
+    Write-Host "  ═══ COMMANDS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    foreach ($group in $Global:P0Commands.Keys) {
+        Write-Host "  $group" -ForegroundColor Yellow
+        foreach ($cmd in $Global:P0Commands[$group]) {
+            $name = $cmd.Canonical
+            $desc = $cmd.Desc
+            $aliasStr = ""
+
+            # Collapse aliases onto the same line
+            if ($cmd.Aliases -and $cmd.Aliases.Count -gt 0) {
+                $aliasStr = " (/$($cmd.Aliases -join ', /'))"
+            }
+
+            $cmdDisplay = "/$name".PadRight(16)
+            # 4 (indent) + 16 (cmd) + desc + alias = width
+            $availForDesc = $width - 4 - 16 - $aliasStr.Length - 2
+            if ($availForDesc -lt 10) { $availForDesc = 10 }
+
+            $displayDesc = $desc
+            if ($displayDesc.Length -gt $availForDesc) {
+                $displayDesc = $displayDesc.Substring(0, $availForDesc - 3) + "..."
+            }
+
+            Write-Host "    $cmdDisplay" -NoNewline -ForegroundColor Cyan
+            Write-Host "$displayDesc" -NoNewline -ForegroundColor Gray
+            if ($aliasStr) {
+                Write-Host $aliasStr -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+            }
+        }
+        Write-Host ""
+    }
+
+    # Adaptive footer based on width
+    if ($width -ge 70) {
+        Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host "  More: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/commands all" -NoNewline -ForegroundColor Cyan
+        Write-Host " • Help: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -NoNewline -ForegroundColor Cyan
+        Write-Host " • Search: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help <query>" -ForegroundColor Cyan
+    } else {
+        Write-Host "  ─────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host "  /commands all" -NoNewline -ForegroundColor Cyan
+        Write-Host " | " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -ForegroundColor Cyan
+    }
+    Write-Host ""
+}
+
+function Show-AllCommands {
+    <#
+    .SYNOPSIS
+        Shows complete command registry (deterministic, includes aliases).
+    #>
+    Write-Host ""
+    Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Sort commands alphabetically for deterministic output
+    $sortedKeys = $Global:Commands.Keys | Sort-Object
+
+    foreach ($key in $sortedKeys) {
+        $cmd = $Global:Commands[$key]
+        $desc = $cmd.Desc
+        $cmdDisplay = "/$key".PadRight(18)
+
+        # Get aliases if any
+        $aliasStr = ""
+        if ($cmd.Alias -and $cmd.Alias.Count -gt 0) {
+            $aliasStr = " (aliases: /$($cmd.Alias -join ', /'))"
+        }
+
+        Write-Host "  $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host "$desc" -NoNewline -ForegroundColor Gray
+        if ($aliasStr) {
+            Write-Host $aliasStr -ForegroundColor DarkGray
+        } else {
+            Write-Host ""
+        }
+    }
+
+    Write-Host ""
+}
+
+function Show-HelpTopics {
+    <#
+    .SYNOPSIS
+        Lists all available help topics.
+    #>
+    Write-Host ""
+    Write-Host "  ═══ HELP TOPICS ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    $topics = $Global:HelpTopics.Keys | Sort-Object
+    foreach ($topic in $topics) {
+        $info = $Global:HelpTopics[$topic]
+        $topicDisplay = "/help $topic".PadRight(22)
+        Write-Host "  $topicDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $info.Summary -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  Search any term: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/help <query>" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Show-HelpTopic {
+    <#
+    .SYNOPSIS
+        Shows detailed help for a specific topic.
+    #>
+    param([string]$Topic)
+
+    $topicLower = $Topic.ToLower()
+    if (-not $Global:HelpTopics.ContainsKey($topicLower)) {
+        Write-Host ""
+        Write-Host "  Unknown topic: $Topic" -ForegroundColor Yellow
+        Write-Host "  Available topics: $($Global:HelpTopics.Keys -join ', ')" -ForegroundColor Gray
+        Write-Host ""
+        return
+    }
+
+    $info = $Global:HelpTopics[$topicLower]
+
+    Write-Host ""
+    Write-Host "  ═══ HELP: $($topicLower.ToUpper()) ═══" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  $($info.Summary)" -ForegroundColor White
+    Write-Host ""
+
+    Write-Host "  Commands:" -ForegroundColor Yellow
+    foreach ($cmd in $info.Commands) {
+        $cmdDisplay = "/$($cmd.Name)".PadRight(18)
+        Write-Host "    $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $cmd.Desc -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    Write-Host "  Examples:" -ForegroundColor Yellow
+    foreach ($ex in $info.Examples) {
+        Write-Host "    $ex" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+function Show-HelpSearch {
+    <#
+    .SYNOPSIS
+        Searches commands by name, alias, description, or keywords.
+    #>
+    param([string]$Query)
+
+    $queryLower = $Query.ToLower()
+    $matches = @()
+
+    # Search command names
+    foreach ($key in $Global:Commands.Keys) {
+        $cmd = $Global:Commands[$key]
+        $score = 0
+        $matchReason = ""
+
+        # Exact command match
+        if ($key -eq $queryLower) {
+            $score = 100
+            $matchReason = "exact"
+        }
+        # Command starts with query
+        elseif ($key.StartsWith($queryLower)) {
+            $score = 80
+            $matchReason = "prefix"
+        }
+        # Command contains query
+        elseif ($key.Contains($queryLower)) {
+            $score = 60
+            $matchReason = "contains"
+        }
+        # Alias match
+        elseif ($cmd.Alias) {
+            foreach ($alias in $cmd.Alias) {
+                if ($alias -eq $queryLower) {
+                    $score = 90
+                    $matchReason = "alias:$alias"
+                    break
+                }
+                elseif ($alias.StartsWith($queryLower)) {
+                    $score = 70
+                    $matchReason = "alias:$alias"
+                    break
+                }
+            }
+        }
+
+        # Keyword match
+        if ($score -eq 0 -and $Global:CommandKeywords.ContainsKey($key)) {
+            foreach ($kw in $Global:CommandKeywords[$key]) {
+                if ($kw.Contains($queryLower) -or $queryLower.Contains($kw)) {
+                    $score = 50
+                    $matchReason = "keyword:$kw"
+                    break
+                }
+            }
+        }
+
+        # Description match
+        if ($score -eq 0 -and $cmd.Desc.ToLower().Contains($queryLower)) {
+            $score = 40
+            $matchReason = "desc"
+        }
+
+        if ($score -gt 0) {
+            $matches += @{
+                Name = $key
+                Desc = $cmd.Desc
+                Score = $score
+                Reason = $matchReason
+                Aliases = $cmd.Alias
+            }
+        }
+    }
+
+    # Sort by score descending
+    $matches = $matches | Sort-Object -Property Score -Descending
+
+    Write-Host ""
+    if ($matches.Count -eq 0) {
+        Write-Host "  No matches for '$Query'" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Try: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "/help topics" -NoNewline -ForegroundColor Cyan
+        Write-Host " to browse categories" -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+
+    Write-Host "  ═══ SEARCH: '$Query' ═══" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Show top 8 results
+    $shown = 0
+    foreach ($match in $matches) {
+        if ($shown -ge 8) { break }
+
+        $cmdDisplay = "/$($match.Name)".PadRight(18)
+        Write-Host "  $cmdDisplay" -NoNewline -ForegroundColor Cyan
+        Write-Host $match.Desc -ForegroundColor Gray
+
+        # Show aliases if present
+        if ($match.Aliases -and $match.Aliases.Count -gt 0) {
+            Write-Host "    Aliases: /$($match.Aliases -join ', /')" -ForegroundColor DarkGray
+        }
+
+        $shown++
+    }
+
+    if ($matches.Count -gt 8) {
+        Write-Host ""
+        Write-Host "  ... and $($matches.Count - 8) more results" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+function Resolve-CommandAlias {
+    <#
+    .SYNOPSIS
+        Resolves a command name or alias to its canonical command.
+    .RETURNS
+        @{ Canonical = "cmd"; IsAlias = $bool; OriginalAlias = "alias" } or $null if not found
+    #>
+    param([string]$Name)
+
+    $nameLower = $Name.ToLower()
+
+    # Check if it's a canonical command
+    if ($Global:Commands.Contains($nameLower)) {
+        return @{ Canonical = $nameLower; IsAlias = $false; OriginalAlias = $null }
+    }
+
+    # Check if it's an alias
+    foreach ($key in $Global:Commands.Keys) {
+        $cmd = $Global:Commands[$key]
+        if ($cmd.Alias -and $cmd.Alias -contains $nameLower) {
+            return @{ Canonical = $key; IsAlias = $true; OriginalAlias = $nameLower }
+        }
+    }
+
+    return $null
+}
+
+function Show-CommandHelp {
+    <#
+    .SYNOPSIS
+        Shows detailed help for a specific command (canonical or alias).
+    #>
+    param([string]$CommandName)
+
+    $resolved = Resolve-CommandAlias -Name $CommandName
+    if (-not $resolved) {
+        Write-Host ""
+        Write-Host "  Unknown command: /$CommandName" -ForegroundColor Yellow
+        Write-Host ""
+        return $false
+    }
+
+    $canonical = $resolved.Canonical
+    $cmd = $Global:Commands[$canonical]
+
+    Write-Host ""
+    Write-Host "  ═══ HELP: /$canonical ═══" -ForegroundColor Cyan
+
+    # Show if this was accessed via an alias
+    if ($resolved.IsAlias) {
+        Write-Host "  (/$($resolved.OriginalAlias) is an alias for /$canonical)" -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Write-Host "  $($cmd.Desc)" -ForegroundColor White
+    Write-Host ""
+
+    # Show usage template
+    if ($cmd.Template) {
+        Write-Host "  Usage:" -ForegroundColor Yellow
+        Write-Host "    $($cmd.Template)" -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    # Show aliases if any
+    if ($cmd.Alias -and $cmd.Alias.Count -gt 0) {
+        Write-Host "  Aliases:" -ForegroundColor Yellow
+        Write-Host "    /$($cmd.Alias -join ', /')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Show options if any
+    if ($cmd.Options -and $cmd.Options.Count -gt 0) {
+        Write-Host "  Options:" -ForegroundColor Yellow
+        Write-Host "    $($cmd.Options -join ', ')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Find which topic(s) this command belongs to
+    $relatedTopics = @()
+    foreach ($topic in $Global:HelpTopics.Keys) {
+        $topicCmds = $Global:HelpTopics[$topic].Commands | ForEach-Object { $_.Name }
+        if ($topicCmds -contains $canonical) {
+            $relatedTopics += $topic
+        }
+    }
+    if ($relatedTopics.Count -gt 0) {
+        Write-Host "  Related topics:" -ForegroundColor Yellow
+        Write-Host "    /help $($relatedTopics -join ', /help ')" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    return $true
+}
+
+function Show-GoldenPathHelp {
+    <#
+    .SYNOPSIS
+        Shows the default /help output with golden path scenarios.
+    #>
+    Write-Host ""
+    Write-Host "  What do you want to do?" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  1) " -NoNewline -ForegroundColor White
+    Write-Host "Start a new project" -ForegroundColor Yellow
+    Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/init" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  2) " -NoNewline -ForegroundColor White
+    Write-Host "Plan and execute work" -ForegroundColor Yellow
+    Write-Host "     " -NoNewline
+    Write-Host "/draft-plan" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/accept-plan" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/go" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  3) " -NoNewline -ForegroundColor White
+    Write-Host "Ship a release" -ForegroundColor Yellow
+    Write-Host "     " -NoNewline
+    Write-Host "/preflight" -NoNewline -ForegroundColor Cyan
+    Write-Host " → " -NoNewline -ForegroundColor DarkGray
+    Write-Host "/ship --confirm" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  /help topics" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Browse by category" -ForegroundColor DarkGray
+    Write-Host "  /help <query>" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Search commands" -ForegroundColor DarkGray
+    Write-Host "  /commands" -NoNewline -ForegroundColor Cyan
+    Write-Host "     P0 command reference" -ForegroundColor DarkGray
+    Write-Host "  /commands all" -NoNewline -ForegroundColor Cyan
+    Write-Host "  Full registry" -ForegroundColor DarkGray
+    Write-Host ""
+}
 
 # ============================================================================
 # DATABASE HELPER
@@ -148,7 +743,7 @@ $Global:Commands = [ordered]@{
 
 function Invoke-Query {
     param([string]$Query, [switch]$Silent)
-    
+
     # Basic SQL injection protection
     $dangerousPatterns = @("DROP TABLE", "DELETE FROM tasks", "--", ";--")
     foreach ($pattern in $dangerousPatterns) {
@@ -157,16 +752,22 @@ function Invoke-Query {
             return @()
         }
     }
-    
+
+    # Escape backslashes for Python (Windows paths)
+    $SafeDbPath = $DB_FILE.Replace('\', '/')
+    # v20.0: Match mesh_server.py connection settings to avoid lock contention
     $script = @"
 import sqlite3, json
 try:
-    conn = sqlite3.connect('$DB_FILE')
+    conn = sqlite3.connect('$SafeDbPath', timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=5000')
     rows = conn.execute('''$Query''').fetchall()
     print(json.dumps([dict(r) for r in rows]))
     conn.close()
-except: print('[]')
+except Exception as e:
+    print('[]')
 "@
     try {
         $result = $script | python 2>$null
@@ -179,6 +780,98 @@ except: print('[]')
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+# NOTE: Test-RepoInitialized, Test-DraftPlanExists, and Get-LatestDraftPlan are defined
+# in the "v18.1: UNIFIED INIT DETECTION" section around line ~8095. This ensures
+# consistent init detection across all UI elements (footer hints, scenarios, autocomplete).
+# Test-RepoInitialized returns: @{ initialized = $bool; reason = "projects_registry"|"golden_docs"|"none"; details = "..." }
+
+# v18.3: Safe JSON parsing with diagnostic logging
+# Prevents "Invalid JSON primitive" errors when Python returns tracebacks
+function ConvertFrom-SafeJson {
+    param(
+        [Parameter(Mandatory=$true)]
+        [AllowEmptyString()]
+        [string]$RawOutput,
+
+        [Parameter(Mandatory=$false)]
+        [string]$CommandName = "command"
+    )
+
+    # v18.3.1: Write timestamped log + last_*.txt alias
+    # Use $CurrentDir\control\state (fallback to $env:TEMP if unavailable)
+    $stateBase = if ($CurrentDir) { Join-Path $CurrentDir "control\state" } else { $env:TEMP }
+    $logsDir = Join-Path $stateBase "logs"
+    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+    if ([string]::IsNullOrWhiteSpace($CommandName)) { $CommandName = "unknown" }
+    $timestampedPath = Join-Path $logsDir "${CommandName}_${timestamp}_raw.txt"
+    $lastPath = Join-Path $stateBase "last_${CommandName}_raw.txt"
+
+    try {
+        if (-not (Test-Path $stateBase)) { New-Item -ItemType Directory -Path $stateBase -Force | Out-Null }
+        if (-not (Test-Path $logsDir))   { New-Item -ItemType Directory -Path $logsDir   -Force | Out-Null }
+        $RawOutput | Out-File -FilePath $timestampedPath -Encoding UTF8 -Force
+        $RawOutput | Out-File -FilePath $lastPath -Encoding UTF8 -Force
+    } catch {
+        # Fail silently - logging is best-effort
+    }
+
+    # Check if output looks like JSON
+    $trimmed = $RawOutput.Trim()
+    if (-not ($trimmed.StartsWith("{") -or $trimmed.StartsWith("["))) {
+        # Not JSON - return error object with first few lines for context
+        $preview = ($trimmed -split "`n" | Select-Object -First 5) -join "`n"
+
+        # v18.3.1: Extract cause from common Python exception patterns
+        $cause = $null
+        $exceptionPatterns = @(
+            '(?m)^(ImportError:.+)$',
+            '(?m)^(ModuleNotFoundError:.+)$',
+            '(?m)^(FileNotFoundError:.+)$',
+            '(?m)^(PermissionError:.+)$',
+            '(?m)^(KeyError:.+)$',
+            '(?m)^(ValueError:.+)$',
+            '(?m)^(TypeError:.+)$',
+            '(?m)^(AttributeError:.+)$',
+            '(?m)^(NameError:.+)$',
+            '(?m)^(OSError:.+)$',
+            '(?m)^(RuntimeError:.+)$',
+            '(?m)^(Exception:.+)$',
+            '(?m)^(\w+Error:.+)$'
+        )
+        foreach ($pattern in $exceptionPatterns) {
+            if ($trimmed -match $pattern) {
+                $cause = $Matches[1].Trim()
+                break
+            }
+        }
+
+        return @{
+            _parseError = $true
+            _message = "Output is not valid JSON"
+            _preview = $preview
+            _cause = $cause
+            _logPath = $lastPath
+            _timestampedPath = $timestampedPath
+        }
+    }
+
+    # Attempt JSON parsing
+    try {
+        $parsed = $trimmed | ConvertFrom-Json -ErrorAction Stop
+        return $parsed
+    }
+    catch {
+        return @{
+            _parseError = $true
+            _message = "JSON parse error: $_"
+            _preview = ($trimmed -split "`n" | Select-Object -First 5) -join "`n"
+            _cause = $null
+            _logPath = $lastPath
+            _timestampedPath = $timestampedPath
+        }
+    }
+}
 
 function Get-ProjectMode {
     if (Test-Path $MilestoneFile) {
@@ -204,11 +897,26 @@ function Get-TaskStats {
 }
 
 # v17.2: Lane-aware counts for header (counts distinct lanes, not tasks)
+feat/v17.2-lane-counts
+# v18.2: Uses $Global:PendingStatuses and $Global:ActiveStatuses for status mapping
+# Prefers lane column, falls back to type if lane is empty/null
+function Get-LaneActivityCounts {
+    $laneExpr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+
+    # v18.2: Build status IN clauses from global arrays
+    $pendingIn = ($Global:PendingStatuses | ForEach-Object { "'$($_.ToLower())'" }) -join ","
+    $activeIn = ($Global:ActiveStatuses | ForEach-Object { "'$($_.ToLower())'" }) -join ","
+
+    $pendingLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) IN ($pendingIn)" -Silent
+    $activeLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) IN ($activeIn)" -Silent
+
+=======
 # Prefers lane column, falls back to type if lane is empty/null
 function Get-LaneActivityCounts {
     $laneExpr = "LOWER(COALESCE(NULLIF(lane,''), type))"
     $pendingLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) = 'pending'" -Silent
     $activeLanes = Invoke-Query "SELECT COUNT(DISTINCT $laneExpr) as c FROM tasks WHERE LOWER(status) = 'in_progress'" -Silent
+main
     return @{
         pendingLaneCount = if ($pendingLanes -and $pendingLanes.c) { $pendingLanes.c } else { 0 }
         activeLaneCount = if ($activeLanes -and $activeLanes.c) { $activeLanes.c } else { 0 }
@@ -298,13 +1006,17 @@ function Get-CommandCatalog {
     param([bool]$ShowAll = $false)
 
     # Tier 1: Golden Path - Beginner-safe essentials (max 9)
-    $goldenPath = @("help", "init", "ops", "plan", "run", "status", "ship", "snapshots", "restore")
+    $goldenPath = @(
+        "help", "init", "ops",
+        "draft-plan", "accept-plan", "refresh-plan",
+        "plan", "go", "status", "ship"
+    )
 
     # Tier 2: Advanced/Maintenance (shown with --all)
     $advanced = @("work", "approve", "approve_source", "snapshot", "restore_confirm", "review", "rules", "questions", "answer", "unlock", "lock", "mode", "milestone", "preflight", "doctor", "refine", "stream", "decide", "note", "blocker", "profile", "standard", "standards", "multi", "projects", "patterns", "incident", "mine")
 
     # Tier 3: Deprecated/Legacy (shown with --all, marked deprecated)
-    $deprecated = @("go", "add", "skip", "drop", "reset", "nuke", "audit", "lib", "ingest", "rigor", "commands")
+    $deprecated = @("add", "skip", "drop", "reset", "nuke", "audit", "lib", "ingest", "rigor", "commands")
 
     # Session commands (shown with --all)
     $session = @("quit", "clear", "refresh", "tasks", "dash", "compact")
@@ -348,7 +1060,22 @@ function Get-PickerCommands {
     param([string]$Filter = "")
 
     # SANDBOX UX: Priority commands (always shown first)
-    $priorityOrder = @("help", "init", "ops", "plan", "run", "ship")
+    # v18.1: Draft-aware priority ordering
+    $initStatus = Test-RepoInitialized
+    $hasDraft = Test-DraftPlanExists
+
+    $priorityOrder = if (-not $initStatus.initialized) {
+        # Not initialized: /init is top priority
+        @("help", "init", "ops", "plan", "go", "ship")
+    }
+    elseif ($hasDraft) {
+        # Initialized + draft exists: /accept-plan is priority
+        @("help", "accept-plan", "draft-plan", "ops", "plan", "go", "ship")
+    }
+    else {
+        # Initialized + no draft: /draft-plan is priority
+        @("help", "draft-plan", "accept-plan", "ops", "plan", "go", "ship")
+    }
 
     if ($Filter -eq "") {
         $result = @()
@@ -363,6 +1090,7 @@ function Get-PickerCommands {
                 $result += $cmd
             }
         }
+        # v18.5: Caller uses [array] cast to ensure array type
         return $result
     }
     else {
@@ -379,28 +1107,64 @@ function Get-PickerCommands {
                 }
             }
         }
-        $sortedOthers = $otherMatches | Sort-Object -Property Name
+        $sortedOthers = @($otherMatches | Sort-Object -Property Name)
         $sortedPriority = @()
         foreach ($cmd in $priorityOrder) {
             $match = $priorityMatches | Where-Object { $_.Name -eq $cmd }
             if ($match) { $sortedPriority += $match }
         }
-        return $sortedPriority + $sortedOthers
+        # v18.5: Caller uses [array] cast to ensure array type
+        return @($sortedPriority) + @($sortedOthers)
     }
 }
 
 function Show-Header {
-    $proj = Get-ProjectMode
     $stats = Get-TaskStats
 feat/v17.2-lane-counts
     $laneCounts = Get-LaneActivityCounts  # v17.2: Lane counts for pending/active
+
+    # v18.2: Get init status
+    $initStatus = Test-RepoInitialized
 =======
+feat/v17.2-lane-counts
+    $laneCounts = Get-LaneActivityCounts  # v17.2: Lane counts for pending/active
+=======
+main
 main
 
     # Get console width - use full width
     $width = $Host.UI.RawUI.WindowSize.Width
     $line = "-" * ($width - 2)
 
+feat/v17.2-lane-counts
+    # v19.2: Path on far right
+    $path = $CurrentDir
+    $maxPathLen = 40
+    if ($path.Length -gt $maxPathLen) {
+        $path = "..." + $path.Substring($path.Length - ($maxPathLen - 3))
+    }
+
+    # v19.4: Mode label (EXEC not colorized, BOOTSTRAP in yellow)
+    $modeLabel = if ($initStatus.initialized) { "EXEC" } else { "BOOTSTRAP" }
+    $modeLabelColor = if ($initStatus.initialized) { "White" } else { "Yellow" }
+
+    # v19.4: Single health indicator dot based on overall status
+    $healthStatus = Get-SystemHealthStatus
+    $healthDot = "●"
+    $healthDotColor = switch ($healthStatus) {
+        "FAIL" { "Red" }
+        "WARN" { "Yellow" }
+        default { "Green" }
+    }
+
+    # v19.6: Pending/active counts with conditional colors (0=DarkGray, >0=White)
+    $pendingCount = $laneCounts.pendingLaneCount
+    $activeCount = $laneCounts.activeLaneCount
+    $pendingColor = if ($pendingCount -gt 0) { "White" } else { "DarkGray" }
+    $activeColor = if ($activeCount -gt 0) { "White" } else { "DarkGray" }
+    $pendingStr = "$pendingCount pending"
+    $activeStr = "$activeCount active"
+=======
 feat/v17.2-lane-counts
     # Build title line: Project Name (left) ... Path (right)
 =======
@@ -435,10 +1199,39 @@ feat/v17.2-lane-counts
     $padLen = $width - 6 - $ProjectName.Length - $path.Length
     if ($padLen -lt 1) { $padLen = 1 }
     $padding = " " * $padLen
+main
 
     Write-Host ""
     Write-Host "+$line+" -ForegroundColor Cyan
 
+feat/v17.2-lane-counts
+    # v19.6: Content row: 2 spaces + EXEC ● | x pending | x active ... path
+    Write-Host "|" -NoNewline -ForegroundColor Cyan
+    Write-Host "  " -NoNewline  # 2 leading spaces before EXEC
+    Write-Host $modeLabel -NoNewline -ForegroundColor $modeLabelColor
+    Write-Host " " -NoNewline
+    Write-Host $healthDot -NoNewline -ForegroundColor $healthDotColor
+    Write-Host " | " -NoNewline -ForegroundColor DarkGray
+    Write-Host $pendingStr -NoNewline -ForegroundColor $pendingColor
+    Write-Host " | " -NoNewline -ForegroundColor DarkGray
+    Write-Host $activeStr -NoNewline -ForegroundColor $activeColor
+
+    # Calculate padding to right-align path
+    # v19.6: Added 2 for leading spaces, split pending/active with separator
+    $countsLen = $pendingStr.Length + 3 + $activeStr.Length  # pending + " | " + active
+    $usedLen = 1 + 2 + $modeLabel.Length + 1 + 1 + 3 + $countsLen  # | + 2spaces + EXEC + space + dot + " | " + counts
+    $padLen = $width - $usedLen - $path.Length - 3  # -3 for 2 trailing spaces + closing |
+    if ($padLen -lt 1) { $padLen = 1 }
+    Write-Host (" " * $padLen) -NoNewline
+    Write-Host $path -NoNewline -ForegroundColor DarkGray
+    Write-Host "  |" -ForegroundColor Cyan  # 2 spaces before right border
+
+    # v19.3: Second interior row (blank) - header now has 2 interior rows
+    Write-Host "|" -NoNewline -ForegroundColor Cyan
+    Write-Host (" " * ($width - 2)) -NoNewline
+    Write-Host "|" -ForegroundColor Cyan
+
+=======
     # Line 1: Project Name (left) ... Path (right)
 =======
     $padLen = $width - 4 - $path.Length
@@ -468,6 +1261,7 @@ feat/v17.2-lane-counts
 =======
 
 main
+main
     Write-Host "+$line+" -ForegroundColor Cyan
 }
 
@@ -480,6 +1274,60 @@ function Get-SystemHealthStatus {
         return "OK"
     }
     catch { return "OK" }
+}
+
+# v19.7: Decision category code to display label mapping
+$Global:DecisionCategoryMap = @{
+    "SEC"  = "Security"
+    "ARCH" = "Architecture"
+    "DATA" = "Data"
+    "PRD"  = "Product"
+    "OPS"  = "Operations"
+    "QA"   = "QA"
+    "UX"   = "UX"
+    "PERF" = "Performance"
+    "API"  = "API"
+}
+
+function Format-DecisionForDisplay {
+    <#
+    .SYNOPSIS
+        Formats a decision log line for dashboard display.
+    .PARAMETER RawLine
+        Raw decision line from DECISION_LOG.md (pipe-delimited table row)
+    .RETURNS
+        Formatted display string, e.g. "Security: Read-Only Mode for Data"
+    #>
+    param([string]$RawLine)
+
+    if ([string]::IsNullOrWhiteSpace($RawLine)) { return "" }
+
+    # v19.7 fix: Split by | and extract specific columns
+    # Format: | ID | Date | Type | Decision | Rationale | Scope | Task | Status |
+    # Columns: [0]=empty, [1]=ID, [2]=Date, [3]=Type, [4]=Decision, [5]=Rationale...
+    $columns = $RawLine -split "\|" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+    if ($columns.Count -ge 4) {
+        # columns[0]=ID, [1]=Date, [2]=Type, [3]=Decision
+        $categoryCode = $columns[2]
+        $description = $columns[3]
+
+        # Map category code to full name
+        $categoryLabel = if ($Global:DecisionCategoryMap.ContainsKey($categoryCode)) {
+            $Global:DecisionCategoryMap[$categoryCode]
+        } else {
+            $categoryCode
+        }
+
+        # Clean up markdown formatting (remove ** bold markers)
+        $cleanDesc = $description -replace "\*\*", ""
+
+        # Format: "Category: Description"
+        return "$categoryLabel`: $cleanDesc"
+    }
+
+    # Fallback: return original trimmed if can't parse
+    return ($RawLine -replace "\|", " ").Trim() -replace "\s+", " "
 }
 
 # ============================================================================
@@ -495,6 +1343,12 @@ $Global:ScrollOffset = 0
 # v13.1: View mode state (minimal)
 $Global:ViewOverride = $null  # null=auto, "dash", "compact"
 $Global:HealthStatus = "OK"   # OK, WARN, FAIL
+
+# v18.2: Lane Activity Status Arrays (for header lane counts)
+# Pending = tasks waiting to be worked on
+# Active = tasks currently being worked on
+$Global:PendingStatuses = @("pending", "next", "planned")
+$Global:ActiveStatuses = @("in_progress", "running")
 
 # v13.2: Modal CLI - 2-mode toggle (OPS/PLAN) + explicit commands for RUN/SHIP
 $Global:CurrentMode = "OPS"
@@ -570,11 +1424,17 @@ function Normalize-CommandKey {
 
 function Get-FilteredCommands {
     param([string]$Filter)
-    
+
     $filter = $Filter.TrimStart("/").ToLower()
     $filtered = @()
-    
+
+    # v18.1: Deprioritize /init when repo is initialized (still discoverable via /in)
+    $initStatus = Test-RepoInitialized
+
     foreach ($key in $Global:Commands.Keys) {
+        # Skip /init from default list when initialized, but show if user types "/in"
+        if ($key -eq "init" -and $initStatus.initialized -and $filter -eq "") { continue }
+
         if ($filter -eq "" -or $key.StartsWith($filter)) {
             $filtered += @{
                 Name = $key
@@ -582,7 +1442,7 @@ function Get-FilteredCommands {
             }
         }
     }
-    
+
     return $filtered
 }
 
@@ -686,21 +1546,27 @@ function Clear-DropdownArea {
 
 function Show-CommandSuggestions {
     param([string]$Filter)
-    
+
     # Remove leading slash
     $filter = $Filter.TrimStart("/").ToLower()
-    
+
     Write-Host ""
     Write-Host "  ─────────────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    
+
+    # v18.1: Deprioritize /init when repo is initialized (still discoverable via /in)
+    $initStatus = Test-RepoInitialized
+
     # Gather matching commands
     $matches = @()
     foreach ($key in $Global:Commands.Keys) {
+        # Skip /init from default list when initialized, but show if user types "/in"
+        if ($key -eq "init" -and $initStatus.initialized -and $filter -eq "") { continue }
+
         if ($filter -eq "" -or $key.StartsWith($filter)) {
             $matches += @{ Name = $key; Desc = $Global:Commands[$key].Desc }
         }
     }
-    
+
     $maxShow = 16  # Show more since we have 2 columns (8 rows × 2)
     $rowsToShow = [Math]::Min([Math]::Ceiling($matches.Count / 2), 8)
     
@@ -762,7 +1628,7 @@ function Invoke-Continue {
         Write-Host "     Use: /decide $($dec.id) <your answer>" -ForegroundColor Gray
         return
     }
-    
+
     # Check for stuck tasks
     $stuckTasks = Invoke-Query "SELECT id, desc FROM tasks WHERE auditor_status='escalated' OR retry_count >= 3 LIMIT 1"
     if ($stuckTasks.Count -gt 0) {
@@ -772,20 +1638,83 @@ function Invoke-Continue {
         Write-Host "     Use: /reset $($stuck.id) after fixing manually" -ForegroundColor Gray
         return
     }
-    
-    # Get next pending task
-    $nextTask = Invoke-Query "SELECT id, type, desc, strictness FROM tasks WHERE status='pending' ORDER BY priority DESC, id LIMIT 1"
-    if ($nextTask.Count -eq 0) {
-        Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
+
+    # v18.5: Use braided scheduler for task selection (round-robin across lanes)
+    # v20.0: Added retry logic for transient DB lock errors
+    $maxRetries = 3
+    $retryDelayMs = 500
+    $result = $null
+
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import pick_task_braided; print(pick_task_braided('control_panel'))" 2>&1
+            $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+            $result = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "pick_task_braided"
+
+            # Check for transient errors that warrant retry
+            if ($result._parseError -or $result.status -eq "ERROR") {
+                $errorMsg = if ($result.message) { $result.message } else { "parse error" }
+                # Retry on locked/busy errors
+                if ($errorMsg -match "locked|busy|timeout" -and $attempt -lt $maxRetries) {
+                    Start-Sleep -Milliseconds $retryDelayMs
+                    continue
+                }
+            }
+            # Got a valid response, exit retry loop
+            break
+        }
+        catch {
+            if ($attempt -lt $maxRetries) {
+                Start-Sleep -Milliseconds $retryDelayMs
+                continue
+            }
+            Write-Host "  ❌ Failed to pick task: $_" -ForegroundColor Red
+            return
+        }
+    }
+
+    if ($result._parseError) {
+        Write-Host "  ❌ Scheduler error - see logs" -ForegroundColor Red
         return
     }
-    
-    $task = $nextTask[0]
-    $strictness = if ($task.strictness) { $task.strictness.ToUpper() } else { "NORMAL" }
-    $icon = switch ($strictness) { "CRITICAL" { "🔴" } "RELAXED" { "🟢" } default { "🟡" } }
-    
-    Write-Host "  ▶ Executing [$icon $strictness]: [$($task.id)] $($task.desc)" -ForegroundColor Cyan
-    Invoke-Query "UPDATE tasks SET status='in_progress', updated_at=strftime('%s','now') WHERE id=$($task.id)" | Out-Null
+
+    if ($result.status -eq "NO_WORK") {
+        # Check if any tasks exist at all
+        $taskCount = Invoke-Query "SELECT COUNT(*) as c FROM tasks" -Silent
+        $count = if ($taskCount -and $taskCount.Count -gt 0) { $taskCount[0].c } else { 0 }
+
+        if ($count -eq 0) {
+            Write-Host "  📋 No tasks yet. Run /accept-plan first." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  ✅ Queue empty. All done!" -ForegroundColor Green
+        }
+        return
+    }
+
+    if ($result.status -eq "OK") {
+        $task = $result
+        $laneLabel = if ($task.lane) { "[$($task.lane)]" } else { "" }
+        $preemptLabel = if ($task.preempted) { " [PREEMPT]" } else { "" }
+
+        Write-Host ""
+        Write-Host "  ▶ Picked task via braided scheduler$preemptLabel" -ForegroundColor Cyan
+        Write-Host "     ID:   T-$($task.id)" -ForegroundColor White
+        Write-Host "     Lane: $laneLabel" -ForegroundColor Gray
+        Write-Host "     Desc: $($task.description)" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Task is now IN_PROGRESS. Worker can claim it." -ForegroundColor DarkGray
+        return
+    }
+
+    # v20.0: Handle ERROR status explicitly
+    if ($result.status -eq "ERROR") {
+        Write-Host "  ❌ Scheduler error: $($result.message)" -ForegroundColor Red
+        return
+    }
+
+    # Unexpected status
+    Write-Host "  ⚠️ Unexpected scheduler response: $($result.status)" -ForegroundColor Yellow
 }
 
 function Show-Stream {
@@ -947,112 +1876,53 @@ function Invoke-SlashCommand {
             return "refresh"
         }
         "help" {
-            # v13.3.1: Scenario-first help
+            # v20.0: Topic-based help with search
+            # Precedence: --all > topics > exact command > exact topic > search
             if ($cmdArgs -eq "--all") {
-                $catalog = Get-CommandCatalog -ShowAll $true
-                Write-Host ""
-                Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  GOLDEN PATH" -ForegroundColor Yellow
-                foreach ($cmd in $catalog.GoldenPath) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor Yellow
-                    Write-Host $cmd.Desc -ForegroundColor Gray
+                # Legacy: redirect to /commands all
+                Show-AllCommands
+            }
+            elseif ($cmdArgs -eq "topics") {
+                # List all help topics
+                Show-HelpTopics
+            }
+            elseif ($cmdArgs -and $cmdArgs.Trim() -ne "") {
+                $query = $cmdArgs.Trim().TrimStart("/")
+
+                # Check for exact command match (canonical or alias)
+                $resolved = Resolve-CommandAlias -Name $query
+                if ($resolved) {
+                    Show-CommandHelp -CommandName $query
                 }
-                Write-Host ""
-                Write-Host "  ADVANCED" -ForegroundColor DarkYellow
-                foreach ($cmd in $catalog.Advanced) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkGray
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
+                # Check for exact topic match
+                elseif ($Global:HelpTopics.ContainsKey($query.ToLower())) {
+                    Show-HelpTopic -Topic $query
                 }
-                Write-Host ""
-                Write-Host "  SESSION" -ForegroundColor DarkCyan
-                foreach ($cmd in $catalog.Session) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkGray
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
+                # Fall back to search
+                else {
+                    Show-HelpSearch -Query $query
                 }
-                Write-Host ""
-                Write-Host "  DEPRECATED" -ForegroundColor DarkRed
-                foreach ($cmd in $catalog.Deprecated) {
-                    Write-Host "    /$($cmd.Name)".PadRight(18) -NoNewline -ForegroundColor DarkRed
-                    Write-Host $cmd.Desc -ForegroundColor DarkGray
-                }
-                Write-Host ""
             }
             else {
-                # Default: Scenario-first help (use-cases, not command catalog)
-                Write-Host ""
-                Write-Host "  What do you want to do?" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  1) " -NoNewline -ForegroundColor White
-                Write-Host "Start a new project" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/init" -ForegroundColor Cyan
-                Write-Host "     Or type: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "'start a payments service'" -ForegroundColor Gray
-                Write-Host ""
-                Write-Host "  2) " -NoNewline -ForegroundColor White
-                Write-Host "Continue working" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/ops" -NoNewline -ForegroundColor Cyan
-                Write-Host " (status) → " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/plan" -NoNewline -ForegroundColor Cyan
-                Write-Host " (roadmap) → " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/run" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host "  3) " -NoNewline -ForegroundColor White
-                Write-Host "Ship a release" -ForegroundColor Yellow
-                Write-Host "     Run: " -NoNewline -ForegroundColor DarkGray
-                Write-Host "/ship" -NoNewline -ForegroundColor Cyan
-                Write-Host " (preflight, no auto-deploy)" -ForegroundColor DarkGray
-                Write-Host ""
-                Write-Host "  ─────────────────────────────────────────" -ForegroundColor DarkGray
-                Write-Host "  /help --all" -NoNewline -ForegroundColor DarkCyan
-                Write-Host "  Full command registry" -ForegroundColor DarkGray
-                Write-Host ""
+                # Default: Golden path help
+                Show-GoldenPathHelp
             }
         }
 
-        # === LEGACY ALIAS ===
+        # === COMMANDS (v20.0) ===
         "commands" {
-            Write-Host ""
-            Write-Host "  ⚠️  /commands is legacy. Use /help or /help --all" -ForegroundColor DarkYellow
-            Write-Host ""
-            # Show /help --all output
-            $catalog = Get-CommandCatalog -ShowAll $true
-            Write-Host "  ═══ ALL COMMANDS ═══" -ForegroundColor Cyan
-            Write-Host ""
-            Write-Host "  GOLDEN PATH (beginner-safe)" -ForegroundColor Yellow
-            foreach ($c in $catalog.GoldenPath) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor Yellow
-                Write-Host $c.Desc -ForegroundColor Gray
+            if ($cmdArgs -eq "all") {
+                # Full registry dump
+                Show-AllCommands
             }
-            Write-Host ""
-            Write-Host "  ADVANCED" -ForegroundColor DarkYellow
-            foreach ($c in $catalog.Advanced) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkGray
-                Write-Host $c.Desc -ForegroundColor DarkGray
+            else {
+                # Curated P0 commands (default)
+                Show-CuratedCommands
             }
-            Write-Host ""
-            Write-Host "  SESSION" -ForegroundColor DarkCyan
-            foreach ($c in $catalog.Session) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkGray
-                Write-Host $c.Desc -ForegroundColor DarkGray
-            }
-            Write-Host ""
-            Write-Host "  DEPRECATED" -ForegroundColor DarkRed
-            foreach ($c in $catalog.Deprecated) {
-                Write-Host "    /$($c.Name)".PadRight(20) -NoNewline -ForegroundColor DarkRed
-                Write-Host $c.Desc -ForegroundColor DarkGray
-            }
-            Write-Host ""
         }
 
         # === EXECUTION ===
         "go" {
-            # Only show deprecation if user typed /go (not /run or /c)
-            if ($originalCmd -eq "go") {
-                Write-Host "  ⚠️  Deprecated: prefer /run or natural language" -ForegroundColor DarkYellow
-            }
             Invoke-Continue
         }
 
@@ -1908,13 +2778,40 @@ function Invoke-SlashCommand {
         
         # === LIBRARY (v13.3.1 - New Project Entry Point) ===
         "init" {
+            # v18.2: Safety guard - prevent accidental re-init
+            $forceFlag = $cmdArgs -match "--force"
+            $initStatus = Test-RepoInitialized
+
+            if ($initStatus.initialized -and (-not $forceFlag)) {
+                Write-Host ""
+                Write-Host "  ⛔ REPO ALREADY INITIALIZED" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Marker: $($initStatus.reason)" -ForegroundColor DarkGray
+                Write-Host "  $($initStatus.details)" -ForegroundColor DarkGray
+                Write-Host ""
+                Write-Host "  Aborting. Use " -NoNewline -ForegroundColor DarkGray
+                Write-Host "/init --force" -NoNewline -ForegroundColor White
+                Write-Host " if you really want to re-scaffold." -ForegroundColor DarkGray
+                Write-Host ""
+                return
+            }
+
+            if ($forceFlag -and $initStatus.initialized) {
+                Write-Host ""
+                Write-Host "  ⚠️  FORCE RE-INIT" -ForegroundColor Yellow
+                Write-Host "  Existing marker: $($initStatus.reason)" -ForegroundColor DarkGray
+                Write-Host "  Proceeding anyway..." -ForegroundColor DarkGray
+                Write-Host ""
+            }
+
             Write-Host ""
             Write-Host "  🚀 NEW PROJECT SETUP" -ForegroundColor Cyan
             Write-Host ""
 
-            # If args provided, this is a quick-start: bootstrap + /work
-            if ($cmdArgs) {
-                Write-Host "  Quick start: '$cmdArgs'" -ForegroundColor Yellow
+            # If args provided (excluding --force), this is a quick-start: bootstrap + /work
+            $cleanArgs = $cmdArgs -replace "--force", "" | ForEach-Object { $_.Trim() }
+            if ($cleanArgs) {
+                Write-Host "  Quick start: '$cleanArgs'" -ForegroundColor Yellow
                 Write-Host ""
             }
 
@@ -2053,7 +2950,18 @@ print(detect_project_profile(r'$CurrentDir'))
                     $created += $templates[$src]
                 }
             }
-            
+
+            # B2: Create explicit init marker (future-proof, deterministic detection)
+            $stateDir = Join-Path $CurrentDir "control\state"
+            if (-not (Test-Path $stateDir)) {
+                New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+            }
+            $markerPath = Join-Path $stateDir ".mesh_initialized"
+            if (-not (Test-Path $markerPath)) {
+                "" | Set-Content -Path $markerPath -Encoding UTF8
+                $created += "control\state\.mesh_initialized"
+            }
+
             # Report results
             foreach ($file in $created) {
                 Write-Host "    ✅ Created $file" -ForegroundColor Green
@@ -2461,22 +3369,22 @@ print(consult_standard('$cmdArgs', '$profile'))
             Write-Host "  Project Type: $projectType" -ForegroundColor Gray
             Write-Host ""
 
-            # Run tests based on project type
+            # Run tests based on project type (avoid Invoke-Expression; use argv arrays)
             $testCmd = $null
             switch ($projectType) {
                 "python_backend" {
                     if ((Test-Path "tests") -or (Test-Path "pytest.ini")) {
-                        $testCmd = "pytest -x -q --tb=short"
+                        $testCmd = @("pytest", "-x", "-q", "--tb=short")
                     }
                 }
                 "typescript_next" {
                     if (Test-Path "package.json") {
-                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                        $testCmd = @("npm", "test", "--", "--passWithNoTests", "--watchAll=false")
                     }
                 }
                 "typescript_node" {
                     if (Test-Path "package.json") {
-                        $testCmd = "npm test -- --passWithNoTests --watchAll=false"
+                        $testCmd = @("npm", "test", "--", "--passWithNoTests", "--watchAll=false")
                     }
                 }
             }
@@ -2486,12 +3394,16 @@ print(consult_standard('$cmdArgs', '$profile'))
                 return
             }
 
-            Write-Host "  Running: $testCmd" -ForegroundColor Gray
+            $testCmdDisplay = ($testCmd -join " ")
+            Write-Host "  Running: $testCmdDisplay" -ForegroundColor Gray
             Write-Host ""
 
             # Execute tests
             try {
-                $result = Invoke-Expression $testCmd 2>&1
+                $exe = $testCmd[0]
+                $argsList = @()
+                if ($testCmd.Count -gt 1) { $argsList = @($testCmd[1..($testCmd.Count - 1)]) }
+                $result = & $exe @argsList 2>&1
 
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host ""
@@ -2823,9 +3735,21 @@ print(consult_standard('$cmdArgs', '$profile'))
             Write-Host ""
             Write-Host "  Regenerating plan from tasks..." -ForegroundColor Yellow
             try {
-                $result = python -c "from mesh_server import refresh_plan_preview; print(refresh_plan_preview())" 2>&1
-                $plan = $result | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($plan.status -eq "FRESH") {
+                $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import refresh_plan_preview; print(refresh_plan_preview())" 2>&1
+                $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+                $plan = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "refresh_plan"
+
+                # v18.3: Handle parse errors gracefully
+                if ($plan._parseError) {
+                    Write-Host "  ❌ Refresh-plan failed; see control/state/last_refresh_plan_raw.txt" -ForegroundColor Red
+                    if ($plan._cause) {
+                        Write-Host "  Cause: $($plan._cause)" -ForegroundColor Yellow
+                    }
+                    Write-Host ""
+                    Write-Host "  First lines of output:" -ForegroundColor DarkGray
+                    ($plan._preview -split "`n") | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+                }
+                elseif ($plan.status -eq "FRESH") {
                     Write-Host "  ✅ Plan refreshed" -ForegroundColor Green
                     foreach ($stream in $plan.streams) {
                         Write-Host "     [$($stream.name)]" -ForegroundColor Yellow
@@ -2845,82 +3769,196 @@ print(consult_standard('$cmdArgs', '$profile'))
         }
 
         "draft-plan" {
-            Write-Host ""
-            Write-Host "  ═══ CREATE DRAFT PLAN ═══" -ForegroundColor Cyan
-            Write-Host ""
-            try {
-                $result = python -c "from mesh_server import draft_plan; print(draft_plan())" 2>&1
-                $response = $result | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($response.status -eq "OK") {
-                    Write-Host "  ✅ Draft created: $($response.path)" -ForegroundColor Green
-                    Write-Host ""
-                    Write-Host "  Opening in editor..." -ForegroundColor Gray
-                    # v13.5.5: Try VS Code first with proper fallback
-                    $vsCodeCmd = Get-Command code -ErrorAction SilentlyContinue
-                    if ($vsCodeCmd) {
-                        & code $response.path
-                    }
-                    else {
-                        # Fallback to system default
-                        Start-Process $response.path
-                    }
-                    Write-Host ""
-                    Write-Host "  📝 Edit the file, then run:" -ForegroundColor Yellow
-                    Write-Host "     /accept-plan $((Split-Path $response.path -Leaf))" -ForegroundColor Cyan
-                }
-                else {
-                    Write-Host "  ❌ $($response.message)" -ForegroundColor Red
-                }
-            }
-            catch {
-                Write-Host "  ❌ Failed to create draft: $_" -ForegroundColor Red
-            }
-            Write-Host ""
-        }
+            # v20.0: Fixed silent failure - now displays result to user
+            $draftPath = $null
+            $response = $null
+            $errorMessage = $null
 
-        "accept-plan" {
-            Write-Host ""
-            Write-Host "  ═══ ACCEPT PLAN ═══" -ForegroundColor Cyan
-            Write-Host ""
-            if (-not $cmdArgs) {
-                Write-Host "  Usage: /accept-plan <path>" -ForegroundColor Yellow
-                Write-Host "  Example: /accept-plan draft_20251212_1700.md" -ForegroundColor Gray
-                Write-Host ""
-                # List available drafts
-                $plansDir = Join-Path $DocsDir "PLANS"
-                if (Test-Path $plansDir) {
-                    $drafts = Get-ChildItem $plansDir -Filter "draft_*.md" | Sort-Object LastWriteTime -Descending | Select-Object -First 5
-                    if ($drafts) {
-                        Write-Host "  Recent drafts:" -ForegroundColor DarkGray
-                        foreach ($draft in $drafts) {
-                            Write-Host "    • $($draft.Name)" -ForegroundColor Gray
-                        }
-                    }
-                }
-            }
-            else {
-                Write-Host "  Processing: $cmdArgs" -ForegroundColor Yellow
+            # Check for existing draft
+            try { $draftPath = Get-LatestDraftPlan } catch { }
+
+            # Create new draft if none exists
+            if (-not $draftPath) {
                 try {
-                    $escapedPath = $cmdArgs -replace "'", "''"
-                    $result = python -c "from mesh_server import accept_plan; print(accept_plan('$escapedPath'))" 2>&1
-                    $response = $result | ConvertFrom-Json -ErrorAction SilentlyContinue
-                    if ($response.status -eq "OK") {
-                        Write-Host "  ✅ $($response.message)" -ForegroundColor Green
-                        if ($response.tasks) {
-                            foreach ($task in $response.tasks) {
-                                Write-Host "     + $($task.id): $($task.desc)" -ForegroundColor Gray
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "python"
+                    $pyCode = "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())"
+                    $psi.Arguments = "-c `"$pyCode`""
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.WorkingDirectory = $RepoRoot
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    $rawResult = $proc.StandardOutput.ReadToEnd()
+                    $proc.WaitForExit()
+
+                    $response = ConvertFrom-SafeJson -RawOutput $rawResult -CommandName "draft_plan"
+
+                    # v20.0: Handle response status explicitly
+                    if ($response -and -not $response._parseError) {
+                        switch ($response.status) {
+                            "OK" {
+                                $draftPath = $response.path
+                            }
+                            "BLOCKED" {
+                                $errorMessage = "BLOCKED: $($response.message)"
+                                if ($response.blocking_files) {
+                                    $errorMessage += " Missing: $($response.blocking_files -join ', ')"
+                                }
+                            }
+                            "ERROR" {
+                                $errorMessage = "Error: $($response.message)"
+                            }
+                            default {
+                                $errorMessage = "Unexpected: $($response.status)"
                             }
                         }
                     }
-                    else {
-                        Write-Host "  ❌ $($response.message)" -ForegroundColor Red
+                    elseif ($response -and $response._parseError) {
+                        $errorMessage = "Parse error: $($response._cause)"
                     }
-                }
-                catch {
-                    Write-Host "  ❌ Failed to accept plan: $_" -ForegroundColor Red
+                } catch {
+                    $errorMessage = "Exception: $_"
                 }
             }
-            Write-Host ""
+
+            # Open in editor (silent, fully detached to prevent log leaks)
+            if ($draftPath) {
+                try {
+                    # v19.11: Use cmd /c start to fully detach and suppress all output
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "cmd.exe"
+                    $psi.Arguments = "/c start `"`" `"$draftPath`""
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    [void][System.Diagnostics.Process]::Start($psi)
+                } catch { }
+            }
+
+            # Update "Next:" line in dashboard (minimal, no full refresh)
+            $width = $Host.UI.RawUI.WindowSize.Width
+            $halfWidth = [Math]::Floor($width / 2)
+            $rightWidth = $halfWidth - 4
+            $nextRow = $Global:RowDashStart + 10  # Row where "Next:" is displayed
+            $nextCmd = if ($draftPath) { "/accept-plan" } else { "/draft-plan" }
+            $nextAvail = $rightWidth - 6
+            Set-Pos $nextRow $halfWidth
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host "Next: " -NoNewline -ForegroundColor Yellow
+            Write-Host $nextCmd.PadRight($nextAvail) -NoNewline -ForegroundColor White
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+
+            Redraw-PromptRegion
+            Set-Pos ($Global:RowInput + 2) 2
+            if ($draftPath) {
+                Write-Host "Draft: $draftPath" -ForegroundColor Green -NoNewline
+            } elseif ($errorMessage) {
+                Write-Host "  $errorMessage" -ForegroundColor Red -NoNewline
+            } else {
+                Write-Host "  Draft: failed (unknown error)" -ForegroundColor Red -NoNewline
+            }
+            Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+            # v19.11: Force Read-StableInput to redraw input bar (clears any artifacts)
+            $Global:SkipNextPromptDraw = $false
+        }
+
+        "accept-plan" {
+            # v20.0: Fixed silent failure - now displays result to user
+            # v18.4: Default to latest draft when no argument provided
+            # v20.0: Pass full absolute path to avoid DOCS_DIR mismatch
+            $planPath = $cmdArgs
+            if (-not $planPath) {
+                $latestDraft = Get-LatestDraftPlan
+                if (-not $latestDraft) {
+                    Redraw-PromptRegion
+                    Set-Pos ($Global:RowInput + 2) 2
+                    Write-Host "  No draft plan found. Run /draft-plan first." -ForegroundColor Yellow
+                    Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                    break
+                }
+                # Use full path, not just filename - avoids DOCS_DIR mismatch between PS and Python
+                $planPath = $latestDraft
+            }
+
+            $response = $null
+            try {
+                # v20.0: Use raw string r'...' for Windows path to avoid backslash escape issues
+                $escapedPath = $planPath -replace "'", "''"
+                $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import accept_plan; print(accept_plan(r'$escapedPath'))" 2>&1
+                $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+                $response = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "accept_plan"
+            }
+            catch {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  Error calling accept_plan: $_" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
+
+            # v20.0: Handle response status explicitly
+            if ($response -and -not $response._parseError) {
+                $status = $response.status
+                switch ($status) {
+                    "OK" {
+                        $count = $response.created_count
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Accepted: $count task(s) created from $planPath" -ForegroundColor Green
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        return "refresh"
+                    }
+                    "BLOCKED" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  BLOCKED: $($response.message)" -ForegroundColor Red
+                        if ($response.blocking_files) {
+                            Set-Pos ($Global:RowInput + 3) 2
+                            Write-Host "  Missing: $($response.blocking_files -join ', ')" -ForegroundColor Yellow
+                        }
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    "ALREADY_ACCEPTED" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Plan already accepted ($($response.message))" -ForegroundColor Yellow
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    "ERROR" {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Error: $($response.message)" -ForegroundColor Red
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                    default {
+                        Redraw-PromptRegion
+                        Set-Pos ($Global:RowInput + 2) 2
+                        Write-Host "  Unknown response: $status" -ForegroundColor Yellow
+                        Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                        break
+                    }
+                }
+            }
+            elseif ($response -and $response._parseError) {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  Parse error: $($response._cause)" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
+            else {
+                Redraw-PromptRegion
+                Set-Pos ($Global:RowInput + 2) 2
+                Write-Host "  No response from accept_plan" -ForegroundColor Red
+                Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+                break
+            }
         }
 
         # === UNKNOWN ===
@@ -2985,7 +4023,7 @@ function Invoke-ModalRoute {
             $Global:LastRunNote = $Text
             Write-Host "  ⚙️ Steering note staged: $Text" -ForegroundColor Magenta
             Write-Host ""
-            $result = Invoke-SlashCommand -UserInput "/run"
+            $result = Invoke-SlashCommand -UserInput "/go"
             if ($result -eq "refresh") { Initialize-Screen }
         }
 
@@ -3024,8 +4062,8 @@ function Invoke-DefaultAction {
         "RUN" {
             # Default: show run status (tasks)
             Write-Host ""
-            Write-Host "  ▶ /run" -ForegroundColor Magenta
-            $result = Invoke-SlashCommand -UserInput "/run"
+            Write-Host "  ▶ /go" -ForegroundColor Magenta
+            $result = Invoke-SlashCommand -UserInput "/go"
             if ($result -eq "refresh") { Initialize-Screen }
         }
 
@@ -3068,12 +4106,22 @@ function Switch-Mode {
 # --- GLOBAL ROW CONSTANTS ---
 # v16.1.1: Layout anchoring - single source of truth for all regions
 $Global:RowHeader = 0
+feat/v17.2-lane-counts
+$Global:RowDashStart = 5  # v19.3: Header is 5 rows (border+content+blank+border) + blank = rows 0-4, dash starts at 5
+=======
 $Global:RowDashStart = 5  # Start after header (rows 0-4)
+main
 $Global:MaxDropdownRows = 5  # Keep small to avoid terminal resize
 
 # v16.1.1: Layout Contract - compute from terminal height
 # InputTopRow is the anchor; all regions derive from it
 $termHeight = $Host.UI.RawUI.WindowSize.Height
+feat/v17.2-lane-counts
+$Global:RowInput = [Math]::Floor($termHeight * 0.75)
+$Global:RowInputBottom = $Global:RowInput + 1    # Bottom border of input box
+$Global:RowHint = $Global:RowInput + 2           # Hint row below input box
+$Global:RowDropdown = $Global:RowInput + 2  # v19.11: Fixed - below bottom border, not on it
+=======
 $minSafeTop = 15           # Minimum rows for dashboard content
 $reserveBottom = 5         # Reserve for input box + dropdown
 $Global:InputTopRow = [Math]::Floor($termHeight * 0.75)
@@ -3094,6 +4142,7 @@ $Global:RowInputBottom = $Global:RowInput + 1     # Bottom border of input box
 $Global:RowHint = $Global:RowInput + 2            # Hint row below input box
 $Global:RowDropdown = $Global:RowInput + 1
 $Global:BottomRegionTop = $Global:RowInputBottom + 1  # Below input box
+main
 
 # v13.3.6: Shared left offset for input area alignment
 # Aligns input bar with "  Hint:" label (2-space indent)
@@ -3133,17 +4182,19 @@ function Get-PromptLayout {
 }
 
 # --- v13.3.5: Clear prompt region atomically ---
+# v19.9: Added $AboveFooter param to clear rows above footer (for command output area)
 function Clear-PromptRegion {
-    param([int]$ExtraRows = 0)
+    param(
+        [int]$ExtraRows = 0,
+        [int]$AboveFooter = 0  # v19.9: Extra rows to clear above footer row
+    )
     $layout = Get-PromptLayout
     $clearWidth = $layout.Width
-    # v13.3.5: Clear from footer (RowInput-2) through bottom border (RowInput+1) + dropdown
-    # Layout: footer(-2), top border(-1), input(0), bottom border(+1), dropdown(+2...)
-    $startRow = $layout.RowInput - 2
-    $totalRows = $layout.MaxVisible + 4 + $ExtraRows  # +4 for footer, borders, dropdown buffer
-    for ($i = 0; $i -lt $totalRows; $i++) {
-        $row = $startRow + $i
-        if ($row -ge 0 -and $row -lt $layout.TermHeight) {
+    # v19.9: Clear from (footer - AboveFooter) all the way to terminal bottom
+    # This ensures command output below input bar is also cleared
+    $startRow = $layout.RowInput - 2 - $AboveFooter
+    for ($row = $startRow; $row -lt $layout.TermHeight; $row++) {
+        if ($row -ge 0) {
             Set-Pos $row 0
             Write-Host (" " * $clearWidth) -NoNewline
         }
@@ -3152,18 +4203,32 @@ function Clear-PromptRegion {
 }
 
 # --- v13.3.5: Redraw prompt and footer ---
+# v19.9: Added -AboveFooter param for clearing gap rows after command output
 function Redraw-PromptRegion {
-    # v13.3.5: Redraw footer (above) + framed input bar
+    param([int]$AboveFooter = 0)
     $layout = Get-PromptLayout
     $width = $layout.Width
+feat/v17.2-lane-counts
+    # v19.9: Sync global RowInput to layout value to prevent drift
+    $Global:RowInput = $layout.RowInput
+    # v19.10: Draw first (overwrite in place), then clear below - eliminates flash
+=======
     # Clear region first
     Clear-PromptRegion
     # Draw footer (Hint: left, [MODE] right) - above input
+main
     Draw-FooterBar
-    # Draw framed input bar
-    Draw-InputBar -width $width -rowInput $layout.RowInput
+    Draw-InputBar -width $width -rowInput $Global:RowInput
+    # Clear only below input bar (hint area) to remove stale text
+    $clearStart = $Global:RowInput + 2
+    for ($row = $clearStart; $row -lt $layout.TermHeight; $row++) {
+        Set-Pos $row 0
+        Write-Host (" " * $width) -NoNewline
+    }
     # Position cursor inside frame (after "│ > ")
-    Set-Pos $layout.RowInput ($Global:InputLeft + 4)
+    Set-Pos $Global:RowInput ($Global:InputLeft + 4)
+    # v19.9: Flag to skip redundant redraw in Read-StableInput
+    $Global:SkipNextPromptDraw = $true
 }
 
 # --- v9.3 STATUS FETCHER ---
@@ -3180,6 +4245,9 @@ function Get-WorkerStatus {
         po_status_color  = "Green"
         po_next_decision = "No pending inputs"
         worker_cot       = "Idling..."
+        scheduler_pointer       = $null
+        scheduler_last_decision = $null
+        pending_by_lane         = @{}
     }
     
     # Get active tasks
@@ -3240,6 +4308,35 @@ function Get-WorkerStatus {
             $status.worker_cot = $cot
         }
     }
+
+    # Braided scheduler diagnostics (from SQLite config)
+    try {
+        $ptrRow = Invoke-Query "SELECT value FROM config WHERE key='scheduler_lane_pointer' LIMIT 1" -Silent
+        if ($ptrRow -and $ptrRow[0].value) {
+            $status.scheduler_pointer = $ptrRow[0].value | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+
+    try {
+        $decRow = Invoke-Query "SELECT value FROM config WHERE key='scheduler_last_decision' LIMIT 1" -Silent
+        if ($decRow -and $decRow[0].value) {
+            $status.scheduler_last_decision = $decRow[0].value | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+
+    # Pending counts per lane (used to explain "idle" vs "blocked" vs "rotation")
+    try {
+        $laneExpr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+        $rows = Invoke-Query "SELECT $laneExpr as lane, COUNT(*) as c FROM tasks WHERE status='pending' GROUP BY $laneExpr" -Silent
+        $map = @{}
+        foreach ($r in $rows) {
+            if ($r.lane) { $map[$r.lane] = [int]$r.c }
+        }
+        $status.pending_by_lane = $map
+    }
+    catch {}
     
     return $status
 }
@@ -3716,8 +4813,15 @@ function Build-PipelineStatus {
         }
         else {
             $planState = "RED"
-            $planHint = "No plan - run /draft-plan"
-            $planReason = "No tasks exist yet"
+            # v18.4: Show /accept-plan hint when draft exists
+            if (Test-DraftPlanExists) {
+                $planHint = "No plan - run /accept-plan"
+                $planReason = "Draft exists, needs acceptance"
+            }
+            else {
+                $planHint = "No plan - run /draft-plan"
+                $planReason = "No tasks exist yet"
+            }
         }
     }
 
@@ -3893,8 +4997,15 @@ function Build-PipelineStatus {
         }
     }
     elseif ($planState -eq "RED") {
-        $suggestedNext.command = "/draft-plan"
-        $suggestedNext.reason = "Plan=RED (no tasks)"
+        # v18.4: Check for existing draft - suggest /accept-plan instead
+        if (Test-DraftPlanExists) {
+            $suggestedNext.command = "/accept-plan"
+            $suggestedNext.reason = "Plan=RED (draft pending)"
+        }
+        else {
+            $suggestedNext.command = "/draft-plan"
+            $suggestedNext.reason = "Plan=RED (no tasks)"
+        }
     }
     elseif ($planState -eq "YELLOW") {
         $suggestedNext.command = "/refresh-plan"
@@ -3905,7 +5016,12 @@ function Build-PipelineStatus {
         $suggestedNext.reason = "Work=YELLOW (ready to start)"
     }
     elseif ($workState -eq "RED") {
-        $suggestedNext.command = "/unblock"
+        if ($firstBlockedId) {
+            $suggestedNext.command = "/reset $firstBlockedId"
+        }
+        else {
+            $suggestedNext.command = "/tasks"
+        }
         $suggestedNext.reason = "Work=RED (tasks blocked)"
     }
     elseif ($optimizeState -eq "YELLOW" -and $optimizeTaskId) {
@@ -4196,7 +5312,10 @@ function Draw-PipelinePanel {
     )
 
     $R = $StartRow
-    $RightWidth = $HalfWidth - 4  # Content width inside borders
+    # v19.3: Use same width calculation as Print-Row for odd terminal widths
+    $W = $Host.UI.RawUI.WindowSize.Width
+    $HalfRight = $W - $HalfWidth
+    $RightWidth = $HalfRight - 4  # Content width inside borders
 
     # === STATE COLOR MAP ===
     $stateColors = @{
@@ -4217,8 +5336,9 @@ function Draw-PipelinePanel {
     Set-Pos $R $HalfWidth
     Write-Host "| " -NoNewline -ForegroundColor DarkGray
     $sourceText = "Source: $($PipelineData.source)"
+    # v19.0: Hard truncate without ellipses
     if ($sourceText.Length -gt $RightWidth) {
-        $sourceText = $sourceText.Substring(0, $RightWidth - 3) + "..."
+        $sourceText = $sourceText.Substring(0, $RightWidth)
     }
     Write-Host $sourceText.PadRight($RightWidth) -NoNewline -ForegroundColor DarkGray
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
@@ -4261,9 +5381,10 @@ function Draw-PipelinePanel {
         $pipelineChars += $shortName.Length + 2
 
         # Add arrow between stages (except after last)
+        # v19.6: space-arrow-space for better readability
         if ($i -lt $stages.Count - 1) {
-            Write-Host "→" -NoNewline -ForegroundColor DarkGray
-            $pipelineChars += 1
+            Write-Host " → " -NoNewline -ForegroundColor DarkGray
+            $pipelineChars += 3
         }
     }
 
@@ -4275,7 +5396,7 @@ function Draw-PipelinePanel {
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
     $R++
 
-    # === BLANK LINE ===
+    # v19.5: Add 1 blank row before Next (Next moves down 1 row)
     Set-Pos $R $HalfWidth
     Write-Host "| " -NoNewline -ForegroundColor DarkGray
     Write-Host (" " * $RightWidth) -NoNewline
@@ -4283,18 +5404,15 @@ function Draw-PipelinePanel {
     $R++
 
     # === SUGGESTED NEXT (purely suggest, not auto-execute) ===
-    # Format: "Next: /ingest (because Context=BOOTSTRAP)"
+    # v19.0: Format: "Next: /command" (no rationale)
     Set-Pos $R $HalfWidth
     Write-Host "| " -NoNewline -ForegroundColor DarkGray
     Write-Host "Next: " -NoNewline -ForegroundColor Yellow
 
     $suggestedCmd = $PipelineData.suggested_next.command
-    $suggestedReason = $PipelineData.suggested_next.reason
 
-    if ($suggestedCmd -and $suggestedReason) {
-        $nextText = "$suggestedCmd (because $suggestedReason)"
-    }
-    elseif ($suggestedCmd) {
+    # v19.0: Just show command, no "(because ...)" rationale
+    if ($suggestedCmd) {
         $nextText = $suggestedCmd
     }
     else {
@@ -4302,10 +5420,18 @@ function Draw-PipelinePanel {
     }
 
     $nextAvail = $RightWidth - 6  # "Next: " is 6 chars
+    # v19.0: Hard truncate without ellipses
     if ($nextText.Length -gt $nextAvail) {
-        $nextText = $nextText.Substring(0, $nextAvail - 3) + "..."
+        $nextText = $nextText.Substring(0, $nextAvail)
     }
     Write-Host $nextText.PadRight($nextAvail) -NoNewline -ForegroundColor White
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
+    $R++
+
+    # v19.5: Add 1 blank row between Next and Critical (Critical moves down 2 total)
+    Set-Pos $R $HalfWidth
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * $RightWidth) -NoNewline
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
     $R++
 
@@ -4329,51 +5455,42 @@ function Draw-PipelinePanel {
     $sortedStages = $nonGreenStages | Sort-Object -Property priority
 
     if ($sortedStages.Count -gt 0) {
-        # Blank line before reasons
-        Set-Pos $R $HalfWidth
-        Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host (" " * $RightWidth) -NoNewline
-        Write-Host " |" -NoNewline -ForegroundColor DarkGray
-        $R++
-
-        # Determine header: Critical if any RED, else Attention
+        # v19.2: Merge header with first reason on single line: "Critical: (PLN) reason"
         $hasRed = ($sortedStages | Where-Object { $_.state -eq "RED" }).Count -gt 0
         $headerText = if ($hasRed) { "Critical:" } else { "Attention:" }
         $headerColor = if ($hasRed) { "Red" } else { "Yellow" }
 
-        Set-Pos $R $HalfWidth
-        Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host $headerText.PadRight($RightWidth) -NoNewline -ForegroundColor $headerColor
-        Write-Host " |" -NoNewline -ForegroundColor DarkGray
-        $R++
+        # v19.4: Single Critical line only (no second line)
+        $rs = $sortedStages | Select-Object -First 1
+        if ($rs) {
+            # v19.4: Use switch for robust abbreviation (avoids ContainsKey issues)
+            $stageName = if ($rs.name) { $rs.name.Trim() } else { "" }
+            $abbrev = switch ($stageName) {
+                "Context"  { "CTX" }
+                "Plan"     { "PLN" }
+                "Work"     { "WRK" }
+                "Optimize" { "OPT" }
+                "Verify"   { "VER" }
+                "Ship"     { "SHP" }
+                default    { if ($stageName.Length -ge 3) { $stageName.Substring(0,3).ToUpper() } else { "UNK" } }
+            }
 
-        # Show up to 2 reason lines (worst-first)
-        $reasonsToShow = $sortedStages | Select-Object -First 2
-        # Stage name abbreviations
-        $stageAbbrev = @{
-            "Context"  = "CTX"
-            "Plan"     = "PLN"
-            "Work"     = "WRK"
-            "Optimize" = "OPT"
-            "Verify"   = "VER"
-            "Ship"     = "SHP"
-        }
-
-        foreach ($rs in $reasonsToShow) {
-            Set-Pos $R $HalfWidth
-            Write-Host "| " -NoNewline -ForegroundColor DarkGray
-
-            $abbrev = if ($stageAbbrev.ContainsKey($rs.name)) { $stageAbbrev[$rs.name] } else { $rs.name.Substring(0,3).ToUpper() }
-            $reasonLine = "($abbrev) $($rs.reason)"
+            $reasonText = if ($rs.reason) { $rs.reason } else { "Status unknown" }
+            $combinedLine = "$headerText ($abbrev) $reasonText"
             $lineColor = if ($rs.state -eq "RED") { "Red" } else { "Yellow" }
 
-            if ($reasonLine.Length -gt $RightWidth) {
-                $reasonLine = $reasonLine.Substring(0, $RightWidth - 3) + "..."
+            # v19.0: Hard truncate without ellipses
+            if ($combinedLine.Length -gt $RightWidth) {
+                $combinedLine = $combinedLine.Substring(0, $RightWidth)
             }
-            Write-Host $reasonLine.PadRight($RightWidth) -NoNewline -ForegroundColor $lineColor
+
+            Set-Pos $R $HalfWidth
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host $combinedLine.PadRight($RightWidth) -NoNewline -ForegroundColor $lineColor
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
             $R++
         }
+
     }
 
     # === BLANK LINE ===
@@ -4397,8 +5514,9 @@ function Draw-PipelinePanel {
         }
 
         $hotkeyAvail = $RightWidth - 9  # "Hotkeys: " is 9 chars
+        # v19.0: Hard truncate without ellipses
         if ($hotkeyStr.Length -gt $hotkeyAvail) {
-            $hotkeyStr = $hotkeyStr.Substring(0, $hotkeyAvail - 3) + "..."
+            $hotkeyStr = $hotkeyStr.Substring(0, $hotkeyAvail)
         }
         Write-Host $hotkeyStr.PadRight($hotkeyAvail) -NoNewline -ForegroundColor Cyan
         Write-Host " |" -NoNewline -ForegroundColor DarkGray
@@ -4409,6 +5527,7 @@ function Draw-PipelinePanel {
 }
 
 # --- PRINT ROW WITH ABSOLUTE POSITIONING ---
+# v19.1: Handles odd terminal widths - right panel may be 1 char wider
 function Print-Row {
     param(
         [int]$Row,
@@ -4418,35 +5537,47 @@ function Print-Row {
         [string]$ColorL = "White",
         [string]$ColorR = "White"
     )
-    
-    $ContentWidth = $HalfWidth - 4
-    
-    # Truncate if needed
-    if ($LeftTxt.Length -gt $ContentWidth) { $LeftTxt = $LeftTxt.Substring(0, $ContentWidth - 3) + "..." }
-    if ($RightTxt.Length -gt $ContentWidth) { $RightTxt = $RightTxt.Substring(0, $ContentWidth - 3) + "..." }
-    
+
+    # v19.1: Calculate right panel width to fill full terminal width
+    $W = $Host.UI.RawUI.WindowSize.Width
+    $HalfRight = $W - $HalfWidth
+    $ContentWidthL = $HalfWidth - 4
+    $ContentWidthR = $HalfRight - 4
+
+    # Truncate if needed (no ellipses per v19.0 rule)
+    if ($LeftTxt.Length -gt $ContentWidthL) { $LeftTxt = $LeftTxt.Substring(0, $ContentWidthL) }
+    if ($RightTxt.Length -gt $ContentWidthR) { $RightTxt = $RightTxt.Substring(0, $ContentWidthR) }
+
     # Draw Left Box at column 0
     Set-Pos $Row 0
     Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    Write-Host $LeftTxt.PadRight($ContentWidth) -NoNewline -ForegroundColor $ColorL
+    Write-Host $LeftTxt.PadRight($ContentWidthL) -NoNewline -ForegroundColor $ColorL
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
-    
+
     # Draw Right Box at column HalfWidth
     Set-Pos $Row $HalfWidth
     Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    Write-Host $RightTxt.PadRight($ContentWidth) -NoNewline -ForegroundColor $ColorR
+    Write-Host $RightTxt.PadRight($ContentWidthR) -NoNewline -ForegroundColor $ColorR
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
 }
 
 # --- DRAW BORDER LINE ---
+# v19.1: Handles odd terminal widths
 function Draw-Border {
     param([int]$Row, [int]$HalfWidth)
 
+feat/v17.2-lane-counts
+    $W = $Host.UI.RawUI.WindowSize.Width
+    $HalfRight = $W - $HalfWidth
+    $lineL = "-" * ($HalfWidth - 2)
+    $lineR = "-" * ($HalfRight - 2)
+=======
     $line = "-" * ($HalfWidth - 2)
+main
     Set-Pos $Row 0
-    Write-Host "+$line+" -NoNewline -ForegroundColor DarkGray
+    Write-Host "+$lineL+" -NoNewline -ForegroundColor DarkGray
     Set-Pos $Row $HalfWidth
-    Write-Host "+$line+" -NoNewline -ForegroundColor DarkGray
+    Write-Host "+$lineR+" -NoNewline -ForegroundColor DarkGray
 }
 
 # --- v16.1.1: LEFT-ONLY PANEL RENDERER (doesn't touch right panel) ---
@@ -4608,6 +5739,60 @@ function Get-StreamStatusLine {
                 $result.SummaryColor = "DarkGray"
             }
 
+            # v20.0: Explain IDLE (no tasks vs deps-blocked vs rotation wait)
+            if ($result.State -eq "IDLE") {
+                $pending = 0
+                try {
+                    if ($WorkerData.pending_by_lane -and $WorkerData.pending_by_lane.ContainsKey("backend")) {
+                        $pending = [int]$WorkerData.pending_by_lane["backend"]
+                    }
+                }
+                catch {}
+
+                if ($pending -gt 0) {
+                    $blocked = $null
+                    try {
+                        $bl = $WorkerData.scheduler_last_decision.blocked_lanes
+                        if ($bl -and ($bl.PSObject.Properties.Name -contains "backend")) {
+                            $blocked = $bl.backend
+                        }
+                    }
+                    catch {}
+
+                    if ($blocked) {
+                        $reason = $blocked.blocked_reason
+                        $ex = $null
+                        try { if ($blocked.unknown_tokens -and $blocked.unknown_tokens.Count -gt 0) { $ex = $blocked.unknown_tokens[0] } } catch {}
+                        $result.State = "BLOCKED"
+                        $result.Bar = "■□□□□"
+                        $result.BarColor = "Red"
+                        $result.SummaryColor = "Red"
+                        $result.Summary = if ($ex) { "deps ($reason) e.g. $ex" } else { "deps ($reason)" }
+                    }
+                    else {
+                        $ptrLane = $null
+                        try { $ptrLane = $WorkerData.scheduler_pointer.lane } catch { $ptrLane = $null }
+                        if ($ptrLane -and $ptrLane -ne "backend") {
+                            $result.State = "WAIT"
+                            $result.Bar = "■■□□□"
+                            $result.BarColor = "Cyan"
+                            $result.SummaryColor = "Cyan"
+                            $result.Summary = "pending ($pending), ptr:$ptrLane"
+                        }
+                        else {
+                            $result.State = "READY"
+                            $result.Bar = "■■■■□"
+                            $result.BarColor = "Green"
+                            $result.SummaryColor = "Green"
+                            $result.Summary = "pending ($pending)"
+                        }
+                    }
+                }
+                else {
+                    $result.Summary = "no tasks"
+                }
+            }
+
             # Format task summary: "[T-123] desc" -> "desc (T-123)"
             if ($task -and $task -ne "(none)" -and $result.State -eq "RUNNING") {
                 if ($task -match "^\[([^\]]+)\]\s*(.*)$") {
@@ -4655,6 +5840,60 @@ function Get-StreamStatusLine {
                 $result.Bar = "□□□□□"
                 $result.BarColor = "DarkGray"
                 $result.SummaryColor = "DarkGray"
+            }
+
+            # v20.0: Explain IDLE (no tasks vs deps-blocked vs rotation wait)
+            if ($result.State -eq "IDLE") {
+                $pending = 0
+                try {
+                    if ($WorkerData.pending_by_lane -and $WorkerData.pending_by_lane.ContainsKey("frontend")) {
+                        $pending = [int]$WorkerData.pending_by_lane["frontend"]
+                    }
+                }
+                catch {}
+
+                if ($pending -gt 0) {
+                    $blocked = $null
+                    try {
+                        $bl = $WorkerData.scheduler_last_decision.blocked_lanes
+                        if ($bl -and ($bl.PSObject.Properties.Name -contains "frontend")) {
+                            $blocked = $bl.frontend
+                        }
+                    }
+                    catch {}
+
+                    if ($blocked) {
+                        $reason = $blocked.blocked_reason
+                        $ex = $null
+                        try { if ($blocked.unknown_tokens -and $blocked.unknown_tokens.Count -gt 0) { $ex = $blocked.unknown_tokens[0] } } catch {}
+                        $result.State = "BLOCKED"
+                        $result.Bar = "■□□□□"
+                        $result.BarColor = "Red"
+                        $result.SummaryColor = "Red"
+                        $result.Summary = if ($ex) { "deps ($reason) e.g. $ex" } else { "deps ($reason)" }
+                    }
+                    else {
+                        $ptrLane = $null
+                        try { $ptrLane = $WorkerData.scheduler_pointer.lane } catch { $ptrLane = $null }
+                        if ($ptrLane -and $ptrLane -ne "frontend") {
+                            $result.State = "WAIT"
+                            $result.Bar = "■■□□□"
+                            $result.BarColor = "Cyan"
+                            $result.SummaryColor = "Cyan"
+                            $result.Summary = "pending ($pending), ptr:$ptrLane"
+                        }
+                        else {
+                            $result.State = "READY"
+                            $result.Bar = "■■■■□"
+                            $result.BarColor = "Green"
+                            $result.SummaryColor = "Green"
+                            $result.Summary = "pending ($pending)"
+                        }
+                    }
+                }
+                else {
+                    $result.Summary = "no tasks"
+                }
             }
 
             # Format task summary: "[T-123] desc" -> "desc (T-123)"
@@ -5279,9 +6518,9 @@ LIMIT 30
                     # Content varies: INBOX shows meaningful_lines, others show score
                     $content = if ($docName -eq "INBOX") {
                         $ml = if ($fileData -and $null -ne $fileData.meaningful_lines) { [int]$fileData.meaningful_lines } else { 0 }
-                        "INBOX.md - $ml pending (last: $mtimeStr)"
+                        "INBOX.md - $ml pending"
                     } else {
-                        "$docName.md - $score% [$state] (last: $mtimeStr)"
+                        "$docName.md - $score% [$state]"
                     }
 
                     $data += @{
@@ -5733,9 +6972,14 @@ function Invoke-HistoryHotkey {
 
                     if ($cmd -and $cmd.StartsWith("/refresh-plan")) {
                         try {
-                            $result = python -c "from mesh_server import refresh_plan_preview; print(refresh_plan_preview())" 2>&1
-                            $plan = ($result -join "`n") | ConvertFrom-Json -ErrorAction SilentlyContinue
-                            if ($plan -and $plan.status -eq "FRESH") {
+                            $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import refresh_plan_preview; print(refresh_plan_preview())" 2>&1
+                            $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+                            $plan = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "refresh_plan"
+                            if ($plan._parseError) {
+                                $hint = if ($plan._cause) { "Plan: $($plan._cause)" } else { "Plan: refresh failed (see last_refresh_plan_raw.txt)" }
+                                Set-HistoryHint -Text $hint -Color "Yellow"
+                            }
+                            elseif ($plan -and $plan.status -eq "FRESH") {
                                 Set-HistoryHint -Text "Plan: refreshed" -Color "Green"
                             }
                             elseif ($plan -and $plan.reason) {
@@ -5751,9 +6995,14 @@ function Invoke-HistoryHotkey {
                     }
                     elseif ($cmd -and $cmd.StartsWith("/draft-plan")) {
                         try {
-                            $result = python -c "from mesh_server import draft_plan; print(draft_plan())" 2>&1
-                            $resp = ($result -join "`n") | ConvertFrom-Json -ErrorAction SilentlyContinue
-                            if ($resp -and $resp.status -eq "OK" -and $resp.path) {
+                            $rawResult = python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from mesh_server import draft_plan; print(draft_plan())" 2>&1
+                            $rawString = if ($rawResult -is [array]) { $rawResult -join "`n" } else { [string]$rawResult }
+                            $resp = ConvertFrom-SafeJson -RawOutput $rawString -CommandName "draft_plan"
+                            if ($resp._parseError) {
+                                $hint = if ($resp._cause) { "Draft: $($resp._cause)" } else { "Draft plan: failed (see last_draft_plan_raw.txt)" }
+                                Set-HistoryHint -Text $hint -Color "Yellow"
+                            }
+                            elseif ($resp -and $resp.status -eq "OK" -and $resp.path) {
                                 $leaf = Split-Path $resp.path -Leaf
                                 Set-HistoryHint -Text "Draft plan: $leaf (edit then /accept-plan)" -Color "Green"
                             }
@@ -5841,15 +7090,26 @@ function Draw-HistoryScreen {
     $R++
 
     # Build tab indicator: TASKS | DOCS | SHIP with current highlighted
-    $tabTasks = if ($Global:HistorySubview -eq "TASKS") { "[TASKS]" } else { " TASKS " }
-    $tabDocs = if ($Global:HistorySubview -eq "DOCS") { "[DOCS]" } else { " DOCS " }
-    $tabShip = if ($Global:HistorySubview -eq "SHIP") { "[SHIP]" } else { " SHIP " }
-    $tabLine = "$tabTasks | $tabDocs | $tabShip"
+    # Selected tab rendered separately with different color
+    $ContentWidthL = $Half - 4
+    $ContentWidthR = $W - $Half - 4
 
-    $leftHeader = "HISTORY VIEW (F2/Esc to exit)"
-    $rightHeader = "Tab: $tabLine"
+    # Left panel: "HISTORY VIEW" + "(F2/Esc to exit)" right-aligned, less bright
+    $leftLabel = "HISTORY VIEW"
+    $leftHint = "(F2/Esc to exit)"
+    $padL = $ContentWidthL - $leftLabel.Length - $leftHint.Length
+    Set-Pos $R 0
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host $leftLabel -NoNewline -ForegroundColor Cyan
+    if ($padL -gt 0) { Write-Host (" " * $padL) -NoNewline }
+    Write-Host $leftHint -NoNewline -ForegroundColor DarkGray
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
 
-    Print-Row $R $leftHeader $rightHeader $Half "Cyan" "Yellow"
+    # Right panel: empty (tabs moved to footer)
+    Set-Pos $R $Half
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+    Write-Host (" " * $ContentWidthR) -NoNewline
+    Write-Host " |" -NoNewline -ForegroundColor DarkGray
     $R++
 
     Draw-Border $R $Half
@@ -5860,8 +7120,8 @@ function Draw-HistoryScreen {
     $colHealth = 8
     $colContent = $Half - $colWorker - $colHealth - 6
 
-    $headerLeft = "  " + "WORKER".PadRight($colWorker) + "CONTENT".PadRight($colContent) + "HEALTH"
-    Print-Row $R $headerLeft "" $Half "DarkCyan" "DarkGray"
+    $headerLeft = " " + "WORKER".PadRight($colWorker) + "CONTENT".PadRight($colContent) + "HEALTH"
+    Print-Row $R $headerLeft "PIPELINE" $Half "DarkCyan" "Cyan"
     $R++
 
     # --- DATA ROWS (Left Panel) ---
@@ -5968,9 +7228,7 @@ function Draw-HistoryScreen {
     $rightLines = @()
     $rightColors = @()
 
-    $rightLines += "PIPELINE"
-    $rightColors += "Cyan"
-
+    # PIPELINE is now in header row, so start with Next:
     $rightLines += "Next: $nextCmd"
     $rightColors += $nextColor
 
@@ -5986,8 +7244,8 @@ function Draw-HistoryScreen {
         $state = if ($s.state) { $s.state } else { "GRAY" }
         $hint = if ($s.hint) { $s.hint } else { "" }
 
-        $label = $name.ToUpperInvariant().PadRight(8)
-        $line = "$label [$state] $hint"
+        # Mark as pipeline stage for special rendering: PSTAGE|name|state|hint
+        $line = "PSTAGE|$name|$state|$hint"
         $rightLines += $line
         $rightColors += $(if ($stateColors.ContainsKey($state)) { $stateColors[$state] } else { "DarkGray" })
     }
@@ -6116,23 +7374,54 @@ function Draw-HistoryScreen {
         # Right panel: pipeline/next step/hint (stable, no scroll growth)
         $rt = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { "" }
         $rc = if ($i -lt $rightColors.Count) { $rightColors[$i] } else { "DarkGray" }
-        if ($rt.Length -gt $RightWidth) {
-            $rt = $rt.Substring(0, $RightWidth - 3) + "..."
-        }
 
         Set-Pos $R $Half
         Write-Host "| " -NoNewline -ForegroundColor DarkGray
-        Write-Host $rt.PadRight($RightWidth) -NoNewline -ForegroundColor $rc
+
+        # Special rendering for pipeline stage lines: PSTAGE|name|state|hint
+        if ($rt.StartsWith("PSTAGE|")) {
+            $parts = $rt.Split("|")
+            $pName = $parts[1].ToUpperInvariant()
+            $pState = $parts[2]
+            $pHint = if ($parts.Count -gt 3) { $parts[3] } else { "" }
+
+            # State circle mapping
+            $circle = switch ($pState) {
+                "GREEN"  { "●" }
+                "YELLOW" { "●" }
+                "RED"    { "●" }
+                default  { "○" }
+            }
+            $circleColor = switch ($pState) {
+                "GREEN"  { "Green" }
+                "YELLOW" { "Yellow" }
+                "RED"    { "Red" }
+                default  { "DarkGray" }
+            }
+
+            # Format: "  NAME  ●  hint words" with 2 spaces between
+            Write-Host "  " -NoNewline
+            Write-Host $pName.PadRight(8) -NoNewline -ForegroundColor White
+            Write-Host "  " -NoNewline
+            Write-Host $circle -NoNewline -ForegroundColor $circleColor
+            Write-Host "  " -NoNewline
+            Write-Host $pHint -NoNewline -ForegroundColor White
+
+            # Pad remainder
+            $usedLen = 2 + 8 + 2 + 1 + 2 + $pHint.Length
+            $padLen = $RightWidth - $usedLen
+            if ($padLen -gt 0) { Write-Host (" " * $padLen) -NoNewline }
+        }
+        else {
+            if ($rt.Length -gt $RightWidth) {
+                $rt = $rt.Substring(0, $RightWidth - 3) + "..."
+            }
+            Write-Host $rt.PadRight($RightWidth) -NoNewline -ForegroundColor $rc
+        }
         Write-Host " |" -NoNewline -ForegroundColor DarkGray
 
         $R++
     }
-
-    # Bottom Border
-    Set-Pos $R 0
-    Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
-    Set-Pos $R $Half
-    Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
 }
 #endregion HISTORY_MODE
 
@@ -6141,46 +7430,35 @@ function Draw-Dashboard {
     # 1. Fetch Data
     $Data = Get-WorkerStatus
 
+    # v18.2: UNIFIED INIT DETECTION - Separate initialization state from readiness state
+    # Contract:
+    #   - InitState (Test-RepoInitialized): Determines UI shell (PRE_INIT vs EXECUTION panels)
+    #   - ReadinessState (readiness.py): Determines strategic command locking within EXECUTION
+    #
+    # UI Mode Rule:
+    #   If InitState.initialized == false: Show PRE_INIT onboarding ("First time here? /init")
+    #   If InitState.initialized == true:  Show EXECUTION shell (pipelines visible)
+    #     - If readiness.status == BOOTSTRAP: Strategic LOCKED + "Next: fill PRD/SPEC..."
+    #     - If readiness.status == EXECUTION: Strategic unlocked
+
+    $initStatus = Test-RepoInitialized
+    $IsInitialized = $initStatus.initialized
+
     # v14.1: Get context readiness (fast, lightweight script)
-    # Use explicit path from $RepoRoot and pass project directory for correct file resolution
     $Readiness = $null
-    $IsBootstrap = $true  # v14.1: Fail-safe to BOOTSTRAP (not EXECUTION) on fresh projects
-    $IsPreInit = $false   # v14.1: NEW - Uninitialized state (before /init)
+    $IsStrategicLocked = $true  # v18.2: Renamed from $IsBootstrap - controls command locking, not panel display
     try {
         $readinessScript = Join-Path $RepoRoot "tools\readiness.py"
         # Pass $CurrentDir as argument so readiness checks the right project
         $readinessJson = python "$readinessScript" "$CurrentDir" 2>&1
         $Readiness = $readinessJson | ConvertFrom-Json -ErrorAction SilentlyContinue
         if ($Readiness) {
-            $IsBootstrap = ($Readiness.status -eq "BOOTSTRAP")
-
-            # v14.1: Detect PRE_INIT - ALL golden docs missing
-            $allMissing = $true
-            foreach ($docName in @("PRD", "SPEC", "DECISION_LOG")) {
-                $fileData = $Readiness.files.$docName
-                if ($fileData -and $fileData.exists) {
-                    $allMissing = $false
-                    break
-                }
-            }
-            $IsPreInit = $allMissing
-        }
-        else {
-            # Parse failed - check files directly for PRE_INIT detection
-            $IsBootstrap = $true
-            $prdPath = Join-Path $CurrentDir "docs\PRD.md"
-            $specPath = Join-Path $CurrentDir "docs\SPEC.md"
-            $decPath = Join-Path $CurrentDir "docs\DECISION_LOG.md"
-            $IsPreInit = (-not (Test-Path $prdPath)) -and (-not (Test-Path $specPath)) -and (-not (Test-Path $decPath))
+            $IsStrategicLocked = ($Readiness.status -eq "BOOTSTRAP")
         }
     }
     catch {
-        # v14.1: Fail-safe - check files directly
-        $IsBootstrap = $true
-        $prdPath = Join-Path $CurrentDir "docs\PRD.md"
-        $specPath = Join-Path $CurrentDir "docs\SPEC.md"
-        $decPath = Join-Path $CurrentDir "docs\DECISION_LOG.md"
-        $IsPreInit = (-not (Test-Path $prdPath)) -and (-not (Test-Path $specPath)) -and (-not (Test-Path $decPath))
+        # Fail-safe: assume strategic locked if readiness check fails
+        $IsStrategicLocked = $true
     }
 
     # Get decisions
@@ -6191,12 +7469,29 @@ function Draw-Dashboard {
         Where-Object { $_ -match "^\|.*\|" -and $_ -notmatch "^[\|\-\s]+$" -and $_ -notmatch "ID\s*\|" } |
         Select-Object -Last 2
     }
+feat/v17.2-lane-counts
+    
+    # Get audit logs
+    $LogFile = Join-Path (Get-Location) "logs\mesh.log"
+    $AuditLog = @()
+    if (Test-Path $LogFile) {
+        $AuditLog = Get-Content $LogFile -ErrorAction SilentlyContinue | Select-Object -Last 2
+    }
+    
+    # 2. Dimensions - SINGLE SOURCE OF TRUTH for panel widths
+    # v19.1: All rendering helpers MUST use these shared values
+    # Handle odd widths: left panel = Half, right panel = W - Half (may be +1 larger)
+=======
 
     # v16.1.1: Audit logs now loaded inline in LIVE AUDIT LOG section (uses TopRegionBottom anchor)
 
     # 2. Dimensions
+main
     $W = $Host.UI.RawUI.WindowSize.Width
-    $Half = [Math]::Floor($W / 2)
+    $Half = [Math]::Floor($W / 2)              # Left panel width
+    $HalfRight = $W - $Half                     # Right panel width (may be +1 for odd $W)
+    $ContentWidth = $Half - 4                   # Content area: "| " (2) + content + " |" (2)
+    $ContentWidthRight = $HalfRight - 4         # Right panel content width
     $R = $Global:RowDashStart
     
     # v9.6: Get Mode and Days to Milestone for header
@@ -6249,6 +7544,16 @@ function Draw-Dashboard {
     }
     catch {}
     
+feat/v17.2-lane-counts
+
+    # v18.1: Removed redundant dashboard header (EXEC [VIBE] [CORE:])
+    # Single source of truth: Show-Header now provides unified project status
+    # v18.2: CONDITIONAL RENDERING based on INIT STATE (not readiness)
+    # - InitState determines which panel to show (PRE_INIT vs EXECUTION)
+    # - ReadinessState determines strategic command locking within EXECUTION
+    if (-not $IsInitialized) {
+        # === PRE_INIT: Not initialized yet, show setup instructions ===
+=======
     # --- BORDERS & HEADERS ---
     Set-Pos $R 0; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
     Set-Pos $R $Half; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
@@ -6270,6 +7575,7 @@ function Draw-Dashboard {
         # v16.1.1: Clear region first to prevent artifacts
         Clear-DashboardRegion -StartRow $R -HalfWidth $Half
 
+main
         $R = Draw-PreInitPanel -StartRow $R -HalfWidth $Half -WorkerData $Data
 
         # v16.1.1: Fill to TopRegionBottom
@@ -6278,6 +7584,8 @@ function Draw-Dashboard {
             $R++
         }
     }
+feat/v17.2-lane-counts
+=======
     elseif ($IsBootstrap) {
         # === BOOTSTRAP MODE: Show readiness panel (docs exist but incomplete) ===
         # v16.1.1: Clear region first to prevent artifacts
@@ -6291,57 +7599,57 @@ function Draw-Dashboard {
             $R++
         }
     }
+main
     else {
+        # === EXECUTION MODE: Always show pipelines once initialized ===
+        # (Strategic commands may be locked based on $IsStrategicLocked)
         # === EXECUTION MODE: Show compact stream dashboard (v16.0) ===
 
+feat/v17.2-lane-counts
+        # --- v19.1: COMPACT STREAM LINES (Left Panel) - Always show all 4 lanes ---
+=======
         # v16.1.1: Clear dashboard region first to prevent artifacts from previous frames
         Clear-DashboardRegion -StartRow $R -HalfWidth $Half
 
         # --- v16.0: COMPACT STREAM LINES (Left Panel) ---
+main
         # Get stream status for all 4 streams
         $BE_Status = Get-StreamStatusLine -StreamName "BACKEND" -WorkerData $Data
         $FE_Status = Get-StreamStatusLine -StreamName "FRONTEND" -WorkerData $Data
         $QA_Status = Get-StreamStatusLine -StreamName "QA" -WorkerData $Data
         $LIB_Status = Get-StreamStatusLine -StreamName "LIBRARIAN" -WorkerData $Data
 
-        # Calculate widths for compact stream line
-        $ContentWidth = $Half - 4
-        $StreamCol = 10   # "BACKEND  " etc
-        $BarCol = 6       # "■■■■■ "
-        $StateCol = 8     # "RUNNING "
-        $SummaryCol = $ContentWidth - $StreamCol - $BarCol - $StateCol - 3  # remaining for " | summary"
+        # v19.1: Always show all 4 streams (BACKEND, FRONTEND above QA/AUDIT, LIBRARIAN)
+        $allStreams = @(
+            @{ Name = "BACKEND"; Status = $BE_Status },
+            @{ Name = "FRONTEND"; Status = $FE_Status },
+            @{ Name = "QA/AUDIT"; Status = $QA_Status },
+            @{ Name = "LIBRARIAN"; Status = $LIB_Status }
+        )
 
-        # --- v16.0: Helper to draw compact stream line ---
-        function Draw-StreamLine {
+        # v19.0: $Half and $ContentWidth are defined at function start (single source of truth)
+        # Stream line layout: | <name:10> <bar:6> <state:8> | <summary:remaining> |
+        $summaryMaxLen = $ContentWidth - 10 - 6 - 8 - 2  # Derived from shared $ContentWidth
+
+        # --- v19.1: Helper to draw compact stream line (left panel only) ---
+        # Uses $Half and $ContentWidth from parent scope (single source of truth)
+        function Draw-StreamLineLeft {
             param(
                 [int]$Row,
                 [string]$StreamName,
-                [hashtable]$Status,
-                [int]$Half
+                [hashtable]$Status
             )
-
-            $ContentWidth = $Half - 4
-
-            # Left panel: Stream line
             Set-Pos $Row 0
             Write-Host "| " -NoNewline -ForegroundColor DarkGray
-
-            # Stream name (padded to 10 chars)
             Write-Host $StreamName.PadRight(10) -NoNewline -ForegroundColor White
-
-            # Microbar (5 chars + space)
             Write-Host "$($Status.Bar) " -NoNewline -ForegroundColor $Status.BarColor
-
-            # State (padded to 8 chars)
             Write-Host $Status.State.PadRight(8) -NoNewline -ForegroundColor $Status.BarColor
-
-            # Separator and summary
             Write-Host "| " -NoNewline -ForegroundColor DarkGray
-
-            # Summary (fill remaining space)
-            $summaryMaxLen = $ContentWidth - 10 - 6 - 8 - 2
             $summary = $Status.Summary
             if ($summary.Length -gt $summaryMaxLen) {
+feat/v17.2-lane-counts
+                $summary = $summary.Substring(0, $summaryMaxLen)
+=======
                 # v16.1.3: Truncate at word boundary to avoid partial words like "fi..."
                 $truncLen = $summaryMaxLen - 1  # Leave room for ellipsis
                 $truncated = $summary.Substring(0, $truncLen)
@@ -6352,12 +7660,74 @@ function Draw-Dashboard {
                     $truncated = $truncated.Substring(0, $lastSpace)
                 }
                 $summary = $truncated.TrimEnd() + "…"
+main
             }
             Write-Host $summary.PadRight($summaryMaxLen) -NoNewline -ForegroundColor $Status.SummaryColor
-
             Write-Host " |" -NoNewline -ForegroundColor DarkGray
         }
 
+        # --- v19.1: Helper to draw right panel line (uses $Half, $ContentWidthRight for odd widths) ---
+        function Draw-RightPanelLine {
+            param([int]$Row, [string]$Text, [string]$Color = "DarkGray")
+            Set-Pos $Row $Half
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            if ($Text.Length -gt $ContentWidthRight) { $Text = $Text.Substring(0, $ContentWidthRight) }
+            Write-Host $Text.PadRight($ContentWidthRight) -NoNewline -ForegroundColor $Color
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        }
+
+feat/v17.2-lane-counts
+        # --- v19.1: Render all 4 lanes (left panel) ---
+        $hasDelegation = $Global:StartupDelegation -and $Global:StartupDelegation.status -eq "READY"
+
+        # v19.3: Blank row before lanes (shift lanes down by 1)
+        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+        $R++
+
+        for ($i = 0; $i -lt $allStreams.Count; $i++) {
+            $stream = $allStreams[$i]
+            Draw-StreamLineLeft -Row $R -StreamName $stream.Name -Status $stream.Status
+            # Right panel content based on row index
+            if ($i -eq 0) {
+                $nextFocusTxt = if ($hasDelegation) { "NEXT FOCUS: CONTENT" }
+                                elseif ($IsStrategicLocked) { "STRATEGIC LOCKED" }
+                                else { "Context Ready" }
+                $nextFocusColor = if ($hasDelegation) { "Cyan" } elseif ($IsStrategicLocked) { "Red" } else { "Green" }
+                Draw-RightPanelLine -Row $R -Text $nextFocusTxt -Color $nextFocusColor
+            }
+            elseif ($i -eq 1) {
+                # v19.7: Format decision with full category name (SEC -> Security)
+                # Pass raw line WITH pipes - Format-DecisionForDisplay splits by | to extract columns
+                $rawDecision = if ($Decisions.Count -ge 1) { $Decisions[-1] } else { "" }
+                $D1 = Format-DecisionForDisplay -RawLine $rawDecision
+                if ($D1.Length -gt $ContentWidth) { $D1 = $D1.Substring(0, $ContentWidth) }
+                Draw-RightPanelLine -Row $R -Text $D1 -Color "DarkGray"
+            }
+            else {
+                Draw-RightPanelLine -Row $R -Text "" -Color "DarkGray"
+            }
+            $R++
+        }
+
+        # v19.4: INBOX down 2 rows + PIPELINE up 1 row
+        # Save row for PIPELINE start (starts here on right, while left has blank rows)
+        $pipelineStartRow = $R
+
+        # Build PIPELINE data first (needed for both display and snapshot)
+        $pipelineData = Build-PipelineStatus
+        Write-PipelineSnapshotIfNeeded -PipelineData $pipelineData
+
+        # v19.4: Draw 2 blank rows on LEFT side only (PIPELINE starts on right at same rows)
+        for ($blankIdx = 0; $blankIdx -lt 2; $blankIdx++) {
+            Set-Pos $R 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host (" " * $ContentWidth) -NoNewline
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+            $R++
+        }
+
+        # --- v15.1: INBOX indicator (left side only) ---
+=======
         # v16.1.4: Render right panel with context status aligned to BACKEND row
         # First line at same Y as BACKEND, then pipeline content centered below
         $RightWidth = $Half - 4  # Content width inside borders
@@ -6507,6 +7877,7 @@ function Draw-Dashboard {
         $R++
 
         # --- v15.1: INBOX indicator (left panel only) ---
+main
         $inboxPath = Join-Path $CurrentDir "docs\INBOX.md"
         $inboxStatus = "—"
         $inboxColor = "DarkGray"
@@ -6535,6 +7906,85 @@ function Draw-Dashboard {
                 $inboxStatus = "empty"
             }
         }
+feat/v17.2-lane-counts
+        # Draw INBOX on left side only
+        $inboxTxt = "INBOX [$inboxStatus]"
+        if ($inboxTxt.Length -gt $ContentWidth) { $inboxTxt = $inboxTxt.Substring(0, $ContentWidth) }
+        Set-Pos $R 0
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $inboxTxt.PadRight($ContentWidth) -NoNewline -ForegroundColor $inboxColor
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+
+        # v19.6: 2 blank rows after INBOX (left side only, with borders)
+        for ($blankIdx = 0; $blankIdx -lt 2; $blankIdx++) {
+            Set-Pos $R 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host (" " * $ContentWidth) -NoNewline
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+            $R++
+        }
+
+        # v20.0: LAST SCHEDULER DECISION (left side only)
+        Set-Pos $R 0
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host "SCHEDULER".PadRight($ContentWidth) -NoNewline -ForegroundColor Yellow
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+
+        # v20.0: Scheduler content (fall back to audit log if scheduler hasn't run yet)
+        $L1 = "  (no scheduler data)"
+        $L1Color = "DarkGray"
+        try {
+            $dec = $Data.scheduler_last_decision
+            if ($dec) {
+                $picked = $dec.picked_id
+                $lane = $dec.lane
+                $reason = $dec.reason
+
+                $ptr = $null
+                try { $ptr = $dec.pointer_next_index } catch { $ptr = $null }
+                if ($null -eq $ptr) { try { $ptr = $dec.pointer_index } catch { $ptr = $null } }
+                if ($null -eq $ptr -and $Data.scheduler_pointer) { try { $ptr = $Data.scheduler_pointer.index } catch { $ptr = $null } }
+
+                $pickedTxt = if ($null -ne $picked) { "$picked" } else { "—" }
+                $laneTxt = if ($lane) { "$lane" } else { "—" }
+                $reasonTxt = if ($reason) { "$reason" } else { "—" }
+                $ptrTxt = if ($null -ne $ptr) { "$ptr" } else { "—" }
+
+                $L1 = "  picked=$pickedTxt lane=$laneTxt reason=$reasonTxt ptr=$ptrTxt"
+                $L1Color = switch ($reasonTxt) {
+                    "urgent" { "Red" }
+                    "high" { "Yellow" }
+                    "rotation" { "Cyan" }
+                    "no_work" { "DarkYellow" }
+                    default { "DarkGray" }
+                }
+            }
+            elseif ($AuditLog.Count -ge 1) {
+                $L1 = "  " + $AuditLog[-1]
+            }
+        }
+        catch {}
+
+        if ($L1.Length -gt $ContentWidth) { $L1 = $L1.Substring(0, $ContentWidth) }
+        Set-Pos $R 0
+        Write-Host "| " -NoNewline -ForegroundColor DarkGray
+        Write-Host $L1.PadRight($ContentWidth) -NoNewline -ForegroundColor $L1Color
+        Write-Host " |" -NoNewline -ForegroundColor DarkGray
+        $R++
+
+        # === v15.5: PIPELINE PANEL (right side) - starts at pipelineStartRow ===
+        $pipelineEndRow = Draw-PipelinePanel -StartRow $pipelineStartRow -HalfWidth $Half -PipelineData $pipelineData
+
+        # v19.6: Fill left panel with blank rows (with borders) until we catch up to pipeline end
+        while ($R -lt $pipelineEndRow) {
+            Set-Pos $R 0
+            Write-Host "| " -NoNewline -ForegroundColor DarkGray
+            Write-Host (" " * $ContentWidth) -NoNewline
+            Write-Host " |" -NoNewline -ForegroundColor DarkGray
+            $R++
+=======
         Print-LeftOnly -Row $R -Text "INBOX     [$inboxStatus]" -HalfWidth $Half -Color $inboxColor
         $R++
 
@@ -6604,56 +8054,68 @@ function Draw-Dashboard {
                 Print-LeftOnly -Row $R -Text "" -HalfWidth $Half -Color "DarkGray"
                 $R++
             }
+main
         }
 
     }  # End of EXECUTION mode conditional
 
+feat/v17.2-lane-counts
+    # Fill remaining rows to reach input bar (v13.1: extend grid to bottom)
+    # v19.5: RowInput - 2 to leave 1 row gap before input bar (prevents border overlap)
+    $BottomRow = $Global:RowInput - 2
+    while ($R -lt $BottomRow) {
+        Print-Row $R "" "" $Half "DarkGray" "DarkGray"
+        $R++
+    }
+
+=======
     # Bottom Border at TopRegionBottom (just above footer row)
     Set-Pos $R 0; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
     Set-Pos $R $Half; Write-Host ("+" + ("-" * ($Half - 2)) + "+") -NoNewline -ForegroundColor DarkGray
+main
 }
 
 # --- HELPER: Prints Row with a Hint on the Right Side ---
 function Print-Row-With-Hint($Row, $LeftTxt, $RightTxt, $HalfWidth, $ColorL, $ColorR, $Hint) {
     $ContentWidth = $HalfWidth - 4
-    
-    # Draw Left
+
+    # Draw Left (v19.0: hard truncate, no ellipses)
     Set-Pos $Row 0; Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    if ($LeftTxt.Length -gt $ContentWidth) { $LeftTxt = $LeftTxt.Substring(0, $ContentWidth - 3) + "..." }
+    if ($LeftTxt.Length -gt $ContentWidth) { $LeftTxt = $LeftTxt.Substring(0, $ContentWidth) }
     Write-Host $LeftTxt.PadRight($ContentWidth) -NoNewline -ForegroundColor $ColorL
     Write-Host " | | " -NoNewline -ForegroundColor DarkGray
-    
+
     # Draw Right + Hint
     Set-Pos $Row $HalfWidth; Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    
-    # Calc space for Right Text
+
+    # Calc space for Right Text (v19.0: hard truncate, no ellipses)
     $Available = $ContentWidth - $Hint.Length - 1
-    if ($RightTxt.Length -gt $Available) { $RightTxt = $RightTxt.Substring(0, $Available - 3) + "..." }
-    
+    if ($RightTxt.Length -gt $Available) { $RightTxt = $RightTxt.Substring(0, $Available) }
+
     Write-Host $RightTxt -NoNewline -ForegroundColor $ColorR
     Write-Host (" $Hint").PadRight($ContentWidth - $RightTxt.Length) -NoNewline -ForegroundColor Magenta
-    
+
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
 }
 
 # --- HELPER: Prints Row with a Hint on the Left Side ---
 function Print-Row-With-Hint-Left($Row, $LeftTxt, $RightTxt, $HalfWidth, $ColorL, $ColorR, $Hint) {
     $ContentWidth = $HalfWidth - 4
-    
-    # Draw Left + Hint
+
+    # Draw Left + Hint (v19.0: hard truncate, no ellipses)
     Set-Pos $Row 0; Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    
+
     $Available = $ContentWidth - $Hint.Length - 1
-    if ($LeftTxt.Length -gt $Available) { $LeftTxt = $LeftTxt.Substring(0, $Available - 3) + "..." }
-    
+    if ($LeftTxt.Length -gt $Available) { $LeftTxt = $LeftTxt.Substring(0, $Available) }
+
     Write-Host $LeftTxt -NoNewline -ForegroundColor $ColorL
     Write-Host (" $Hint").PadRight($ContentWidth - $LeftTxt.Length) -NoNewline -ForegroundColor Magenta
-    
+
     Write-Host " | | " -NoNewline -ForegroundColor DarkGray
-    
-    # Draw Right
+
+    # Draw Right (v19.0: hard truncate, no ellipses)
     Set-Pos $Row $HalfWidth; Write-Host "| " -NoNewline -ForegroundColor DarkGray
-    if ($RightTxt.Length -gt $ContentWidth) { $RightTxt = $RightTxt.Substring(0, $ContentWidth - 3) + "..." }
+    if ($RightTxt.Length -gt $ContentWidth) { $RightTxt = $RightTxt.Substring(0, $ContentWidth) }
     Write-Host $RightTxt.PadRight($ContentWidth) -NoNewline -ForegroundColor $ColorR
     Write-Host " |" -NoNewline -ForegroundColor DarkGray
 }
@@ -6661,8 +8123,11 @@ function Print-Row-With-Hint-Left($Row, $LeftTxt, $RightTxt, $HalfWidth, $ColorL
 # --- CLEAR DROPDOWN ZONE ---
 function Clear-DropdownZone {
     $width = $Host.UI.RawUI.WindowSize.Width
+    # v19.11: Guard - ensure we never clear the border row
+    $borderRow = $Global:RowInput + 1
+    $startRow = [Math]::Max($Global:RowDropdown, $borderRow + 1)
     for ($i = 0; $i -lt $Global:MaxDropdownRows + 2; $i++) {
-        Set-Pos ($Global:RowDropdown + $i) 0
+        Set-Pos ($startRow + $i) 0
         Write-Host (" " * $width) -NoNewline
     }
     # Restore cursor to input row (at left edge of input frame)
@@ -6678,7 +8143,14 @@ function Draw-Dropdown {
     )
     
     if ($Commands.Count -eq 0) { return }
-    
+
+    # v19.11: Guard - never draw on input bar border row (RowInput + 1)
+    $borderRow = $Global:RowInput + 1
+    if ($Global:RowDropdown -le $borderRow) {
+        # Safety: force dropdown below border if misconfigured
+        $Global:RowDropdown = $borderRow + 1
+    }
+
     $windowWidth = $Host.UI.RawUI.WindowSize.Width
     $midPoint = [Math]::Floor($windowWidth / 2)
     $colWidth = $midPoint - 1
@@ -6781,6 +8253,12 @@ function Draw-InputBar {
     $boxWidth = $width - $left - 1  # width of box from InputLeft to right edge
     $innerWidth = $boxWidth - 2      # space between left and right borders
 
+    # v19.11: Clear columns 0-1 on all three rows to prevent stale artifacts
+    $leftPad = " " * $left
+    Set-Pos $topRow 0; Write-Host $leftPad -NoNewline
+    Set-Pos $rowInput 0; Write-Host $leftPad -NoNewline
+    Set-Pos $bottomRow 0; Write-Host $leftPad -NoNewline
+
     # Top border: ┌───────────┐
     Set-Pos $topRow $left
     Write-Host ("┌" + ("─" * $innerWidth) + "┐") -NoNewline -ForegroundColor DarkGray
@@ -6814,14 +8292,31 @@ function Clear-InputContent {
     Set-Pos $rowInput ($left + 4)
 }
 
+feat/v17.2-lane-counts
+# --- v19.1: Editor-Style Footer Bar (hint left of [MODE]) ---
+# Clean single-line footer: hint text immediately left of [MODE] badge
+# v19.9: Added optional $rowInput param to allow consistent positioning with layout
+=======
 # --- v16.1.4: Editor-Style Footer Bar (Hint: left, [MODE] right) ---
 # Clean coding-CLI style: "Hint: <suggestion>" on left (dim), [MODE] on right
 # Pipeline "Next:" is the only true next action (in COGNITIVE panel)
+main
 function Draw-FooterBar {
-    $footerRow = $Global:RowInput - 2
-    $microHintRow = $Global:RowInput - 3
+    param([int]$rowInput = 0)
+    # v19.9: Use provided rowInput or fall back to global
+    $baseRow = if ($rowInput -gt 0) { $rowInput } else { $Global:RowInput }
+    $footerRow = $baseRow - 2
     $width = $Host.UI.RawUI.WindowSize.Width
 
+feat/v17.2-lane-counts
+    # Clear row above footer (v19.8: remove 4 border | chars from dashboard)
+    Set-Pos ($footerRow - 1) 0
+    Write-Host (" " * $width) -NoNewline
+
+    # Clear footer line (v19.8: clear full width to remove any border artifacts)
+    Set-Pos $footerRow 0
+    Write-Host (" " * $width) -NoNewline
+=======
     # Clear lines
     Set-Pos $microHintRow 0
     Write-Host (" " * ($width - 1)) -NoNewline
@@ -6842,8 +8337,9 @@ function Draw-FooterBar {
     Set-Pos $footerRow 0
     Write-Host "  Hint: " -NoNewline -ForegroundColor DarkGray
     Write-Host $hintText -NoNewline -ForegroundColor DarkGray
+main
 
-    # Mode badge (right-aligned)
+    # Mode badge colors
     $modeColors = @{
         "OPS"  = "Cyan"
         "PLAN" = "Yellow"
@@ -6852,6 +8348,8 @@ function Draw-FooterBar {
     }
     $modeLabel = "[$($Global:CurrentMode)]"
     $modeColor = $modeColors[$Global:CurrentMode]
+feat/v17.2-lane-counts
+=======
 
     # v16.1.2: Minimal mode hint positioned left of [MODE] tag (dark grey)
     $modeHints = @{
@@ -6869,10 +8367,66 @@ function Draw-FooterBar {
     Set-Pos $footerRow $col
     Write-Host $modeHint -NoNewline -ForegroundColor DarkGray
     Write-Host $modeLabel -NoNewline -ForegroundColor $modeColor
+main
 
-    # SANDBOX UX: Router debug overlay
+    # v19.1: Hint text placed immediately left of [MODE]
+    # In history mode, show tabs instead of hint
+    if ($Global:HistoryMode) {
+        # Calculate position for tabs - right-aligned to middle of screen
+        $Half = [Math]::Floor($width / 2)
+        $tabStr = "Tab: [TASKS] |  DOCS  |  SHIP "
+        $tabCol = $Half - $tabStr.Length
+        if ($tabCol -lt 0) { $tabCol = 0 }
+
+        Set-Pos $footerRow $tabCol
+        Write-Host "Tab: " -NoNewline -ForegroundColor DarkGray
+        if ($Global:HistorySubview -eq "TASKS") {
+            Write-Host "[TASKS]" -NoNewline -ForegroundColor Cyan
+        } else {
+            Write-Host " TASKS " -NoNewline -ForegroundColor DarkGray
+        }
+        Write-Host " | " -NoNewline -ForegroundColor DarkGray
+        if ($Global:HistorySubview -eq "DOCS") {
+            Write-Host "[DOCS]" -NoNewline -ForegroundColor Cyan
+        } else {
+            Write-Host " DOCS " -NoNewline -ForegroundColor DarkGray
+        }
+        Write-Host " | " -NoNewline -ForegroundColor DarkGray
+        if ($Global:HistorySubview -eq "SHIP") {
+            Write-Host "[SHIP]" -NoNewline -ForegroundColor Cyan
+        } else {
+            Write-Host " SHIP " -NoNewline -ForegroundColor DarkGray
+        }
+
+        # Mode badge on far right
+        $col = $width - $modeLabel.Length
+        if ($col -lt 2) { $col = 2 }
+        Set-Pos $footerRow $col
+        Write-Host $modeLabel -NoNewline -ForegroundColor $modeColor
+    } else {
+        $hintText = switch ($Global:CurrentMode) {
+            "OPS"  { "ask 'health', 'drift', or type /ops" }
+            "PLAN" { "describe what you want to build" }
+            "RUN"  { "give feedback or press Enter" }
+            "SHIP" { "/ship --confirm to release" }
+            default { "" }
+        }
+
+        # Calculate positions: hint ... [MODE] flush to right edge
+        # v19.8: Remove -1 gap so content extends to last column (no pip artifact)
+        $rightSection = "$hintText $modeLabel"
+        $col = $width - $rightSection.Length
+        if ($col -lt 2) { $col = 2 }
+
+        Set-Pos $footerRow $col
+        Write-Host $hintText -NoNewline -ForegroundColor DarkGray
+        Write-Host " " -NoNewline
+        Write-Host $modeLabel -NoNewline -ForegroundColor $modeColor
+    }
+
+    # SANDBOX UX: Router debug overlay (optional)
     if ($Global:RouterDebug -and $Global:LastRoutedCommand) {
-        $debugRow = $Global:RowInput - 4
+        $debugRow = $Global:RowInput - 3
         Set-Pos $debugRow 0
         Write-Host (" " * ($width - 1)) -NoNewline
         Set-Pos $debugRow 2
@@ -7364,14 +8918,21 @@ function Read-StableInput {
     $maxInputLen = $innerWidth - 3    # max text length (innerWidth minus " > ")
     $cursorStart = $left + 4          # after "│ > "
 
-    # v13.3.5: Draw footer first (above input)
-    Draw-FooterBar
+    # v19.9: Skip draw if Redraw-PromptRegion just drew (prevents drift)
+    if ($Global:SkipNextPromptDraw) {
+        $Global:SkipNextPromptDraw = $false
+        # v19.11: Still need to position cursor even when skipping draw
+        Set-Pos $Global:RowInput $cursorStart
+    } else {
+        # v13.3.5: Draw footer first (above input)
+        Draw-FooterBar
 
-    # Draw the framed input bar
-    Draw-InputBar -width $width -rowInput $Global:RowInput
+        # Draw the framed input bar
+        Draw-InputBar -width $width -rowInput $Global:RowInput
 
-    # Return cursor to input line (inside frame, after "│ > ")
-    Set-Pos $Global:RowInput $cursorStart
+        # Return cursor to input line (inside frame, after "│ > ")
+        Set-Pos $Global:RowInput $cursorStart
+    }
 
     $buffer = ""
     $cursorCol = $cursorStart
@@ -7830,6 +9391,9 @@ function Read-StableInput {
         if ($buffer.Length -eq 0 -and $char -eq '/') {
             Write-Host "/" -NoNewline -ForegroundColor Yellow
             $pickerResult = Show-CommandPicker
+            # v19.11: Always redraw input bar after picker to clear any stale artifacts
+            Draw-InputBar -width $width -rowInput $Global:RowInput
+            Set-Pos $Global:RowInput $cursorStart
             if ($pickerResult.Kind -eq "select") {
                 return $pickerResult.Command
             }
@@ -8055,7 +9619,7 @@ function Show-CommandPicker {
 
     # Draw dropdown (below the bottom border)
     function DrawPickerDropdown {
-        $cmdList = Get-PickerCommands -Filter $script:pickerFilter
+        [array]$cmdList = Get-PickerCommands -Filter $script:pickerFilter
 
         # Update input line content (inside the frame): │ > /filter │
         # Clear and redraw the middle of the frame
@@ -8118,12 +9682,12 @@ function Show-CommandPicker {
         return $cmdList
     }
 
-    $filteredCmds = @(DrawPickerDropdown)
+    [array]$filteredCmds = DrawPickerDropdown
 
     while ($true) {
         # v15.4.1: AllowCtrlC lets us intercept Ctrl+C instead of immediate termination
         $keyPress = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown,AllowCtrlC")
-        $filteredCmds = @(Get-PickerCommands -Filter $script:pickerFilter)
+        [array]$filteredCmds = Get-PickerCommands -Filter $script:pickerFilter
 
         # v15.4.1: Auto-clear Ctrl+C warning after 2 seconds
         if ($Global:CtrlCWarningShownUtc) {
@@ -8279,38 +9843,147 @@ function Show-CommandPicker {
 }
 
 # ============================================================================
+# v18.1: UNIFIED INIT DETECTION
+# ============================================================================
+
+# B1: Single source of truth for initialization detection
+# Returns object: @{ initialized = $bool; reason = "..."; details = "..." }
+# Contract - returns initialized=TRUE if ANY of:
+#   - Marker file exists: control/state/.mesh_initialized (preferred)
+#   - Project in registry: config/projects.json
+#   - 2-of-3 golden docs: docs/PRD.md, docs/SPEC.md, docs/DECISION_LOG.md
+#   - Legacy layout: docs/_mesh/ACTIVE_SPEC.md
+# Used by: /init guard, footer hint, autocomplete priority
+function Test-RepoInitialized {
+    param([string]$Path = $CurrentDir)
+
+    # Tier A (preferred): Explicit marker file (created by /init)
+    $markerPath = Join-Path $Path "control\state\.mesh_initialized"
+    if (Test-Path $markerPath) {
+        return @{
+            initialized = $true
+            reason = "marker_file"
+            details = "Found: $markerPath"
+        }
+    }
+
+    # Tier B: Check projects.json registry
+    $projectsFile = Join-Path $RepoRoot "config\projects.json"
+    if (Test-Path $projectsFile) {
+        try {
+            $projects = Get-Content $projectsFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $normalizedPath = $Path.TrimEnd('\', '/')
+            $match = $projects | Where-Object {
+                $_.path -and $_.path.TrimEnd('\', '/') -eq $normalizedPath
+            }
+            if ($match) {
+                return @{
+                    initialized = $true
+                    reason = "projects_registry"
+                    details = "Project ID: $($match.id), Profile: $($match.profile)"
+                }
+            }
+        }
+        catch {
+            # JSON parse error - fall through to Tier C
+        }
+    }
+
+    # Tier C: Check golden docs presence (2 of 3 required - prevents false positives from partial scaffolds)
+    $goldenDocs = @("docs\PRD.md", "docs\SPEC.md", "docs\DECISION_LOG.md")
+    $found = @()
+    foreach ($doc in $goldenDocs) {
+        $docPath = Join-Path $Path $doc
+        if (Test-Path $docPath) { $found += $doc }
+    }
+    if ($found.Count -ge 2) {
+        return @{
+            initialized = $true
+            reason = "golden_docs"
+            details = "Found $($found.Count)/3: $($found -join ', ')"
+        }
+    }
+
+    # Tier D: Legacy layout (old projects with docs/_mesh/ACTIVE_SPEC.md)
+    $legacySpecPath = Join-Path $Path "docs\_mesh\ACTIVE_SPEC.md"
+    if (Test-Path $legacySpecPath) {
+        return @{
+            initialized = $true
+            reason = "legacy_layout"
+            details = "Found: docs/_mesh/ACTIVE_SPEC.md"
+        }
+    }
+
+    return @{
+        initialized = $false
+        reason = "none"
+        details = "No marker, no registry entry, only $($found.Count)/3 golden docs, no legacy layout"
+    }
+}
+
+# B1: Check if a draft plan exists in docs/PLANS/
+# Returns the path to the most recent draft, or $null if none exists
+# v20.0: Use $RepoRoot instead of $CurrentDir for consistency with mesh_server.py
+function Get-LatestDraftPlan {
+    # Use $RepoRoot (script directory) - same as mesh_server.py's BASE_DIR
+    $baseDir = if ($RepoRoot) { $RepoRoot } else { $CurrentDir }
+    $plansDir = Join-Path $baseDir "docs\PLANS"
+    if (-not (Test-Path $plansDir)) {
+        return $null
+    }
+    $draft = Get-ChildItem $plansDir -Filter "draft_*.md" -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending |
+             Select-Object -First 1
+    if ($draft) {
+        return $draft.FullName
+    }
+    return $null
+}
+
+# B1: Simple boolean check for draft existence
+function Test-DraftPlanExists {
+    return $null -ne (Get-LatestDraftPlan)
+}
+
+# ============================================================================
 # v13.3.1: SCENARIO HINT (action-based, not tech explanation)
 # ============================================================================
 
 function Get-SystemScenario {
     # Detect current system state for scenario-based hints
+    # B1: Use Test-RepoInitialized as single source of truth for "fresh" detection
+    # v18.1: Added draft-aware scenarios for better flow guidance
     try {
+        $initStatus = Test-RepoInitialized
         $stats = Get-TaskStats
         $hasTasks = ($stats.pending -gt 0 -or $stats.in_progress -gt 0 -or $stats.completed -gt 0)
-
-        # Check for sources/domain rules
-        $hasSources = (Test-Path (Join-Path $CurrentDir "docs\DOMAIN_RULES.md")) -or
-        (Test-Path (Join-Path $CurrentDir "control\sources"))
+        $hasDraft = Test-DraftPlanExists
 
         # Check librarian status
         $workerStatus = Get-WorkerStatus
         $isMessy = $workerStatus.lib_status_text -match "MESSY|CLUTTERED"
 
-        if (-not $hasSources -and -not $hasTasks) {
-            return "fresh"      # Brand new project
+        if (-not $initStatus.initialized) {
+            return "fresh"              # Brand new project (not initialized)
+        }
+        elseif (-not $hasTasks -and $hasDraft) {
+            return "ready_for_accept"   # v18.1: Initialized, draft exists, need to accept
+        }
+        elseif (-not $hasTasks) {
+            return "ready_for_draft"    # v18.1: Initialized, no draft, no tasks
         }
         elseif ($isMessy) {
-            return "messy"      # Needs cleanup
+            return "messy"              # Needs cleanup
         }
         elseif ($stats.pending -gt 0) {
-            return "pending"    # Has work to do
+            return "pending"            # Has work to do
         }
         else {
-            return "normal"     # Standard state
+            return "execution"          # v18.1: In execution mode with tasks
         }
     }
     catch {
-        return "normal"
+        return "execution"
     }
 }
 
@@ -8438,6 +10111,88 @@ function Initialize-CtrlCHandler {
     if ($Global:CtrlCArmed) { return }
     $Global:CtrlCArmed = $true
     [Console]::TreatControlCAsInput = $true
+}
+
+# ============================================================================
+# TEST HELPERS (v19.8)
+# ============================================================================
+# These functions support automated testing without requiring interactive mode.
+
+<#
+.SYNOPSIS
+    Returns the dashboard bottom border line as a string for testing.
+.DESCRIPTION
+    v19.8: Renders the bottom border text that would appear on the dashboard
+    without ANSI positioning. Used by regression tests to verify no trailing
+    '+' artifact appears at the right edge.
+.PARAMETER TerminalWidth
+    Simulated terminal width (default: 120)
+.EXAMPLE
+    $line = Get-DashboardBottomBorderForTest -TerminalWidth 120
+    if ($line -match '\+\s*$') { throw "Trailing + found!" }
+#>
+function Get-DashboardBottomBorderForTest {
+    param([int]$TerminalWidth = 120)
+
+    $Half = [Math]::Floor($TerminalWidth / 2)
+    $HalfRight = $TerminalWidth - $Half
+
+    # Match the actual border rendering from Draw-Dashboard (v19.8)
+    # Right panel omits last char (footer bar owns that row)
+    $leftBorder = "+" + ("-" * ($Half - 2)) + "+"
+    $rightBorder = "+" + ("-" * ($HalfRight - 1))  # v19.8: no trailing char, footer owns it
+
+    return $leftBorder + $rightBorder
+}
+
+<#
+.SYNOPSIS
+    Returns the footer line content as a string for testing.
+.DESCRIPTION
+    v19.8: Renders the footer line text (hint + [MODE] badge) that would appear
+    on the footer row. Used by regression tests to verify:
+    - No trailing '|' pip artifact at the right edge
+    - Content extends to the last column (no gap)
+.PARAMETER TerminalWidth
+    Simulated terminal width (default: 120)
+.PARAMETER Mode
+    Current mode: OPS, PLAN, RUN, SHIP (default: OPS)
+.EXAMPLE
+    $line = Get-FooterLineForTest -TerminalWidth 120 -Mode "OPS"
+    if ($line -match '\|\s*$') { throw "Trailing | pip found!" }
+#>
+function Get-FooterLineForTest {
+    param(
+        [int]$TerminalWidth = 120,
+        [string]$Mode = "OPS"
+    )
+
+    # Match the actual footer rendering from Draw-FooterBar (v19.8)
+    $modeLabel = "[$Mode]"
+    $hintText = switch ($Mode) {
+        "OPS"  { "ask 'health', 'drift', or type /ops" }
+        "PLAN" { "describe what you want to build" }
+        "RUN"  { "give feedback or press Enter" }
+        "SHIP" { "/ship --confirm to release" }
+        default { "" }
+    }
+
+    $rightSection = "$hintText $modeLabel"
+    # v19.8: No -1 gap, content extends to last column
+    $col = $TerminalWidth - $rightSection.Length
+    if ($col -lt 2) { $col = 2 }
+
+    # Build the full line: spaces + hint + space + [MODE]
+    $line = (" " * $col) + $rightSection
+
+    # Ensure line is exactly terminal width (padded or truncated)
+    if ($line.Length -lt $TerminalWidth) {
+        $line = $line.PadRight($TerminalWidth)
+    } elseif ($line.Length -gt $TerminalWidth) {
+        $line = $line.Substring(0, $TerminalWidth)
+    }
+
+    return $line
 }
 
 # ============================================================================
@@ -8592,16 +10347,8 @@ while ($true) {
 
     # Slash commands (explicit)
     if ($userInput.StartsWith("/")) {
-        $parts = $userInput.TrimStart("/").Split(" ", 2)
-        $cmdName = $parts[0].ToLower()
-
-        if ($Global:Commands.Contains($cmdName)) {
-            $result = Invoke-SlashCommand -UserInput $userInput
-            if ($result -eq "refresh") { Initialize-Screen }
-        }
-        else {
-            Write-Host "  Unknown command: /$cmdName" -ForegroundColor Yellow
-        }
+        $result = Invoke-SlashCommand -UserInput $userInput
+        if ($result -eq "refresh") { Initialize-Screen }
     }
     else {
         # v13.2: Plain text → modal routing (no backend calls)

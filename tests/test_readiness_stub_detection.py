@@ -348,5 +348,303 @@ class TestBackwardCompatibility(unittest.TestCase):
                           "Non-stub files should use normal scoring")
 
 
+class TestFlexibleHeaderDetection(unittest.TestCase):
+    """v18.2: Tests for flexible header matching without ## prefix"""
+
+    def setUp(self):
+        """Create temporary docs directory for testing"""
+        self.test_dir = tempfile.mkdtemp()
+        self.docs_dir = Path(self.test_dir) / "docs"
+        self.docs_dir.mkdir()
+        self.original_dir = os.getcwd()
+        os.chdir(self.test_dir)
+
+    def tearDown(self):
+        """Clean up temporary directory"""
+        os.chdir(self.original_dir)
+        shutil.rmtree(self.test_dir)
+
+    def test_header_regex_compiles_correctly(self):
+        """Ensure header regex patterns compile without f-string brace errors.
+
+        This test guards against regressions where {1,6} in the regex
+        is accidentally interpreted as an f-string format specifier.
+        If the braces aren't escaped as {{1,6}}, the regex will be malformed.
+        """
+        import re
+
+        # Simulate the pattern construction from readiness.py
+        header_texts = ["Goals", "User Stories", "Success Metrics", "Data Model", "API", "Security", "Records"]
+
+        for header_text in header_texts:
+            # This is the exact pattern from readiness.py
+            pattern = rf'^(?:#{{1,6}}\s+)?{re.escape(header_text)}(?:[\s:]*$|\s*\()'
+
+            # Verify pattern compiles
+            try:
+                compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+            except re.error as e:
+                self.fail(f"Regex failed to compile for header '{header_text}': {e}")
+
+            # Verify {1,6} is in the pattern (not interpreted as f-string)
+            self.assertIn("{1,6}", pattern,
+                         f"Pattern should contain literal {{1,6}} for header '{header_text}'")
+
+            # Verify it matches markdown headers
+            self.assertIsNotNone(compiled.search(f"## {header_text}"),
+                                f"Pattern should match '## {header_text}'")
+
+    def test_false_positive_sentence_not_matched_as_header(self):
+        """Sentences starting with header words should NOT be detected as headers.
+
+        Ensures 'Goals are important' doesn't count as the 'Goals' header.
+        This guards against overly permissive regex matching.
+        """
+        # PRD where header words appear mid-sentence (NOT as headers)
+        prd_with_false_positives = """# Product Requirements Document
+
+This document describes our goals and objectives for the project.
+Goals are important because they guide our development process.
+User stories help us understand what features to build next.
+Success metrics will be tracked throughout the project lifecycle.
+
+## Goals
+- Build a task manager
+- Support 100 users
+- Achieve 99% uptime
+
+## User Stories
+- As a user, I can create tasks
+- As a user, I can delete tasks
+
+## Success Metrics
+- 95% satisfaction
+- < 1s load time
+"""
+
+        (self.docs_dir / "PRD.md").write_text(prd_with_false_positives)
+        (self.docs_dir / "SPEC.md").write_text("## Data Model\n- E1\n## API\n- E2\n## Security\n- E3")
+        (self.docs_dir / "DECISION_LOG.md").write_text("## Records\n| ID |\n")
+
+        result = get_context_readiness(base_dir=self.test_dir)
+
+        # PRD should find exactly 3 headers (the actual ## headers, not the sentences)
+        # "Goals are important" at line start should NOT match as "Goals" header
+        self.assertEqual(result["files"]["PRD"]["headers"], 3,
+                        "Should only match actual headers, not sentences starting with header words")
+
+    def test_headers_without_hash_prefix(self):
+        """Headers without ## prefix should still be detected"""
+        # PRD with plain text headers (no ## prefix) - like LLM-generated docs
+        prd_plain_headers = """Product Requirements Document: Test App
+
+Goals
+Build a task management application for teams to collaborate effectively.
+Enable real-time synchronization across multiple devices and browsers.
+Provide drag-and-drop interface for organizing tasks and workflows.
+Support team sizes from 5 to 100 members with access controls.
+Ensure enterprise-grade security with data encryption at rest.
+Achieve sub-second response times for all user interactions.
+
+User Stories
+[ ] As a team lead, I can create projects and assign team members.
+[ ] As a developer, I can track my tasks and update their status.
+[ ] As a manager, I can generate reports on team productivity.
+[ ] As an admin, I can configure SSO and manage user permissions.
+[ ] As a team member, I can receive notifications for assignments.
+[ ] As a stakeholder, I can view project progress dashboards.
+
+Success Metrics
+[ ] Achieve 95% user satisfaction score in quarterly surveys.
+[ ] Maintain average API response time under 300 milliseconds.
+[ ] Support 10000 concurrent users without performance issues.
+"""
+
+        # SPEC with plain text headers and enough content to pass thresholds
+        spec_plain_headers = """Technical Specification: Test App
+
+Data Model
+- User entity stores authentication credentials and profile information.
+- Project entity contains tasks, members, and workflow configuration.
+- Task entity tracks assignments, status, comments, and attachments.
+- All entities use UUID primary keys for distributed systems.
+- Implement soft deletes for audit trail and data recovery.
+- Use PostgreSQL for relational data and Redis for caching.
+- Add indexes on frequently queried columns for performance.
+
+API
+- RESTful API using JSON for all request and response payloads.
+- JWT-based authentication with refresh token rotation support.
+- Rate limiting at 1000 requests per minute per user account.
+- GraphQL endpoint for complex queries and subscriptions.
+- WebSocket connections for live updates and notifications.
+- All endpoints require HTTPS and validate CSRF tokens.
+- Versioned API paths for backward compatibility support.
+
+Security
+- Implement OAuth2 for third-party integrations and SSO.
+- Encrypt sensitive data at rest using AES-256 encryption.
+- Use prepared statements to prevent SQL injection attacks.
+- Sanitize all user input and implement CSP headers.
+- Regular penetration testing and vulnerability scanning.
+- Role-based access control with principle of least privilege.
+- Audit logging for all sensitive operations and data access.
+"""
+
+        # DECISION_LOG with proper content (>150 words to reach threshold)
+        decision_log = """# Decision Log: Test App
+
+## Records
+
+This document tracks all architectural and technical decisions made during the project.
+Each decision includes context, rationale, and status to ensure traceability.
+Decisions are append-only and should never be deleted, only superseded if needed.
+The team reviews decisions weekly to ensure alignment with project goals.
+All stakeholders should be notified when major decisions are made.
+
+| ID | Date | Type | Decision | Rationale | Status |
+|----|------|------|----------|-----------|--------|
+| 001 | 2025-01-01 | ARCH | Use PostgreSQL database | ACID compliance needed for data integrity | ✅ |
+| 002 | 2025-01-02 | API | Implement JWT authentication | Industry standard for API security model | ✅ |
+| 003 | 2025-01-03 | DATA | Use UUID primary keys | Better for distributed systems | ✅ |
+| 004 | 2025-01-04 | SEC | Implement RBAC | Required for enterprise compliance | ✅ |
+| 005 | 2025-01-05 | PERF | Add Redis caching | Reduce database load for read operations | ✅ |
+
+Additional decisions will be documented here as the project evolves.
+Each decision should include clear rationale and be reviewed by technical leads.
+Superseded decisions should be marked with appropriate status indicators.
+"""
+
+        (self.docs_dir / "PRD.md").write_text(prd_plain_headers)
+        (self.docs_dir / "SPEC.md").write_text(spec_plain_headers)
+        (self.docs_dir / "DECISION_LOG.md").write_text(decision_log)
+
+        result = get_context_readiness(base_dir=self.test_dir)
+
+        # Assert: Headers should be found despite missing ## prefix
+        self.assertEqual(result["files"]["PRD"]["headers"], 3,
+                        "PRD should detect 3 headers without ## prefix")
+        self.assertEqual(result["files"]["SPEC"]["headers"], 3,
+                        "SPEC should detect 3 headers without ## prefix")
+
+        # Assert: All files should pass their thresholds
+        self.assertGreaterEqual(result["files"]["PRD"]["score"], 80,
+                               "PRD should meet threshold")
+        self.assertGreaterEqual(result["files"]["SPEC"]["score"], 80,
+                               "SPEC should meet threshold")
+        self.assertGreaterEqual(result["files"]["DECISION_LOG"]["score"], 30,
+                               "DECISION_LOG should meet threshold")
+
+        # Assert: Should reach EXECUTION status
+        self.assertEqual(result["status"], "EXECUTION",
+                        "Plain headers should enable EXECUTION mode")
+
+    def test_headers_with_trailing_text(self):
+        """Headers with parenthetical suffixes (e.g., 'API (Internal Interfaces)') should match"""
+        # Note: Only parenthetical suffixes are allowed, not arbitrary trailing words
+        # "Security (Considerations)" matches, "Security Considerations" does not
+        spec_with_trailing = """Technical Specification: Test App
+
+Data Model (Core Entities)
+User entity stores authentication credentials and profile info.
+Project entity contains tasks, members, and workflow config.
+Task entity tracks assignments, status, and attachments.
+All entities use UUID primary keys for distributed systems.
+Implement soft deletes for audit trail and data recovery.
+Use PostgreSQL for relational data and Redis for caching.
+
+API (Internal Interfaces)
+RESTful API using JSON for all request and response payloads.
+JWT-based authentication with refresh token rotation.
+Rate limiting at 1000 requests per minute per user.
+GraphQL endpoint for complex queries and subscriptions.
+WebSocket connections for live updates and notifications.
+All endpoints require HTTPS and validate CSRF tokens.
+
+Security (Best Practices)
+Implement OAuth2 for third-party integrations and SSO.
+Encrypt sensitive data at rest using AES-256 encryption.
+Use prepared statements to prevent SQL injection attacks.
+Sanitize all user input and implement CSP headers.
+Regular penetration testing and vulnerability scanning.
+Role-based access control with principle of least privilege.
+"""
+
+        (self.docs_dir / "SPEC.md").write_text(spec_with_trailing)
+        # Create minimal PRD and DECISION_LOG
+        (self.docs_dir / "PRD.md").write_text("## Goals\nGoal 1\n## User Stories\nStory 1\n## Success Metrics\nMetric 1")
+        (self.docs_dir / "DECISION_LOG.md").write_text("## Records\n| ID | Date |\n")
+
+        result = get_context_readiness(base_dir=self.test_dir)
+
+        # Assert: SPEC should find all 3 headers (parenthetical suffixes allowed)
+        self.assertEqual(result["files"]["SPEC"]["headers"], 3,
+                        "SPEC should detect headers with parenthetical suffixes")
+
+    def test_standalone_checkboxes_counted_as_bullets(self):
+        """Standalone checkboxes [ ] should be counted as bullet points"""
+        prd_with_standalone_checkboxes = """# Product Requirements Document
+
+## Goals
+[ ] Goal 1: Build a task management application for teams.
+[ ] Goal 2: Enable real-time synchronization across devices.
+[ ] Goal 3: Provide drag-and-drop interface for tasks.
+[ ] Goal 4: Support team sizes from 5 to 100 members.
+[ ] Goal 5: Ensure enterprise-grade security with encryption.
+[ ] Goal 6: Achieve sub-second response times for users.
+
+## User Stories
+[ ] US1: As a team lead, I can create projects.
+[ ] US2: As a developer, I can track my tasks.
+[ ] US3: As a manager, I can generate reports.
+
+## Success Metrics
+[ ] M1: 95% user satisfaction score.
+[ ] M2: <300ms API response time.
+"""
+
+        (self.docs_dir / "PRD.md").write_text(prd_with_standalone_checkboxes)
+        (self.docs_dir / "SPEC.md").write_text("## Data Model\n- E1\n## API\n- E2\n## Security\n- E3")
+        (self.docs_dir / "DECISION_LOG.md").write_text("## Records\n| ID |\n")
+
+        result = get_context_readiness(base_dir=self.test_dir)
+
+        # Assert: Standalone checkboxes should be counted as bullets
+        self.assertGreater(result["files"]["PRD"]["bullets"], 5,
+                          "Standalone checkboxes [ ] should be counted as bullets")
+
+    def test_mixed_bullet_formats(self):
+        """Mix of bullet styles should all be counted"""
+        prd_mixed_bullets = """# Product Requirements Document
+
+## Goals
+- Dashed bullet item one for the project goals section.
+* Star bullet item two for additional functionality.
+1. Numbered item three for sequential requirements list.
+- [ ] Checkbox with dash item four for trackable items.
+[ ] Standalone checkbox item five without bullet prefix.
+[ ] Standalone checkbox item six as last test case.
+
+## User Stories
+- Story 1
+- Story 2
+- Story 3
+
+## Success Metrics
+- Metric 1
+- Metric 2
+"""
+
+        (self.docs_dir / "PRD.md").write_text(prd_mixed_bullets)
+        (self.docs_dir / "SPEC.md").write_text("## Data Model\n- E1\n## API\n- E2\n## Security\n- E3")
+        (self.docs_dir / "DECISION_LOG.md").write_text("## Records\n| ID |\n")
+
+        result = get_context_readiness(base_dir=self.test_dir)
+
+        # Assert: All bullet formats should be counted
+        self.assertGreater(result["files"]["PRD"]["bullets"], 5,
+                          "Mixed bullet formats should all be counted")
+
+
 if __name__ == '__main__':
     unittest.main()

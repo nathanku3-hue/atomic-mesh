@@ -33,7 +33,7 @@ except ImportError:
 # =============================================================================
 # v10.18.0: VERSION CONSTANT
 # =============================================================================
-MESH_VERSION = "13.0.0"
+MESH_VERSION = "18.0.0"
 
 # FIX #3: Environment Variable for DB Path - allows isolation between environments
 # =============================================================================
@@ -52,6 +52,122 @@ DB_PATH = os.getenv("ATOMIC_MESH_DB", os.path.join(BASE_DIR, "mesh.db"))
 DB_FILE = DB_PATH
 MODE_FILE = ".mesh_mode"
 MILESTONE_FILE = ".milestone_date"
+
+# =============================================================================
+# v18.0: LANE CONSTANTS (Braided Stream Scheduler)
+# =============================================================================
+# Lower weight = higher priority. Used for default task priority by lane.
+LANE_WEIGHTS = {"backend": 10, "frontend": 20, "qa": 30, "ops": 40, "docs": 50}
+LANE_ORDER = ["backend", "frontend", "qa", "ops", "docs"]
+
+# =============================================================================
+# v20.1: WORKER ROLE → ALLOWED LANES (Production Safety)
+# =============================================================================
+# Goal: prevent silent misrouting/starvation by enforcing lane access server-side.
+#
+# NOTE: This is not a security boundary (MCP has no auth here). It is a correctness
+# boundary that protects against misconfigured workers and accidental callers.
+DEFAULT_WORKER_ALLOWED_LANES: dict[str, set[str]] = {
+    # Codex/generalist worker
+    "backend": {"backend", "qa", "ops"},
+    # Claude/creative worker
+    "frontend": {"frontend", "docs"},
+    # Optional dedicated workers
+    "qa": {"qa"},
+    "ops": {"ops"},
+    "docs": {"docs"},
+    # Local operator tools (full visibility)
+    "admin": set(LANE_ORDER),
+}
+
+ADMIN_WORKER_IDS = {
+    "control_panel",
+    "mission_control",
+    "commander",
+    "planner",
+    "admin",
+}
+
+_WORKER_ROLE_PREFIX_RE = re.compile(r"^(backend|frontend|qa|ops|docs)(?:$|[_-])", re.IGNORECASE)
+
+
+def _resolve_worker_lane_policy(worker_id: str | None, worker_type: str | None) -> dict:
+    """
+    Resolve worker role and allowed lanes (fail closed).
+
+    Identity inputs:
+      - worker_type: explicit role label provided by caller (preferred)
+      - worker_id: inferred via prefix like "backend_123" or special admin IDs
+
+    Returns:
+      {"ok": bool, "role": str|None, "allowed_lanes": set[str], "error": str|None}
+    """
+    inferred_role: str | None = None
+    if worker_id:
+        wid = str(worker_id).strip().lower()
+        if wid in ADMIN_WORKER_IDS:
+            inferred_role = "admin"
+        else:
+            m = _WORKER_ROLE_PREFIX_RE.match(wid)
+            if m:
+                inferred_role = m.group(1).lower()
+
+    explicit_role: str | None = None
+    if worker_type:
+        explicit_role = str(worker_type).strip().lower()
+
+    if explicit_role and explicit_role not in DEFAULT_WORKER_ALLOWED_LANES:
+        return {
+            "ok": False,
+            "role": None,
+            "allowed_lanes": set(),
+            "error": f"UNKNOWN_WORKER_TYPE:{explicit_role}",
+        }
+
+    if explicit_role and inferred_role and explicit_role != inferred_role:
+        return {
+            "ok": False,
+            "role": None,
+            "allowed_lanes": set(),
+            "error": f"WORKER_TYPE_MISMATCH:{explicit_role}!={inferred_role}",
+        }
+
+    role = explicit_role or inferred_role
+    if not role:
+        # Backward compatibility: if no role can be determined, allow all lanes.
+        # This ensures existing tests and callers that don't specify worker_type
+        # continue to work. Server-side enforcement only applies when role is known.
+        return {
+            "ok": True,
+            "role": None,
+            "allowed_lanes": set(LANE_ORDER),
+            "error": None,
+        }
+
+    allowed = set(DEFAULT_WORKER_ALLOWED_LANES.get(role, set()))
+    if not allowed:
+        return {
+            "ok": False,
+            "role": role,
+            "allowed_lanes": set(),
+            "error": f"NO_ALLOWED_LANES:{role}",
+        }
+
+    # Normalize to known lanes only (fail closed on unknown lanes).
+    allowed &= set(LANE_ORDER)
+    return {"ok": True, "role": role, "allowed_lanes": allowed, "error": None}
+
+# Deferred: LANE_POINTER_FILE set after module init (needs STATE_DIR)
+# Will be: os.path.join(STATE_DIR, "scheduler_lane_pointer.json")
+LANE_POINTER_FILE = None  # Set in _get_lane_pointer_file()
+
+
+def _get_lane_pointer_file():
+    """Get lane pointer file path (deferred to avoid circular import)."""
+    global LANE_POINTER_FILE
+    if LANE_POINTER_FILE is None:
+        LANE_POINTER_FILE = os.path.join(STATE_DIR, "scheduler_lane_pointer.json")
+    return LANE_POINTER_FILE
 
 
 def get_project_root() -> str:
@@ -520,11 +636,14 @@ def get_safe_files_for_librarian(file_list: List[str]) -> List[str]:
     return safe_files
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
     # WAL mode for concurrent access - set once per connection
     conn.execute("PRAGMA journal_mode=WAL;")
+    # Speed/durability balance for WAL (production default; override via env if needed)
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -628,6 +747,14 @@ def init_db():
                 ("review_notes", "TEXT DEFAULT ''", "v10.12"),
                 ("risk", "TEXT DEFAULT 'LOW'", "v14.0"),
                 ("qa_status", "TEXT DEFAULT 'NONE'", "v14.0"),
+                # v18.0: Braided Stream Scheduler columns
+                ("lane", "TEXT DEFAULT ''", "v18.0"),
+                ("lane_rank", "INTEGER DEFAULT 0", "v18.0"),
+                ("created_at", "INTEGER DEFAULT 0", "v18.0"),
+                ("exec_class", "TEXT DEFAULT 'exclusive'", "v18.0"),
+                ("task_signature", "TEXT DEFAULT ''", "v18.0"),
+                ("source_plan_hash", "TEXT DEFAULT ''", "v18.0"),
+                ("plan_key", "TEXT DEFAULT ''", "v19.10"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -637,6 +764,43 @@ def init_db():
                         server_logger.info(f"{version}: Added {col_name} column to tasks table")
                     except Exception:
                         pass  # Column already exists
+
+            # v19.10: Cheap-win indexes for scheduler hot paths
+            # - Preemption: status + priority ordering
+            # - Lane scan: status + lane ordering
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_pick_preempt "
+                    "ON tasks(status, priority, lane_rank, created_at, id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_pick_lane "
+                    "ON tasks(status, lane, priority, lane_rank, created_at, id)"
+                )
+
+                # v20.0: Targeted indexes for dashboard/query hot paths
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_auditor_status_status "
+                    "ON tasks(auditor_status, status)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_archetype "
+                    "ON tasks(status, archetype)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated_at "
+                    "ON tasks(status, updated_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_source_plan_hash "
+                    "ON tasks(source_plan_hash)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_task_signature "
+                    "ON tasks(task_signature)"
+                )
+            except Exception as e:
+                server_logger.warning(f"Index creation skipped: {e}")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS artifacts (
                 key TEXT PRIMARY KEY,
@@ -832,6 +996,43 @@ def get_po_status():
         server_logger.warning(f"PO status check failed: {e}")
         return "Green", "No pending inputs"
 
+
+def _tail_text_lines(file_path: str, max_lines: int = 50, encoding: str = "utf-8") -> list:
+    """
+    Efficiently reads the last N lines of a text file without loading the whole file.
+    Falls back to a streaming deque approach on failure.
+    """
+    if max_lines <= 0:
+        return []
+
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+
+            block_size = 8192
+            data = b""
+            newlines = 0
+
+            while pos > 0 and newlines <= max_lines:
+                read_size = block_size if pos >= block_size else pos
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                data = chunk + data
+                newlines += chunk.count(b"\n")
+
+            raw_lines = data.splitlines()[-max_lines:]
+            return [ln.decode(encoding, errors="ignore").rstrip("\r") for ln in raw_lines]
+    except Exception:
+        try:
+            from collections import deque
+            with open(file_path, "r", encoding=encoding, errors="ignore") as f:
+                return [line.rstrip("\n").rstrip("\r") for line in deque(f, maxlen=max_lines)]
+        except Exception:
+            return []
+
+
 def get_latest_log_line():
     """
     v9.4 Telemetry: Reads the latest [THOUGHT] from logs for COT display.
@@ -840,9 +1041,8 @@ def get_latest_log_line():
     log_path = os.path.join(BASE_DIR, "logs", "mesh.log")
     if os.path.exists(log_path):
         try:
-            with open(log_path, 'r', encoding='utf-8') as f:
-                # Read last 15 lines for efficiency
-                lines = f.readlines()[-15:]
+            # Bounded tail read (avoid unbounded readlines() on large logs)
+            lines = _tail_text_lines(log_path, max_lines=15, encoding="utf-8")
                 
             # Search backwards for the last [THOUGHT]
             for line in reversed(lines):
@@ -923,7 +1123,1978 @@ def get_system_status() -> str:
         "worker_cot": worker_cot
     })
 
+
+@mcp.tool()
+def get_exec_snapshot() -> str:
+    """
+    v21.0: Returns EXEC dashboard snapshot for live execution monitoring.
+
+    All fields are optional-safe (missing values won't crash UI).
+    Used by control_panel.ps1 Draw-ExecScreen for the new EXEC dashboard.
+
+    Returns JSON with:
+    - plan: {hash, name, version, path} - current accepted plan identity
+    - stream: {id, name} - current stream focus
+    - security: {read_only} - system security state
+    - scheduler: {rotation_ptr, last_pick} - braided scheduler state
+    - lanes: [{name, active, pending, done, total, blocked}] - per-lane stats
+    - workers: [{id, type, allowed_lanes, status, last_seen_s, task_ids}] - worker roster
+    - active_tasks: [{id, lane, status, title, age_s, worker_id, parent_id, deps_blocked}]
+    - alerts: [{level, code, text}] - system alerts
+    """
+    import time
+    import hashlib
+
+    snapshot = {
+        "plan": {"hash": None, "name": None, "version": None, "path": None},
+        "stream": {"id": None, "name": None},
+        "security": {"read_only": True},  # Default to read-only (safe)
+        "scheduler": {"rotation_ptr": None, "last_pick": None},
+        "lanes": [],
+        "workers": [],
+        "active_tasks": [],
+        "alerts": [],
+    }
+
+    try:
+        with get_db() as conn:
+            now = int(time.time())
+
+            # === PLAN IDENTITY ===
+            # Get latest accepted plan from config (if stored)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='accepted_plan_path' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    plan_path = row["value"]
+                    snapshot["plan"]["path"] = plan_path
+                    # Extract name from filename
+                    snapshot["plan"]["name"] = os.path.basename(plan_path) if plan_path else None
+                    # Generate hash from path (simple identity)
+                    snapshot["plan"]["hash"] = hashlib.md5(plan_path.encode()).hexdigest()[:8] if plan_path else None
+            except Exception:
+                pass
+
+            # Get version from config
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='plan_version' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    snapshot["plan"]["version"] = row["value"]
+            except Exception:
+                pass
+
+            # === SCHEDULER STATE ===
+            # Lane pointer
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='scheduler_lane_pointer' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    ptr_data = json.loads(row["value"])
+                    snapshot["scheduler"]["rotation_ptr"] = ptr_data.get("index")
+            except Exception:
+                pass
+
+            # Last pick decision
+            try:
+                row = conn.execute(
+                    "SELECT value FROM config WHERE key='scheduler_last_decision' LIMIT 1"
+                ).fetchone()
+                if row and row["value"]:
+                    dec_data = json.loads(row["value"])
+                    snapshot["scheduler"]["last_pick"] = {
+                        "task_id": dec_data.get("picked_id"),
+                        "lane": dec_data.get("lane"),
+                        "reason": dec_data.get("reason"),
+                    }
+            except Exception:
+                pass
+
+            # === LANE STATISTICS ===
+            try:
+                # Query task counts by lane and status
+                lane_expr = "LOWER(COALESCE(NULLIF(lane,''), type))"
+                rows = conn.execute(f"""
+                    SELECT {lane_expr} as lane_name, status, COUNT(*) as c
+                    FROM tasks
+                    GROUP BY {lane_expr}, status
+                """).fetchall()
+
+                lane_stats = {}
+                for row in rows:
+                    lane_name = row["lane_name"] or "unknown"
+                    if lane_name not in lane_stats:
+                        lane_stats[lane_name] = {
+                            "name": lane_name,
+                            "active": 0,
+                            "pending": 0,
+                            "done": 0,
+                            "total": 0,
+                            "blocked": 0,
+                        }
+                    count = int(row["c"])
+                    lane_stats[lane_name]["total"] += count
+                    status = (row["status"] or "").lower()
+                    if status == "in_progress":
+                        lane_stats[lane_name]["active"] += count
+                    elif status == "pending":
+                        lane_stats[lane_name]["pending"] += count
+                    elif status == "completed":
+                        lane_stats[lane_name]["done"] += count
+                    elif status == "blocked":
+                        lane_stats[lane_name]["blocked"] += count
+
+                # Convert to list ordered by standard lane order
+                lane_order = ["backend", "frontend", "qa", "ops", "docs"]
+                for lane_name in lane_order:
+                    if lane_name in lane_stats:
+                        snapshot["lanes"].append(lane_stats[lane_name])
+                # Add any extra lanes not in standard order
+                for lane_name, stats in lane_stats.items():
+                    if lane_name not in lane_order:
+                        snapshot["lanes"].append(stats)
+            except Exception:
+                pass
+
+            # === WORKERS ===
+            # Query worker heartbeats table (if exists)
+            try:
+                # Check if worker_heartbeats table exists
+                tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='worker_heartbeats'"
+                ).fetchall()
+                if tables:
+                    rows = conn.execute("""
+                        SELECT worker_id, worker_type, allowed_lanes, status, last_seen, task_ids
+                        FROM worker_heartbeats
+                        ORDER BY last_seen DESC
+                        LIMIT 10
+                    """).fetchall()
+                    for row in rows:
+                        last_seen_s = now - int(row["last_seen"]) if row["last_seen"] else None
+                        allowed = json.loads(row["allowed_lanes"]) if row["allowed_lanes"] else []
+                        task_ids = json.loads(row["task_ids"]) if row["task_ids"] else []
+                        snapshot["workers"].append({
+                            "id": row["worker_id"],
+                            "type": row["worker_type"],
+                            "allowed_lanes": allowed,
+                            "status": row["status"] or "unknown",
+                            "last_seen_s": last_seen_s,
+                            "task_ids": task_ids,
+                        })
+            except Exception:
+                pass
+
+            # === ACTIVE TASKS ===
+            try:
+                rows = conn.execute("""
+                    SELECT id, lane, type, status, desc, updated_at, worker_id, parent_task_id, deps
+                    FROM tasks
+                    WHERE status = 'in_progress'
+                    ORDER BY updated_at DESC
+                    LIMIT 10
+                """).fetchall()
+                for row in rows:
+                    lane = row["lane"] or row["type"] or "unknown"
+                    age_s = now - int(row["updated_at"]) if row["updated_at"] else 0
+                    # Count blocked deps
+                    deps_blocked = 0
+                    if row["deps"]:
+                        try:
+                            deps_list = json.loads(row["deps"])
+                            if deps_list:
+                                # Count incomplete deps
+                                dep_ids = [d for d in deps_list if isinstance(d, int) or (isinstance(d, str) and d.isdigit())]
+                                if dep_ids:
+                                    placeholders = ",".join("?" * len(dep_ids))
+                                    incomplete = conn.execute(
+                                        f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders}) AND status != 'completed'",
+                                        [int(d) for d in dep_ids]
+                                    ).fetchone()[0]
+                                    deps_blocked = incomplete
+                        except Exception:
+                            pass
+
+                    snapshot["active_tasks"].append({
+                        "id": row["id"],
+                        "lane": lane,
+                        "status": row["status"],
+                        "title": (row["desc"] or "")[:50],
+                        "age_s": age_s,
+                        "worker_id": row["worker_id"],
+                        "parent_id": row["parent_task_id"],
+                        "deps_blocked": deps_blocked,
+                    })
+            except Exception:
+                pass
+
+            # === ALERTS ===
+            # Check for various alert conditions
+
+            # 1. Working tree dirty
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=BASE_DIR,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "WORKTREE_DIRTY",
+                        "text": "Working tree dirty (uncommitted changes)",
+                    })
+            except Exception:
+                pass
+
+            # 2. Blocked tasks
+            try:
+                blocked_count = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status='blocked'"
+                ).fetchone()[0]
+                if blocked_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "TASKS_BLOCKED",
+                        "text": f"{blocked_count} task(s) blocked",
+                    })
+            except Exception:
+                pass
+
+            # 3. RED decisions pending
+            try:
+                red_count = conn.execute(
+                    "SELECT COUNT(*) FROM decisions WHERE status='pending' AND priority='red'"
+                ).fetchone()[0]
+                if red_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "error",
+                        "code": "RED_DECISION",
+                        "text": f"RED decision pending - work blocked",
+                    })
+            except Exception:
+                pass
+
+            # 4. Stale tasks (in_progress for too long)
+            try:
+                stale_threshold = 3600  # 1 hour
+                stale_count = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND updated_at < ?",
+                    (now - stale_threshold,)
+                ).fetchone()[0]
+                if stale_count > 0:
+                    snapshot["alerts"].append({
+                        "level": "warn",
+                        "code": "STALE_TASKS",
+                        "text": f"{stale_count} task(s) stale (>1h in progress)",
+                    })
+            except Exception:
+                pass
+
+    except Exception as e:
+        # If DB connection fails, return minimal snapshot with error alert
+        snapshot["alerts"].append({
+            "level": "error",
+            "code": "DB_ERROR",
+            "text": f"Database error: {str(e)[:50]}",
+        })
+
+    return json.dumps(snapshot)
+
+
 # =============================================================================
+# v17.0: DOCUMENT EXTRACTION PIPELINE
+# =============================================================================
+# Extracts structured context from PRD/SPEC/DECISION_LOG for plan generation.
+# Key principle: DETERMINISTIC extraction, no LLM, no guessing.
+
+# Debug flag - set MESH_PLAN_DEBUG=1 to enable extraction logging
+PLAN_DEBUG = os.getenv("MESH_PLAN_DEBUG", "0") == "1"
+
+def _plan_debug(msg: str):
+    """Log to stderr only if MESH_PLAN_DEBUG=1"""
+    if PLAN_DEBUG:
+        import sys
+        print(f"[PLAN_DEBUG] {msg}", file=sys.stderr)
+
+
+def _resolve_doc_path(doc_name: str, base_dir: str = None) -> str:
+    """
+    Resolve document path checking both docs/ and docs/_mesh/ layouts.
+
+    Args:
+        doc_name: Document filename (e.g., "PRD.md", "SPEC.md", "DECISION_LOG.md")
+        base_dir: Project root directory. Defaults to BASE_DIR.
+
+    Returns:
+        Absolute path to document if found, else None.
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    # Primary location: docs/{doc_name}
+    primary_path = os.path.join(base_dir, "docs", doc_name)
+    if os.path.exists(primary_path):
+        _plan_debug(f"Resolved {doc_name} -> {primary_path}")
+        return primary_path
+
+    # Secondary location: docs/_mesh/{doc_name}
+    secondary_path = os.path.join(base_dir, "docs", "_mesh", doc_name)
+    if os.path.exists(secondary_path):
+        _plan_debug(f"Resolved {doc_name} -> {secondary_path} (fallback)")
+        return secondary_path
+
+    _plan_debug(f"Could not resolve {doc_name}")
+    return None
+
+
+def _extract_user_stories(prd_text: str) -> list:
+    """
+    Extract user stories from PRD text.
+
+    Accepted formats:
+    - Lines containing "As a ... I want ..." (case-insensitive)
+    - Bullet/checkbox lines under "User Stories" header
+    - Checkbox formats: "- [ ] ...", "[ ] ...", "- ..."
+
+    Returns:
+        List of dicts: [{"id": "US-01", "story": "...", "raw": "..."}]
+    """
+    stories = []
+    seen = set()
+
+    # Pattern 1: "As a ... I want ..." anywhere in text
+    as_a_pattern = re.compile(
+        r'(?:^|\n)\s*(?:[-*]\s*)?(?:\[[ xX]?\]\s*)?'  # Optional bullet/checkbox
+        r'(?:US[-_]?\d+[:\s]*)?'  # Optional US-01: prefix
+        r'(As an?\s+.+?(?:,\s*)?I\s+(?:want|need|can)\s+.+?)(?:\n|$)',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    for i, match in enumerate(as_a_pattern.finditer(prd_text)):
+        story_text = match.group(1).strip()
+        # Clean up multiline
+        story_text = re.sub(r'\s+', ' ', story_text)
+
+        # Skip template placeholders
+        if '[user]' in story_text.lower() or '[capability]' in story_text.lower():
+            continue
+
+        if story_text not in seen and len(story_text) > 20:
+            seen.add(story_text)
+            # Try to extract ID from preceding text
+            story_id = f"US-{len(stories)+1:02d}"
+            id_match = re.search(r'US[-_]?(\d+)', match.group(0))
+            if id_match:
+                story_id = f"US-{id_match.group(1).zfill(2)}"
+
+            stories.append({
+                "id": story_id,
+                "story": story_text,
+                "raw": match.group(0).strip()[:200]
+            })
+
+    # Pattern 2: Bullets under "User Stories" section
+    section_match = re.search(
+        r'(?:^|\n)(?:#{1,3}\s*)?User\s*Stories?\s*\n(.*?)(?=\n#{1,3}\s|\Z)',
+        prd_text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if section_match:
+        section_text = section_match.group(1)
+        bullet_pattern = re.compile(
+            r'^\s*(?:[-*]|\d+\.)\s*(?:\[[ xX]?\]\s*)?(.+)$',
+            re.MULTILINE
+        )
+
+        for match in bullet_pattern.finditer(section_text):
+            line = match.group(1).strip()
+            # Skip sub-headers, empty, or already captured
+            if line.startswith('#') or len(line) < 15:
+                continue
+            if any(line in s["story"] or s["story"] in line for s in stories):
+                continue
+            # Skip template placeholders
+            if '[user]' in line.lower() or '[capability]' in line.lower():
+                continue
+
+            story_id = f"US-{len(stories)+1:02d}"
+            id_match = re.search(r'US[-_]?(\d+)', line)
+            if id_match:
+                story_id = f"US-{id_match.group(1).zfill(2)}"
+                line = re.sub(r'US[-_]?\d+[:\s]*', '', line).strip()
+
+            if line not in seen:
+                seen.add(line)
+                stories.append({
+                    "id": story_id,
+                    "story": line,
+                    "raw": match.group(0).strip()[:200]
+                })
+
+    _plan_debug(f"Extracted {len(stories)} user stories")
+    return stories
+
+
+def _extract_api_endpoints(spec_text: str) -> list:
+    """
+    Extract API endpoints from SPEC text.
+
+    Accepted formats:
+    - Markdown table rows with endpoint path and method
+    - Prose lines: "GET /api/...", "POST /api/..."
+    - Inline code blocks with method + path
+
+    Returns:
+        List of dicts: [{"method": "GET", "path": "/api/users", "raw": "..."}]
+    """
+    endpoints = []
+    seen = set()
+
+    methods = r'(?:GET|POST|PUT|DELETE|PATCH)'
+
+    # Pattern 1: Table rows with | /api/... | and method
+    table_pattern = re.compile(
+        rf'\|[^|]*({methods})[^|]*\|[^|]*(/[a-zA-Z0-9_/:{{}}.-]+)[^|]*\|'
+        rf'|\|[^|]*(/[a-zA-Z0-9_/:{{}}.-]+)[^|]*\|[^|]*({methods})[^|]*\|',
+        re.IGNORECASE
+    )
+
+    for match in table_pattern.finditer(spec_text):
+        groups = match.groups()
+        if groups[0] and groups[1]:
+            method, path = groups[0].upper(), groups[1]
+        elif groups[2] and groups[3]:
+            path, method = groups[2], groups[3].upper()
+        else:
+            continue
+
+        # Clean path
+        path = path.strip()
+        if not path.startswith('/'):
+            continue
+        # Skip template placeholders
+        if '/resource' in path.lower() and 'api' not in path.lower():
+            continue
+
+        key = f"{method} {path}"
+        if key not in seen:
+            seen.add(key)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "raw": match.group(0).strip()[:150]
+            })
+
+    # Pattern 2: Prose/code lines "GET /api/..."
+    prose_pattern = re.compile(
+        rf'(?:^|\s|`)({methods})\s+(/[a-zA-Z0-9_/:{{}}.-]+)',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    for match in prose_pattern.finditer(spec_text):
+        method = match.group(1).upper()
+        path = match.group(2).strip()
+
+        if not path.startswith('/'):
+            continue
+
+        key = f"{method} {path}"
+        if key not in seen:
+            seen.add(key)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "raw": match.group(0).strip()[:150]
+            })
+
+    _plan_debug(f"Extracted {len(endpoints)} API endpoints")
+    return endpoints
+
+
+def _extract_data_entities(spec_text: str) -> list:
+    """
+    Extract data model entities from SPEC text.
+
+    Accepted formats:
+    - Markdown table under "Data Model" section
+    - Bullet list items with entity names (e.g., "[ ] EntityName (filename)")
+    - Code blocks with class/type/interface/struct definitions
+
+    Returns:
+        List of dicts: [{"name": "User", "fields": "...", "raw": "..."}]
+    """
+    entities = []
+    seen = set()
+
+    # Pattern 1: Table rows under Data Model section
+    section_match = re.search(
+        r'(?:^|\n)(?:#{1,3}\s*)?(?:Data\s*Model|Entities|Schema)\s*\n(.*?)(?=\n#{1,3}\s|\n---|\Z)',
+        spec_text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if section_match:
+        section_text = section_match.group(1)
+
+        # Pattern 1a: Table rows | EntityName | fields |
+        table_row_pattern = re.compile(
+            r'^\s*\|\s*([A-Z][a-zA-Z0-9_]+)\s*\|(.+)\|',
+            re.MULTILINE
+        )
+
+        for match in table_row_pattern.finditer(section_text):
+            name = match.group(1).strip()
+            rest = match.group(2).strip()
+
+            # Skip header rows and common non-entity words
+            skip_words = ('entity', 'table', 'name', 'model', 'field', 'type', 'notes', 'source')
+            if name.lower() in skip_words:
+                continue
+            if '-' * 3 in name:
+                continue
+
+            if name not in seen:
+                seen.add(name)
+                entities.append({
+                    "name": name,
+                    "fields": rest[:100],
+                    "raw": match.group(0).strip()[:200]
+                })
+
+        # Pattern 1b: Bullet list items like "[ ] EntityName (filename.parquet)"
+        bullet_entity_pattern = re.compile(
+            r'^\s*(?:[-*]|\[[ xX]?\])\s*\*?\*?([A-Z][a-zA-Z0-9_]+)\*?\*?\s*(?:\([^)]+\))?[:\s]',
+            re.MULTILINE
+        )
+
+        for match in bullet_entity_pattern.finditer(section_text):
+            name = match.group(1).strip()
+            # Skip common non-entity words including Security/API section items
+            skip_words = ('key', 'note', 'field', 'type', 'input', 'output', 'description',
+                          'method', 'access', 'threat', 'isolation', 'control', 'risk',
+                          'mitigation', 'authentication', 'validation', 'endpoint', 'interface')
+            if name.lower() in skip_words:
+                continue
+
+            if name not in seen:
+                seen.add(name)
+                # Try to extract fields from the rest of the line
+                line_end = spec_text.find('\n', match.end())
+                rest = spec_text[match.end():line_end] if line_end > 0 else ""
+                entities.append({
+                    "name": name,
+                    "fields": rest[:100].strip(),
+                    "raw": match.group(0).strip()[:200]
+                })
+
+    # Pattern 2: Code definitions (class/type/interface/struct)
+    code_pattern = re.compile(
+        r'\b(?:class|type|interface|struct)\s+([A-Z][a-zA-Z0-9_]+)\b',
+        re.MULTILINE
+    )
+
+    for match in code_pattern.finditer(spec_text):
+        name = match.group(1).strip()
+        skip_words = ('entity', 'table', 'model', 'base', 'abstract', 'interface')
+        if name.lower() in skip_words:
+            continue
+
+        if name not in seen:
+            seen.add(name)
+            entities.append({
+                "name": name,
+                "fields": "",
+                "raw": match.group(0).strip()[:100]
+            })
+
+    _plan_debug(f"Extracted {len(entities)} data entities")
+    return entities
+
+
+def _extract_decisions(decision_log_text: str) -> list:
+    """
+    Extract decisions from DECISION_LOG with STRICT 8-column schema.
+
+    Schema: ID | Date | Type | Decision | Rationale | Scope | Task | Status
+
+    Rules:
+    - Only parse rows with exactly 8 columns
+    - Extract Decision column (col[3]) ONLY - do not concatenate other fields
+    - Keep ACCEPTED and PROPOSED status rows
+    - Skip INIT type rows
+
+    Returns:
+        List of dicts: [{"id": "005", "type": "SECURITY", "decision": "...", "status": "ACCEPTED"}]
+    """
+    decisions = []
+
+    lines = decision_log_text.split('\n')
+    in_table = False
+    header_seen = False
+
+    for line in lines:
+        line = line.strip()
+
+        # Detect table start
+        if '|' in line and 'ID' in line and 'Date' in line:
+            in_table = True
+            header_seen = True
+            continue
+
+        # Skip separator row (contains ---)
+        if in_table and '---' in line:
+            continue
+
+        # Process table row
+        if in_table and line.startswith('|') and line.endswith('|'):
+            # Split and clean columns
+            cols = [c.strip() for c in line.split('|')]
+            # Remove empty first/last from split (caused by leading/trailing |)
+            cols = [c for c in cols if c]  # Keep only non-empty
+
+            # Strict 8-column check
+            if len(cols) != 8:
+                _plan_debug(f"Skipping malformed decision row (got {len(cols)} cols): {line[:80]}")
+                continue
+
+            dec_id = cols[0]
+            dec_date = cols[1]
+            dec_type = cols[2].upper()
+            dec_decision = cols[3]  # ONLY the Decision column
+            dec_rationale = cols[4]
+            dec_scope = cols[5]
+            dec_task = cols[6]
+            dec_status = cols[7].upper()
+
+            # Skip INIT rows
+            if dec_type == 'INIT':
+                _plan_debug(f"Skipping INIT decision: {dec_id}")
+                continue
+
+            # Only keep ACCEPTED or PROPOSED (also accept ✅ as ACCEPTED)
+            if '✅' in dec_status or 'ACTIVE' in dec_status:
+                dec_status = 'ACCEPTED'
+            if 'ACCEPTED' not in dec_status and 'PROPOSED' not in dec_status:
+                _plan_debug(f"Skipping decision {dec_id} with status {dec_status}")
+                continue
+
+            # Skip if decision text is empty or placeholder
+            if not dec_decision or dec_decision == '-' or len(dec_decision) < 3:
+                continue
+
+            decisions.append({
+                "id": dec_id,
+                "type": dec_type,
+                "decision": dec_decision,
+                "status": dec_status,
+                "scope": dec_scope,
+                "task_ref": dec_task
+            })
+
+    _plan_debug(f"Extracted {len(decisions)} decisions (strict 8-col)")
+    return decisions
+
+
+def extract_project_context(base_dir: str = None) -> dict:
+    """
+    Assemble full project context from PRD/SPEC/DECISION_LOG.
+
+    Returns:
+        {
+            "paths": {"prd": "...", "spec": "...", "decision_log": "..."},
+            "user_stories": [...],
+            "api_endpoints": [...],
+            "data_entities": [...],
+            "decisions": [...],
+            "debug": {"counts": {...}}
+        }
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    ctx = {
+        "paths": {},
+        "user_stories": [],
+        "api_endpoints": [],
+        "data_entities": [],
+        "decisions": [],
+        "debug": {"counts": {}, "errors": []}
+    }
+
+    # Resolve paths
+    prd_path = _resolve_doc_path("PRD.md", base_dir)
+    spec_path = _resolve_doc_path("SPEC.md", base_dir)
+    decision_log_path = _resolve_doc_path("DECISION_LOG.md", base_dir)
+
+    ctx["paths"] = {
+        "prd": prd_path,
+        "spec": spec_path,
+        "decision_log": decision_log_path
+    }
+
+    # Extract from PRD
+    if prd_path:
+        try:
+            with open(prd_path, 'r', encoding='utf-8', errors='ignore') as f:
+                prd_text = f.read()
+            ctx["user_stories"] = _extract_user_stories(prd_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"PRD read error: {e}")
+
+    # Extract from SPEC
+    if spec_path:
+        try:
+            with open(spec_path, 'r', encoding='utf-8', errors='ignore') as f:
+                spec_text = f.read()
+            ctx["api_endpoints"] = _extract_api_endpoints(spec_text)
+            ctx["data_entities"] = _extract_data_entities(spec_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"SPEC read error: {e}")
+
+    # Extract from DECISION_LOG
+    if decision_log_path:
+        try:
+            with open(decision_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                decision_text = f.read()
+            ctx["decisions"] = _extract_decisions(decision_text)
+        except Exception as e:
+            ctx["debug"]["errors"].append(f"DECISION_LOG read error: {e}")
+
+    # Debug counts
+    ctx["debug"]["counts"] = {
+        "user_stories": len(ctx["user_stories"]),
+        "api_endpoints": len(ctx["api_endpoints"]),
+        "data_entities": len(ctx["data_entities"]),
+        "decisions": len(ctx["decisions"])
+    }
+
+    _plan_debug(f"Context extracted: {ctx['debug']['counts']}")
+    return ctx
+
+
+def _context_is_sufficient(ctx: dict) -> tuple:
+    """
+    Check if extracted context is sufficient for meaningful plan generation.
+
+    Pass condition:
+    - (user_stories > 0 OR api_endpoints > 0) AND (data_entities > 0 OR decisions > 0)
+    - Expected task count >= 10
+
+    Returns:
+        (is_sufficient: bool, reasons: list[str])
+    """
+    counts = ctx.get("debug", {}).get("counts", {})
+    stories = counts.get("user_stories", 0)
+    endpoints = counts.get("api_endpoints", 0)
+    entities = counts.get("data_entities", 0)
+    decisions = counts.get("decisions", 0)
+
+    reasons = []
+
+    # Check anchor types
+    has_work_anchors = stories > 0 or endpoints > 0
+    has_structure_anchors = entities > 0 or decisions > 0
+
+    if not has_work_anchors:
+        reasons.append("missing_user_stories_or_endpoints")
+    if not has_structure_anchors:
+        reasons.append("missing_entities_or_decisions")
+
+    # Estimate task count
+    # Backend: endpoints + entities
+    # Frontend: stories
+    # QA: stories
+    # Ops/Docs: decisions
+    estimated_tasks = endpoints + entities + (stories * 2) + decisions
+
+    if estimated_tasks < 10:
+        reasons.append(f"insufficient_roadmap_size (estimated {estimated_tasks} < 10)")
+
+    is_sufficient = len(reasons) == 0
+    _plan_debug(f"Context sufficient: {is_sufficient}, reasons: {reasons}")
+
+    return (is_sufficient, reasons)
+
+
+def _generate_missing_context_plan(ctx: dict, reasons: list) -> str:
+    """
+    Generate a "missing context" checklist plan when context is insufficient.
+
+    Returns:
+        Markdown string with actionable doc improvement tasks.
+    """
+    counts = ctx.get("debug", {}).get("counts", {})
+
+    lines = [
+        f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "> **Status: INSUFFICIENT_CONTEXT**",
+        "> The documents don't contain enough structured information to generate a meaningful roadmap.",
+        "> Complete the checklist below, then re-run `/draft-plan`.",
+        "",
+        "## [Docs]",
+        ""
+    ]
+
+    # User stories guidance
+    if counts.get("user_stories", 0) < 3:
+        lines.append("- [ ] Docs: Add at least 3 user stories to PRD.md under \"## User Stories\"")
+        lines.append("  - Format: `- [ ] US-01: As a [role], I want [capability] so that [benefit]`")
+        lines.append("")
+
+    # API endpoints guidance
+    if counts.get("api_endpoints", 0) < 3:
+        lines.append("- [ ] Docs: Add at least 3 API endpoints to SPEC.md under \"## API\"")
+        lines.append("  - Format: Table with columns `| Endpoint | Method | Request | Response |`")
+        lines.append("  - Or prose: `GET /api/v1/users` etc.")
+        lines.append("")
+
+    # Data entities guidance
+    if counts.get("data_entities", 0) < 2:
+        lines.append("- [ ] Docs: Add at least 2 data entities to SPEC.md under \"## Data Model\"")
+        lines.append("  - Format: Table with columns `| Entity | Fields | Notes |`")
+        lines.append("")
+
+    # Decisions guidance
+    if counts.get("decisions", 0) < 1:
+        lines.append("- [ ] Docs: Add at least 1 ACCEPTED decision to DECISION_LOG.md")
+        lines.append("  - Schema: `| ID | Date | Type | Decision | Rationale | Scope | Task | Status |`")
+        lines.append("  - Types: ARCH, SECURITY, DATA, API, UX, OPS")
+        lines.append("")
+
+    # Summary
+    lines.extend([
+        "---",
+        "",
+        "## Current Extraction Results",
+        "",
+        f"- User Stories: {counts.get('user_stories', 0)}",
+        f"- API Endpoints: {counts.get('api_endpoints', 0)}",
+        f"- Data Entities: {counts.get('data_entities', 0)}",
+        f"- Decisions: {counts.get('decisions', 0)}",
+        "",
+        f"**Reasons:** {', '.join(reasons)}",
+        ""
+    ])
+
+    return "\n".join(lines)
+
+
+
+def _generate_short_title(text: str, max_len: int = 48) -> str:
+    """
+    Generate a short title (<= max_len chars) from text.
+    Never truncates mid-word; adds no ellipsis.
+    Returns "(untitled)" if input is empty or whitespace-only.
+    Strips markdown formatting (**bold**, __underline__, etc.)
+    """
+    import re as re_mod
+
+    # Guardrail: never return empty
+    if not text or not text.strip():
+        return "(untitled)"
+
+    text = text.strip()
+
+    # Strip markdown formatting: **bold**, __underline__, *italic*, _italic_
+    text = re_mod.sub(r'\*\*([^*]+)\*\*', r'\g<1>', text)  # **bold**
+    text = re_mod.sub(r'__([^_]+)__', r'\g<1>', text)      # __underline__
+    text = re_mod.sub(r'\*([^*]+)\*', r'\g<1>', text)      # *italic*
+    text = re_mod.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\g<1>', text)  # _italic_ (word boundary)
+
+    if len(text) <= max_len:
+        return text
+    # Find last space before max_len
+    truncated = text[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > max_len // 2:
+        result = truncated[:last_space].rstrip()
+    else:
+        result = truncated.rstrip()
+
+    # Final guardrail: ensure non-empty result
+    return result if result else "(untitled)"
+
+
+def _generate_decision_action(dec_type: str, dec_text: str, dec_id: str) -> dict:
+    """
+    Generate concrete action title and DoD for a decision based on type.
+    FIX 5: DoDs are artifact-based with specific file paths, config keys, or test refs.
+    Returns dict with 'title', 'dod'.
+    """
+    dec_type_upper = dec_type.upper()
+    dec_text_lower = dec_text.lower()
+
+    # Generate short title from decision text
+    short_title = _generate_short_title(dec_text, 40)
+
+    # FIX 5: Content-specific artifact-based DoDs
+    if "duckdb" in dec_text_lower or "parquet" in dec_text_lower:
+        return {
+            "title": f"Setup {short_title}",
+            "dod": "db/schema.sql exists; src/data/ingest.py loads Parquet; tests/test_ingest.py passes"
+        }
+    elif "read-only" in dec_text_lower or "read only" in dec_text_lower:
+        return {
+            "title": f"Enable {short_title}",
+            "dod": "config.read_only_mode key added; src/core/safety.py enforces; tests/test_readonly.py passes"
+        }
+    elif "merge_asof" in dec_text_lower or "pit" in dec_text_lower:
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "src/data/pit_join.py implements merge_asof; tests/test_pit.py proves no leakage"
+        }
+    elif "abc" in dec_text_lower or "protocol" in dec_text_lower or "cartridge" in dec_text_lower:
+        return {
+            "title": f"Implement {short_title}",
+            "dod": "src/strategies/base.py defines Protocol; tests/test_strategy_contract.py passes"
+        }
+    elif "streamlit" in dec_text_lower:
+        return {
+            "title": f"Bootstrap {short_title}",
+            "dod": "app.py exists in root; streamlit run app.py shows landing page"
+        }
+
+    # Type-based artifact DoDs
+    if dec_type_upper == "SECURITY" or dec_type_upper == "SEC":
+        return {
+            "title": f"Enable {short_title}",
+            "dod": "config.security.* keys set; src/core/security.py enforces; tests/test_security.py passes"
+        }
+    elif dec_type_upper == "DATA":
+        return {
+            "title": f"Setup {short_title}",
+            "dod": "db/schema.sql updated; migrations/ contains change; tests/test_data.py passes"
+        }
+    elif dec_type_upper == "ARCH":
+        # Derive module name from short_title
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
+        return {
+            "title": f"Bootstrap {short_title}",
+            "dod": f"src/{module_name}/__init__.py exists; tests/test_{module_name}.py smoke passes"
+        }
+    elif dec_type_upper == "PERF":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
+        return {
+            "title": f"Optimize {short_title}",
+            "dod": f"benchmarks/bench_{module_name}.py shows target met; config.perf.* keys documented"
+        }
+    elif dec_type_upper == "API":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
+        return {
+            "title": f"Configure {short_title}",
+            "dod": f"docs/openapi.yaml updated; src/api/{module_name}.py exists; tests/test_api.py passes"
+        }
+    elif dec_type_upper == "UX":
+        # Derive module name from short_title
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
+        return {
+            "title": f"Implement {short_title}",
+            "dod": f"docs/_mesh/UX_PATTERNS.md updated; src/ui/{module_name}.py exists"
+        }
+    elif dec_type_upper == "ALGO":
+        module_name = re.sub(r'[^a-z0-9]+', '_', short_title.lower()).strip('_')[:20]
+        return {
+            "title": f"Implement {short_title}",
+            "dod": f"src/algo/{module_name}.py exists; tests/test_algo.py fixture passes"
+        }
+    else:
+        return {
+            "title": f"Configure {short_title}",
+            "dod": f"config.* key for DEC-{dec_id} set; related test passes"
+        }
+
+
+
+# =============================================================================
+# PLAN GENERATION HELPERS (v18.0 - Production Execution Grade)
+# =============================================================================
+# INVARIANT A: Backend Spine Must Exist
+# INVARIANT B: Decision-Driven Enforcement + Tests (SECURITY/DATA/ARCH)
+# INVARIANT C: Priority is Dependency-Aware (blockers/spine/enforcement = HIGH)
+
+
+def _build_backend_spine(ctx: dict, task_counter: dict, find_decision_trace) -> list:
+    """
+    INVARIANT A: Build backend workflow spine tasks.
+
+    Creates 4-7 core backend tasks that form the throughput + correctness backbone:
+    1. Define DuckDB schema & tables (consolidates entity persistence)
+    2. Ingest Parquet -> DuckDB
+    3. Implement query layer for backtest runner
+    4. Backtest runner core
+    5. Compute key metrics
+    6. Persist/query results (with schema/table details)
+    7. Transaction log view model
+
+    Entity persistence is collapsed into schema definition - no per-entity CRUD.
+    Each task has a _key for dependency tracking.
+
+    FIX 1: Data-layer tasks (schema/ingest/query) require entities>0 and depend on
+    Docs:data_model_entities if entities were missing initially.
+
+    Returns list of task dicts.
+    """
+    spine_tasks = []
+    decisions = ctx.get("decisions", [])
+    user_stories = ctx.get("user_stories", [])
+    data_entities = ctx.get("data_entities", [])
+
+    # FIX 1: Only create spine if we have user stories (for runner/metrics)
+    # Data-layer tasks additionally require entities
+    if len(user_stories) == 0:
+        return spine_tasks
+
+    # Get entity names for traceability
+    entity_names = [e.get("name", "Unknown") for e in data_entities]
+    entity_list = ", ".join(entity_names) if entity_names else "none"
+
+    # FIX 1: Track if we need entity dependency (entities=0 means Docs task needed first)
+    needs_entity_dep = len(data_entities) == 0
+
+    # A) DuckDB schema definition (consolidates entity persistence)
+    # FIX 1: Only generate if entities exist; otherwise this depends on Docs task
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        schema_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Define DuckDB schema & tables",
+            "dod": "schema.sql exists; tables created for all entities; smoke query works",
+            "trace": schema_trace,
+            "detail": f"Entities: {entity_list}",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "duckdb_schema"
+        })
+
+    # B) Data ingest pipeline
+    # FIX 1: Add Dep to Docs:data_model_entities if entities=0
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        ingest_trace = find_decision_trace(["duckdb", "parquet"]) or "SPEC-DATA"
+        ingest_task = {
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement ingest pipeline Parquet to DuckDB",
+            "dod": "Loads prices/fundamentals from ./data; mapping defined; idempotent load works",
+            "trace": ingest_trace,
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "duckdb_ingest"
+        }
+        spine_tasks.append(ingest_task)
+
+    # C) Query layer for backtest runner
+    # FIX 1: Only generate if entities exist (query layer needs schema)
+    if len(data_entities) > 0:
+        task_counter["B"] += 1
+        query_trace = find_decision_trace(["duckdb", "query"]) or "SPEC-DATA"
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement query layer for backtest runner",
+            "dod": "Functions for fetching price/fund slices, joins, time range filters",
+            "trace": query_trace,
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "query_layer"
+        })
+
+    # =================================================================
+    # DATA-DEPENDENT SPINE TASKS: Only emit if entities > 0
+    # =================================================================
+    # These tasks fundamentally require a data model / dataset contract.
+    # If entities=0, the Docs lane will have a blocker for "Define Data Model entities".
+
+    if len(data_entities) > 0:
+        # D) Backtest runner core - PRD-derived, trace to PRD-US:US-04 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement backtest runner core",
+            "dod": "Given fixture data + strategy, returns trades + equity series deterministically",
+            "trace": "PRD-US:US-04",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "runner_core"
+        })
+
+        # E) Metrics calculation - PRD-derived, trace to PRD-US:US-04 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Compute key metrics (CAGR, Sharpe, MaxDD)",
+            "dod": "Metrics match fixture expected values within tolerance",
+            "trace": "PRD-US:US-04",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "metrics"
+        })
+
+        # F) Results store/query - PRD-derived, trace to PRD-US:US-07 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Persist and query backtest results",
+            "dod": "backtest_runs table indexed by run_id; can list, fetch, compare two runs",
+            "trace": "PRD-US:US-07",
+            "priority": "HIGH",
+            "_spine": True,
+            "_key": "results_store"
+        })
+
+        # G) Transaction log - PRD-derived, trace to PRD-US:US-06 is correct
+        task_counter["B"] += 1
+        spine_tasks.append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Generate transaction log view model",
+            "dod": "Trades include entry/exit reason + timestamps; UI can render table",
+            "trace": "PRD-US:US-06",
+            "_spine": True,
+            "_key": "txn_view"
+        })
+
+    return spine_tasks
+
+
+
+def _decision_enforcement_tasks(ctx: dict, task_counter: dict) -> dict:
+    """
+    INVARIANT B: Generate enforcement tasks for decisions.
+
+    For SECURITY decisions: Creates implementation task + QA enforcement test (P:HIGH)
+    For DATA decisions: Creates correctness QA task
+    For ARCH decisions: Creates setup + smoke test task
+
+    Returns dict with 'ops', 'qa', 'backend' task lists.
+    """
+    result = {"ops": [], "qa": [], "backend": []}
+    decisions = ctx.get("decisions", [])
+    processed = set()
+
+    for dec in decisions:
+        dec_id = dec.get("id", "???")
+        dec_type = dec.get("type", "").upper()
+        dec_text = dec.get("decision", "")
+        dec_text_lower = dec_text.lower()
+        dec_status = dec.get("status", "")
+
+        # Skip PROPOSED decisions (handled separately as Docs tasks)
+        if "PROPOSED" in dec_status.upper():
+            continue
+
+        # === SECURITY decisions: implement + QA enforce (both P:HIGH) ===
+        if dec_type == "SEC" or dec_type == "SECURITY":
+            if f"sec_{dec_id}" not in processed:
+                # Implementation/enforcement task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text,
+                    "priority": "HIGH"
+                })
+
+                # QA enforcement test (P:HIGH per INVARIANT B)
+                task_counter["Q"] += 1
+                # Determine specific enforcement test
+                if "read-only" in dec_text_lower or "read only" in dec_text_lower:
+                    qa_title = "Read-only mode enforcement"
+                    qa_dod = "Write attempts blocked when read-only enabled; test proves no DB mutation"
+                else:
+                    qa_title = f"Security enforcement: {_generate_short_title(dec_text, 30)}"
+                    qa_dod = "Security control verified; unauthorized action blocked"
+
+                result["qa"].append({
+                    "id": f"T-Q{task_counter['Q']}",
+                    "title": qa_title,
+                    "dod": f"pytest + fixture dataset + deterministic seed; {qa_dod}",
+                    "trace": f"DEC-{dec_id}",
+                    "priority": "HIGH",
+                    "level": "INTEGRATION",
+                    "_enforcement": True
+                })
+                processed.add(f"sec_{dec_id}")
+
+        # === DATA decisions: correctness QA task ===
+        elif dec_type == "DATA":
+            if f"data_{dec_id}" not in processed:
+                # Implementation task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+
+                # Correctness QA for specific DATA patterns
+                if "duckdb" in dec_text_lower or "parquet" in dec_text_lower:
+                    task_counter["Q"] += 1
+                    result["qa"].append({
+                        "id": f"T-Q{task_counter['Q']}",
+                        "title": "DuckDB + Parquet parity",
+                        "dod": "pytest + fixture dataset + deterministic seed; same dataset yields identical results from Parquet baseline vs DuckDB query",
+                        "trace": f"DEC-{dec_id}",
+                        "level": "INTEGRATION"
+                    })
+                processed.add(f"data_{dec_id}")
+
+        # === ALGO decisions: correctness QA (e.g., PIT) ===
+        elif dec_type == "ALGO":
+            if f"algo_{dec_id}" not in processed:
+                # Implementation task
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+
+                # PIT correctness test
+                if "merge_asof" in dec_text_lower or "pit" in dec_text_lower or "point-in-time" in dec_text_lower:
+                    task_counter["Q"] += 1
+                    result["qa"].append({
+                        "id": f"T-Q{task_counter['Q']}",
+                        "title": "PIT merge_asof correctness",
+                        "dod": "pytest + fixture dataset + deterministic seed; demonstrates correct point-in-time join; fails if leakage occurs",
+                        "trace": f"DEC-{dec_id}",
+                        "priority": "HIGH",
+                        "level": "INTEGRATION"
+                    })
+                processed.add(f"algo_{dec_id}")
+
+        # === ARCH/API/UX/PERF decisions: standard Ops task ===
+        else:
+            if f"other_{dec_id}" not in processed:
+                task_counter["O"] += 1
+                action = _generate_decision_action(dec_type, dec_text, dec_id)
+                result["ops"].append({
+                    "id": f"T-O{task_counter['O']}",
+                    "title": action["title"],
+                    "dod": action["dod"],
+                    "trace": f"DEC-{dec_id}",
+                    "detail": dec_text
+                })
+                processed.add(f"other_{dec_id}")
+
+    return result
+
+
+def build_plan_from_context(ctx: dict) -> str:
+    """
+    Generate production execution-grade multi-stream plan markdown.
+
+    Implements three hard invariants:
+    - INVARIANT A: Backend Spine Must Exist (throughput + correctness backbone)
+    - INVARIANT B: Decision-Driven Enforcement + Tests (SECURITY/DATA/ARCH)
+    - INVARIANT C: Priority is Dependency-Aware (blockers/spine/enforcement = HIGH)
+
+    Target streams: Docs, Backend, Frontend, QA, Ops
+
+    Returns:
+        Markdown string with task checklist.
+    """
+    streams = {
+        "Backend": [],
+        "Frontend": [],
+        "QA": [],
+        "Ops": [],
+        "Docs": []
+    }
+
+    task_counter = {"B": 0, "F": 0, "Q": 0, "O": 0, "D": 0}
+
+    user_stories = ctx.get("user_stories", [])
+    api_endpoints = ctx.get("api_endpoints", [])
+    data_entities = ctx.get("data_entities", [])
+    decisions = ctx.get("decisions", [])
+
+    # Helper to find decision by type keyword
+    def find_decision_trace(keywords):
+        for dec in decisions:
+            dec_text = dec.get("decision", "").lower()
+            dec_type = dec.get("type", "").upper()
+            for kw in keywords:
+                if kw.lower() in dec_text or kw.upper() == dec_type:
+                    return f"DEC-{dec.get('id', '???')}"
+        return None
+
+    # =================================================================
+    # DOCS LANE: API Strategy + Internal Contract (FIX A)
+    # =================================================================
+    # Always generate API strategy task - removes false pressure for endpoints
+
+    task_counter["D"] += 1
+    streams["Docs"].append({
+        "id": f"T-D{task_counter['D']}",
+        "title": "Declare API strategy",
+        "dod": "SPEC includes API Strategy section with one of: No API (Streamlit local), Local API only, or Remote API",
+        "trace": "SPEC-API",
+        "priority": "HIGH",
+        "_key": "api_strategy"
+    })
+
+    # TASK 4: If endpoints=0, also require internal interface contract + implementation
+    if len(api_endpoints) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Define internal interface contract",
+            "dod": "SPEC Internal Interfaces lists >= 5 function signatures with return types and error semantics",
+            "trace": "SPEC-API",
+            "priority": "HIGH",
+            "_key": "internal_interface_contract"
+        })
+
+    # Additional docs blockers if truly missing
+    if len(user_stories) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Add User Stories to PRD",
+            "dod": "PRD contains >= 3 user stories with acceptance criteria",
+            "trace": "PRD-US",
+            "priority": "HIGH",
+            "_key": "user_stories"
+        })
+
+    if len(data_entities) == 0:
+        task_counter["D"] += 1
+        streams["Docs"].append({
+            "id": f"T-D{task_counter['D']}",
+            "title": "Define Data Model entities",
+            "dod": "SPEC Data Model lists >= 3 entities with fields and types",
+            "trace": "SPEC-DATA",
+            "priority": "HIGH",
+            "_key": "data_model_entities"
+        })
+
+    # Proposed decisions need finalization
+    for dec in decisions:
+        if "PROPOSED" in dec.get("status", "").upper():
+            task_counter["D"] += 1
+            streams["Docs"].append({
+                "id": f"T-D{task_counter['D']}",
+                "title": f"Finalize {dec.get('type', 'UNKNOWN')} decision {dec.get('id', '???')}",
+                "dod": "Decision reviewed and marked ACCEPTED or REJECTED",
+                "trace": f"DEC-{dec.get('id', '???')}"
+            })
+
+    # =================================================================
+    # BACKEND LANE: Spine First (INVARIANT A)
+    # =================================================================
+
+    spine_tasks = _build_backend_spine(ctx, task_counter, find_decision_trace)
+    streams["Backend"].extend(spine_tasks)
+
+    # FIX C: Strategy cartridge interface (unblocks US-02/US-03)
+    # TASK 1: Trace to DEC if strategy decision exists, else SPEC-DATA (not PRD-US:US-02)
+    # Gate on entities > 0: strategies operate on data, need data model first
+    if len(user_stories) > 0 and len(data_entities) > 0:
+        task_counter["B"] += 1
+        strategy_trace = find_decision_trace(["abc", "protocol", "strategy", "cartridge"]) or "SPEC-DATA"
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Define strategy cartridge interface",
+            "dod": "Abstract base class or protocol; required methods; params schema; example strategy passes contract test",
+            "trace": strategy_trace,
+            "priority": "HIGH",
+            "_key": "strategy_interface"
+        })
+
+    # TASK 4: If endpoints=0, add Backend implementation task for internal interfaces
+    # Gate on entities > 0: internal interfaces need data model to operate on
+    if len(api_endpoints) == 0 and len(user_stories) > 0 and len(data_entities) > 0:
+        task_counter["B"] += 1
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": "Implement internal interfaces v1",
+            "dod": "Implements all SPEC Internal Interfaces signatures; typed errors; unit tests for each signature",
+            "trace": "SPEC-API",
+            "priority": "HIGH",
+            "dep": "Docs:internal_interface_contract",
+            "_key": "internal_interfaces_impl"
+        })
+
+    # From API endpoints (if any)
+    for ep in api_endpoints:
+        task_counter["B"] += 1
+        method = ep.get("method", "GET")
+        path = ep.get("path", "/unknown")
+        streams["Backend"].append({
+            "id": f"T-B{task_counter['B']}",
+            "title": f"Implement {method} {path}",
+            "dod": "Endpoint returns correct response, validated against schema",
+            "trace": f"SPEC-API:{method} {path}"
+        })
+
+    # FIX B: Entity persistence consolidated into schema definition task
+    # No per-entity CRUD explosion - entity list is in spine schema task Detail field
+
+    # =================================================================
+    # FRONTEND LANE: Dependency-Aware Priority (INVARIANT C + FIX D)
+    # =================================================================
+    # FIX D: Limit P:HIGH to max 2 tasks (prioritize US-01 data load + US-04 metrics)
+    # TASK 2: Add machine-actionable Dep tags for schedulability
+    # FIX 2: Filter out "Acceptance:" pseudo-tasks
+    # FIX 3: Deduplicate story IDs
+
+    high_priority_story_ids = {"US-01", "US-04"}  # Data load + metrics view
+    frontend_high_count = 0
+    MAX_FRONTEND_HIGH = 2
+
+    # TASK 2 + FIX 6: Build story->backend deps ONLY from emitted tasks
+    # Collect all emitted task keys from Backend + Docs lanes
+    emitted_keys = set()
+    for task in streams["Backend"]:
+        if task.get("_key"):
+            emitted_keys.add(f"Backend:{task['_key']}")
+    for task in streams["Docs"]:
+        if task.get("_key"):
+            emitted_keys.add(f"Docs:{task['_key']}")
+
+    # Define ideal deps, then filter to only existing tasks
+    ideal_story_deps = {
+        "US-01": ["Backend:duckdb_ingest"],
+        "US-02": ["Backend:strategy_interface"],
+        "US-03": ["Backend:strategy_interface"],
+        "US-04": ["Backend:metrics", "Backend:runner_core"],
+        "US-05": ["Backend:runner_core", "Backend:query_layer"],
+        "US-06": ["Backend:txn_view"],
+        "US-07": ["Backend:results_store"],
+    }
+
+    # Build actual deps only from emitted keys
+    story_deps = {}
+    for story_id, deps in ideal_story_deps.items():
+        valid_deps = [d for d in deps if d in emitted_keys]
+        if valid_deps:
+            story_deps[story_id] = ",".join(valid_deps)
+
+    # FIX 3: Deduplicate stories by ID (keep first occurrence)
+    seen_story_ids = set()
+    deduplicated_stories = []
+    for story in user_stories:
+        story_id = story.get("id", "US-??")
+        if story_id not in seen_story_ids:
+            seen_story_ids.add(story_id)
+            deduplicated_stories.append(story)
+
+    for story in deduplicated_stories:
+        story_id = story.get("id", "US-??")
+        full_story = story.get("story", "")
+
+        # FIX 2: Skip if this looks like an "Acceptance:" pseudo-task
+        if "acceptance:" in full_story.lower()[:20] or story_id.startswith("ACC-"):
+            continue
+
+        short_title_base = _generate_short_title(full_story, 40)
+
+        # BOOTSTRAP MODE: Shape Frontend tasks as UI shell + placeholders
+        if len(data_entities) == 0:
+            task = {
+                "id": f"T-F{task_counter['F']}",
+                "title": f"{story_id} [Shell] {short_title_base}",
+                "dod": "UI shell renders; placeholder/loading states; no backend calls",
+                "trace": f"PRD-US:{story_id}",
+                "detail": f"(Bootstrap shell; unblocks after Docs:data_model_entities) {full_story}",
+                "blocked_by": "Docs:data_model_entities"
+            }
+            # No P:HIGH for bootstrap shells
+        else:
+            task = {
+                "id": f"T-F{task_counter['F']}",
+                "title": f"{story_id} {short_title_base}",
+                "dod": "Component renders, handles user interaction per story",
+                "trace": f"PRD-US:{story_id}",
+                "detail": full_story
+            }
+            # TASK 2: Add machine-actionable Dep tag if this story has known dependencies
+            if story_id in story_deps:
+                task["dep"] = story_deps[story_id]
+            # FIX D: Only US-01 and US-04 get P:HIGH (if spine exists)
+            if story_id in high_priority_story_ids and frontend_high_count < MAX_FRONTEND_HIGH:
+                task["priority"] = "HIGH"
+                frontend_high_count += 1
+        task_counter["F"] += 1
+
+        streams["Frontend"].append(task)
+
+    # =================================================================
+    # QA LANE: Decision Enforcement (INVARIANT B) + Story Tests
+    # =================================================================
+    # TASK 3: Add Level field and normalize harness language
+    # FIX 4: Domain-specific edge cases (not generic "empty input")
+
+    # Get decision-driven QA tasks
+    enforcement = _decision_enforcement_tasks(ctx, task_counter)
+
+    # Add enforcement QA tasks first (they're higher priority)
+    streams["QA"].extend(enforcement["qa"])
+
+    # =================================================================
+    # UNIT-LEVEL QA: Backend determinism + schema validation (~88/100)
+    # =================================================================
+    # These verify core backend invariants before integration tests
+
+    # 1) Runner + Metrics Determinism (requires entities)
+    if len(data_entities) > 0:
+        task_counter["Q"] += 1
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": "Runner + Metrics Determinism",
+            "dod": "pytest + golden fixtures; same input yields identical output; tests/test_determinism.py passes",
+            "trace": "Backend:runner_core,Backend:metrics",
+            "level": "UNIT",
+            "priority": "HIGH"
+        })
+
+    # 2) Snapshot Schema Validation + Backward Compat
+    if len(data_entities) > 0:
+        task_counter["Q"] += 1
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": "Snapshot Schema Validation",
+            "dod": "pytest; schema version header present; backward-compat loader works; tests/test_schema_compat.py passes",
+            "trace": "Backend:results_store",
+            "level": "UNIT"
+        })
+
+    # FIX 4: Domain-specific edge cases per story type
+    # BOOTSTRAP MODE: Different edge cases when entities=0 (no dataset to test against)
+    if len(data_entities) > 0:
+        domain_edge_cases = {
+            # Data loading
+            "load": "missing Parquet file, corrupt header, schema mismatch",
+            "ingest": "duplicate rows, null primary key, timezone mismatch",
+            # Strategy/backtest
+            "select": "strategy file not found, invalid params schema",
+            "run": "empty price series, single-day backtest, future leak attempt",
+            "backtest": "zero trades generated, negative position size",
+            # Metrics/results
+            "metrics": "division by zero (no trades), NaN in equity curve",
+            "results": "missing run_id, corrupt JSON, concurrent write",
+            "compare": "same run twice, incompatible date ranges",
+            # UI/display
+            "view": "empty dataset, 10k+ rows pagination, missing columns",
+            "equity": "flat equity line, single data point, extreme drawdown",
+            "transaction": "1000+ trades table, missing reason field",
+            "pipeline": "missing snapshot file, corrupt JSON, stage overflow",
+            "status": "all stages green, mixed red/yellow ordering",
+            # Parameters
+            "adjust": "out-of-range value, non-numeric input, boundary values",
+            "drag": "invalid date range, future dates, pre-data dates",
+        }
+    else:
+        # entities=0: UI scaffolding tests (domain-tuned even without data)
+        domain_edge_cases = {
+            # UI shell states
+            "view": "loading spinner, empty state placeholder, error boundary fallback",
+            "create": "form validation, required fields, invalid strategy path format",
+            "mark": "toggle state debounce, bulk selection edge, undo stack overflow",
+            "filter": "no matches found, clear all filters, filter state persistence",
+            "select": "dropdown empty state, unknown stage name, selection persistence",
+            "adjust": "slider bounds, reset to default, overly long input truncation",
+            # Domain-specific bootstrap edges
+            "status": "unknown pipeline stage, stale timestamp display",
+            "results": "snapshot schema version mismatch, missing run_id placeholder",
+            "pipeline": "malformed stage name, pipeline state corruption recovery",
+            "strategy": "invalid .py path, missing BaseStrategy class stub",
+            # Generic UI
+            "default": "responsive layout, accessibility, keyboard nav",
+        }
+
+    # Keywords to determine test level
+    backend_keywords = ["load", "run", "compute", "persist", "query", "ingest", "backtest"]
+
+    # FIX 3: Deduplicate QA stories too
+    seen_qa_ids = set()
+    for story in user_stories:
+        story_id = story.get("id", "US-??")
+
+        # Skip duplicates
+        if story_id in seen_qa_ids:
+            continue
+        seen_qa_ids.add(story_id)
+
+        # FIX 2: Skip Acceptance pseudo-tasks
+        full_story = story.get("story", "")
+        if "acceptance:" in full_story.lower()[:20]:
+            continue
+
+        story_text = full_story.lower()
+
+        # FIX 4: Find domain-specific edge case
+        # Default fallback is domain-tuned even when no keyword match
+        if len(data_entities) == 0:
+            edge_case = "component mount/unmount, async state race, error boundary"
+        else:
+            edge_case = "empty dataset, malformed input, timeout recovery"
+        for kw, ec in domain_edge_cases.items():
+            if kw in story_text:
+                edge_case = ec
+                break
+
+        # TASK 3: Determine Level and harness
+        # BOOTSTRAP MODE: Different harness when entities=0
+        is_backend = any(kw in story_text for kw in backend_keywords)
+        if is_backend and len(data_entities) > 0:
+            level = "INTEGRATION"
+            harness = "pytest + fixture dataset + deterministic seed"
+            blocked_by = None
+        elif is_backend and len(data_entities) == 0:
+            # Backend test without data - mark as blocked
+            level = "INTEGRATION"
+            harness = "pytest + mock data layer"
+            blocked_by = "Docs:data_model_entities"
+        else:
+            level = "UI_SMOKE"
+            harness = "pytest + Streamlit session state assertions"
+            # BOOTSTRAP MODE: UI_SMOKE also blocked until data model exists
+            blocked_by = "Docs:data_model_entities" if len(data_entities) == 0 else None
+
+        task_counter["Q"] += 1
+        qa_task = {
+            "id": f"T-Q{task_counter['Q']}",
+            "title": f"{story_id} Integration Test",
+            "dod": f"{harness}; covers happy path + edge: {edge_case}",
+            "trace": f"PRD-US:{story_id}",
+            "level": level
+        }
+        if blocked_by:
+            qa_task["blocked_by"] = blocked_by
+            qa_task["detail"] = "(Bootstrap test shell; unblocks after Docs:data_model_entities)"
+        streams["QA"].append(qa_task)
+
+    # API endpoint tests (if any) - TASK 3: Add Level field
+    for ep in api_endpoints[:3]:
+        task_counter["Q"] += 1
+        method = ep.get("method", "GET")
+        path = ep.get("path", "/unknown")
+        streams["QA"].append({
+            "id": f"T-Q{task_counter['Q']}",
+            "title": f"API test {method} {path}",
+            "dod": "pytest + fixture dataset + deterministic seed; validates response schema and status codes",
+            "trace": f"SPEC-API:{method} {path}",
+            "level": "INTEGRATION"
+        })
+
+    # =================================================================
+    # OPS LANE: Decision Implementation Tasks
+    # =================================================================
+
+    streams["Ops"].extend(enforcement["ops"])
+
+    # BOOTSTRAP MODE: Mark Ops tasks as Scaffold when entities=0
+    # Scaffold tasks are safe to run without backend/data model (setup configs, etc.)
+    if len(data_entities) == 0:
+        for task in streams["Ops"]:
+            task["scaffold"] = True
+            # Remove P:HIGH from scaffold tasks (they're not critical path)
+            task.pop("priority", None)
+
+    # =================================================================
+    # DEP VALIDATION: Strip invalid deps, add warnings (no asserts in prod)
+    # =================================================================
+    # Collect all emitted task keys across all lanes
+    all_emitted_keys = set()
+    for lane_name, lane_tasks in streams.items():
+        for task in lane_tasks:
+            if task.get("_key"):
+                all_emitted_keys.add(f"{lane_name}:{task['_key']}")
+
+    # Validate and fix deps + blocked_by (scheduler treats both as blocking)
+    invalid_deps_found = []
+    for lane_name, lane_tasks in streams.items():
+        for task in lane_tasks:
+            # Validate dep field
+            if "dep" in task:
+                deps = task["dep"].split(",")
+                valid_deps = []
+                for dep in deps:
+                    dep = dep.strip()
+                    if dep in all_emitted_keys:
+                        valid_deps.append(dep)
+                    else:
+                        invalid_deps_found.append((task.get("id", "?"), dep))
+
+                if valid_deps:
+                    task["dep"] = ",".join(valid_deps)
+                else:
+                    del task["dep"]  # Remove empty dep field
+
+            # Validate blocked_by field (same semantics as dep for scheduler)
+            if "blocked_by" in task:
+                blockers = task["blocked_by"].split(",")
+                valid_blockers = []
+                for blocker in blockers:
+                    blocker = blocker.strip()
+                    if blocker in all_emitted_keys:
+                        valid_blockers.append(blocker)
+                    else:
+                        invalid_deps_found.append((task.get("id", "?"), f"BlockedBy:{blocker}"))
+
+                if valid_blockers:
+                    task["blocked_by"] = ",".join(valid_blockers)
+                else:
+                    del task["blocked_by"]  # Remove invalid blocker
+
+    # Log warnings for invalid deps/blockers (visible in plan metadata)
+    dep_warnings = []
+    if invalid_deps_found:
+        for task_id, bad_dep in invalid_deps_found:
+            dep_warnings.append(f"Stripped invalid dep '{bad_dep}' from {task_id}")
+        _plan_debug(f"DEP VALIDATION: {len(invalid_deps_found)} invalid deps/blockers stripped")
+
+    # =================================================================
+    # BUILD MARKDOWN OUTPUT
+    # =================================================================
+
+    lines = [
+        f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "> Edit this file, then run `/accept-plan` to hydrate the database.",
+        "> Format: `- [ ] Lane: Title — DoD: ... | Trace: ... | Detail: ... | P:HIGH`",
+        ""
+    ]
+
+    total_tasks = 0
+    lanes_with_tasks = 0
+
+    for stream_name in ["Docs", "Backend", "Frontend", "QA", "Ops"]:
+        tasks = streams[stream_name]
+        if not tasks:
+            continue
+
+        lanes_with_tasks += 1
+        lines.append(f"## [{stream_name}]")
+        lines.append("")
+
+        for task in tasks:
+            total_tasks += 1
+            title = task.get("title", task.get("desc", ""))
+            dod = task.get("dod", "")
+            trace = task.get("trace", "")
+            detail = task.get("detail", "")
+            priority = task.get("priority", "")
+            plan_key = task.get("_key", "")
+
+            # Remove internal markers (but NOT scaffold yet - needed for rendering below)
+            task.pop("_spine", None)
+            task.pop("_enforcement", None)
+            task.pop("_key", None)
+
+            task_line = f"- [ ] {stream_name}: {title}"
+            if dod or trace or detail or priority:
+                task_line += " —"
+                if dod:
+                    task_line += f" DoD: {dod}"
+                if trace:
+                    task_line += f" | Trace: {trace}"
+                if detail:
+                    task_line += f" | Detail: {detail}"
+                # v19.10: Stable per-plan key (enables Dep/BlockedBy wiring on /accept-plan)
+                if plan_key:
+                    task_line += f" | K:{stream_name}:{plan_key}"
+                # TASK 2: Add Dep field if present
+                dep = task.get("dep", "")
+                if dep:
+                    task_line += f" | Dep: {dep}"
+                # BOOTSTRAP MODE: Add BlockedBy field if present (entities=0 case)
+                blocked_by = task.get("blocked_by", "")
+                if blocked_by:
+                    task_line += f" | BlockedBy: {blocked_by}"
+                # TASK 3: Add Level field if present
+                level = task.get("level", "")
+                if level:
+                    task_line += f" | Level: {level}"
+                # BOOTSTRAP MODE: Add Scaffold tag if present (safe to run without data)
+                scaffold = task.get("scaffold", False)
+                if scaffold:
+                    task_line += " | Scaffold"
+                if priority:
+                    task_line += f" | P:{priority}"
+
+            lines.append(task_line)
+
+        lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        f"<!-- Plan generated: {datetime.now().isoformat()} -->",
+        f"<!-- Tasks: {total_tasks} | Lanes: {lanes_with_tasks} -->",
+        f"<!-- Anchors: stories={len(user_stories)}, endpoints={len(api_endpoints)}, entities={len(data_entities)}, decisions={len(decisions)} -->",
+        ""
+    ])
+
+    _plan_debug(f"Built plan: {total_tasks} tasks across {lanes_with_tasks} lanes")
+
+    return "\n".join(lines)
+
+
+def build_plan_from_context_structured(ctx: dict) -> dict:
+    """
+    Generate a structured plan dict with status and streams.
+
+    This is a structured alternative to build_plan_from_context() which
+    returns markdown. Use this when you need programmatic access to plan data.
+
+    Returns:
+        dict: {"status": "OK"|"INSUFFICIENT_CONTEXT", "streams": [...]}
+    """
+    # Check if context is sufficient (status only; tasks still generated deterministically)
+    is_sufficient, _ = _context_is_sufficient(ctx)
+
+    plan_md = build_plan_from_context(ctx)
+    streams_list = []
+    current_stream = None
+
+    for raw_line in plan_md.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Stream header: "## [Backend]"
+        if line.startswith("## [") and line.endswith("]"):
+            name = line[len("## ["):-1].strip()
+            current_stream = {"name": name, "tasks": []}
+            streams_list.append(current_stream)
+            continue
+
+        # Task line: "- [ ] Backend: Title — DoD: ... | Trace: ..."
+        if current_stream and line.startswith("- [ ]"):
+            task = {"raw": line}
+
+            # Lane + title (best-effort)
+            try:
+                # Strip checkbox prefix
+                body = line.split("]", 1)[1].strip()
+                m = re.match(r"^(\w+):\s*(.+?)(?:\s+—\s+|$)", body)
+                if m:
+                    task["lane"] = m.group(1).lower()
+                    task["title"] = m.group(2).strip()
+                else:
+                    task["lane"] = str(current_stream.get("name", "")).lower()
+                    task["title"] = body
+            except Exception:
+                task["lane"] = str(current_stream.get("name", "")).lower()
+                task["title"] = line
+
+            # Common tags (best-effort; keep raw for anything else)
+            trace_match = re.search(r"\|\s*Trace:\s*([^|]+)", line)
+            if trace_match:
+                task["trace"] = trace_match.group(1).strip()
+
+            detail_match = re.search(r"\|\s*Detail:\s*([^|]+)", line)
+            if detail_match:
+                task["detail"] = detail_match.group(1).strip()
+
+            dep_match = re.search(r"\|\s*Dep:\s*([^|]+)", line)
+            if dep_match:
+                task["dep"] = dep_match.group(1).strip()
+
+            blocked_match = re.search(r"\|\s*BlockedBy:\s*([^|]+)", line)
+            if blocked_match:
+                task["blocked_by"] = blocked_match.group(1).strip()
+
+            level_match = re.search(r"\|\s*Level:\s*([^|]+)", line)
+            if level_match:
+                task["level"] = level_match.group(1).strip()
+
+            priority_match = re.search(r"\|\s*P:([A-Z]+)\b", line)
+            if priority_match:
+                task["priority"] = priority_match.group(1).strip().upper()
+
+            key_match = re.search(r"\|\s*K:\s*([^|]+)", line)
+            if key_match:
+                task["plan_key"] = key_match.group(1).strip()
+
+            if "| Scaffold" in line:
+                task["scaffold"] = True
+
+            current_stream["tasks"].append(task)
+
+    return {
+        "status": "OK" if is_sufficient else "INSUFFICIENT_CONTEXT",
+        "streams": streams_list
+    }
+
+
+def _assess_plan_quality(plan: dict, context: dict) -> dict:
+    """
+    Assess the quality of a generated plan.
+
+    Args:
+        plan: dict with "streams" key containing task lists
+        context: dict with extracted context (user_stories, api_endpoints, etc.)
+
+    Returns:
+        dict: {"level": "OK"|"BAD"|"THIN", "reason": "..."}
+
+    Thresholds:
+        - MIN_TASKS: 10
+        - MIN_STREAMS: 3
+    """
+    MIN_TASKS = 10
+    MIN_STREAMS = 3
+
+    streams = plan.get("streams", [])
+    total_tasks = sum(len(s.get("tasks", [])) for s in streams)
+    stream_count = len(streams)
+
+    # Check task count
+    if total_tasks < MIN_TASKS:
+        return {
+            "level": "BAD",
+            "reason": "TOO_FEW_TASKS",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    # Check stream count
+    if stream_count < MIN_STREAMS:
+        return {
+            "level": "BAD",
+            "reason": "TOO_FEW_STREAMS",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    # Check if thin (passes thresholds but barely)
+    # THIN = meets minimum but not comfortable margin
+    if total_tasks < MIN_TASKS + 2 or stream_count < MIN_STREAMS:
+        return {
+            "level": "THIN",
+            "reason": "MEETS_MINIMUM",
+            "task_count": total_tasks,
+            "stream_count": stream_count
+        }
+
+    return {
+        "level": "OK",
+        "reason": "SUFFICIENT",
+        "task_count": total_tasks,
+        "stream_count": stream_count
+    }
+
+
 # PLAN-AS-CODE SYSTEM (v13.5.5)
 # =============================================================================
 # Tools for cached plan preview on startup and plan file workflow:
@@ -1321,12 +3492,15 @@ A task is "reviewable" when:
 @mcp.tool()
 def refresh_plan_preview() -> str:
     """
-    Regenerates the plan preview by reading ACTIVE_SPEC.md and tasks.
-    This is the SLOW operation - may involve LLM calls.
-    Use sparingly (e.g., after spec changes).
+    v17.0: Regenerates the plan preview from document extraction.
 
-    Returns the newly generated plan preview JSON.
+    Uses deterministic extraction from PRD/SPEC/DECISION_LOG.
+    Updates the cache with extraction counts and quality status.
+
+    Returns JSON with extraction results and quality assessment.
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -1341,46 +3515,42 @@ def refresh_plan_preview() -> str:
         pass  # Fail open if readiness check fails
 
     cache_path = get_plan_preview_path()
-    
+
     try:
-        # Load current tasks from state
-        state = load_state()
-        tasks = state.get("tasks", {})
-        
-        # Group tasks by type (workstream)
-        streams = {}
-        for task_id, task in tasks.items():
-            task_type = task.get("type", "unknown")
-            stream_name = task_type.capitalize()
-            
-            if stream_name not in streams:
-                streams[stream_name] = []
-            
-            # Only include pending/in_progress tasks
-            if task.get("status") in ["pending", "in_progress", "blocked"]:
-                streams[stream_name].append({
-                    "id": task_id,
-                    "desc": task.get("desc", "No description"),
-                    "status": task.get("status", "pending"),
-                    "priority": task.get("priority", 1)
-                })
-        
-        # Sort tasks by priority within each stream
-        for stream_name in streams:
-            streams[stream_name].sort(key=lambda t: t.get("priority", 1), reverse=True)
-        
-        # Build the plan preview structure
+        # v17.0: Extract context from documents
+        ctx = extract_project_context(base_dir=BASE_DIR)
+        _plan_debug(f"Refresh extraction: {ctx['debug']['counts']}")
+
+        # Check sufficiency
+        is_sufficient, reasons = _context_is_sufficient(ctx)
+
+        # Estimate task/lane counts
+        counts = ctx["debug"]["counts"]
+        estimated_tasks = (
+            counts["api_endpoints"] +
+            counts["data_entities"] +
+            (counts["user_stories"] * 2) +
+            counts["decisions"]
+        )
+        estimated_lanes = sum([
+            1 if counts["api_endpoints"] > 0 or counts["data_entities"] > 0 else 0,  # Backend
+            1 if counts["user_stories"] > 0 else 0,  # Frontend
+            1 if counts["user_stories"] > 0 or counts["api_endpoints"] > 0 else 0,  # QA
+            1 if counts["decisions"] > 0 else 0,  # Ops/Docs
+        ])
+
+        # Build cache structure
         plan = {
-            "status": "FRESH",
+            "status": "FRESH" if is_sufficient else "INSUFFICIENT_CONTEXT",
             "generated_at": time.time(),
-            "source": "tasks.json",
-            "streams": [
-                {"name": name, "tasks": tasks_list}
-                for name, tasks_list in streams.items()
-                if tasks_list  # Only include non-empty streams
-            ]
+            "source": "doc_extraction",
+            "counts": counts,
+            "estimated_tasks": estimated_tasks,
+            "estimated_lanes": estimated_lanes,
+            "is_sufficient": is_sufficient,
+            "reasons": reasons
         }
-        
+
         # Write to cache
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
@@ -1392,14 +3562,15 @@ def refresh_plan_preview() -> str:
             plan["active_spec_updated"] = hydration_result.get("path")
             plan["hydration_note"] = f"ACTIVE_SPEC updated: {hydration_result.get('reason')}"
         else:
-            # Log warning but don't block
             plan["hydration_warning"] = hydration_result.get("reason", "Unknown error")
 
         return json.dumps(plan)
+
     except Exception as e:
         return json.dumps({
             "status": "ERROR",
             "reason": f"Failed to refresh plan: {e}",
+            "traceback": tb.format_exc(),
             "streams": []
         })
 
@@ -1407,11 +3578,19 @@ def refresh_plan_preview() -> str:
 @mcp.tool()
 def draft_plan() -> str:
     """
-    Creates a draft plan markdown file from the cached plan preview.
-    Opens the file for user editing.
+    v17.0: Creates a draft plan from document extraction (PRD/SPEC/DECISION_LOG).
 
-    Returns the path to the created file.
+    Uses deterministic extraction to generate multi-stream roadmap.
+    Falls back to "missing context" checklist if docs are insufficient.
+
+    Returns JSON with:
+    - status: OK | INSUFFICIENT_CONTEXT | BLOCKED | ERROR
+    - path: Path to generated draft file
+    - plan_quality: OK | INSUFFICIENT_CONTEXT
+    - counts: Extraction statistics
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -1425,93 +3604,152 @@ def draft_plan() -> str:
     except Exception:
         pass  # Fail open if readiness check fails
 
-    cache_path = get_plan_preview_path()
-    
     try:
-        # Load cached plan
-        if os.path.exists(cache_path):
-            with open(cache_path, "r", encoding="utf-8") as f:
-                plan = json.load(f)
-        else:
-            plan = {"streams": []}
-        
+        # v17.0: Extract context from documents
+        ctx = extract_project_context(base_dir=BASE_DIR)
+        _plan_debug(f"Extraction complete: {ctx['debug']['counts']}")
+
+        # Check if context is sufficient
+        is_sufficient, reasons = _context_is_sufficient(ctx)
+
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         plans_dir = os.path.join(DOCS_DIR, "PLANS")
         os.makedirs(plans_dir, exist_ok=True)
-        
         draft_path = os.path.join(plans_dir, f"draft_{timestamp}.md")
-        
-        # Generate markdown content
-        lines = [
-            f"# Draft Plan - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "",
-            "> Edit this file, then run `/accept-plan` to hydrate the database.",
-            "> Format: `- [ ] Type: Description`",
-            "",
-        ]
-        
-        for stream in plan.get("streams", []):
-            stream_name = stream.get("name", "Unknown")
-            lines.append(f"## [{stream_name}]")
-            lines.append("")
-            
-            for task in stream.get("tasks", []):
-                task_id = task.get("id", "")
-                desc = task.get("desc", "")
-                status = task.get("status", "pending")
-                
-                # Use checkbox format
-                checkbox = "[x]" if status == "completed" else "[ ]"
-                lines.append(f"- {checkbox} {stream_name}: {desc}")
-            
-            lines.append("")
-        
-        # If no streams, add a template
-        if not plan.get("streams"):
-            lines.extend([
-                "## [Backend]",
-                "",
-                "- [ ] Backend: API endpoint for user authentication",
-                "- [ ] Backend: Rate limiting middleware",
-                "",
-                "## [Frontend]",
-                "",
-                "- [ ] Frontend: Login form component",
-                "- [ ] Frontend: Dashboard layout",
-                "",
-            ])
-        
+
+        if not is_sufficient:
+            # Generate missing-context checklist (NOT generic auth/login template)
+            plan_content = _generate_missing_context_plan(ctx, reasons)
+            plan_quality = "INSUFFICIENT_CONTEXT"
+            _plan_debug(f"Generated INSUFFICIENT_CONTEXT plan: {reasons}")
+        else:
+            # Generate full multi-stream plan from context
+            plan_content = build_plan_from_context(ctx)
+            plan_quality = "OK"
+            _plan_debug("Generated OK plan from context")
+
         # Write the file
         with open(draft_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        
+            f.write(plan_content)
+
+        # Count tasks in generated plan
+        task_count = plan_content.count("- [ ]")
+        lane_count = plan_content.count("## [")
+
+        # Also update the cache for refresh_plan_preview compatibility
+        cache_path = get_plan_preview_path()
+        cache_data = {
+            "status": plan_quality,
+            "generated_at": time.time(),
+            "source": "doc_extraction",
+            "counts": ctx["debug"]["counts"],
+            "task_count": task_count,
+            "lane_count": lane_count
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+
         return json.dumps({
             "status": "OK",
             "path": draft_path,
-            "message": f"Draft created: {draft_path}"
+            "message": f"Draft created: {draft_path}",
+            "plan_quality": plan_quality,
+            "task_count": task_count,
+            "lane_count": lane_count,
+            "anchors": ctx["debug"]["counts"],
+            "reasons": reasons if not is_sufficient else []
         })
+
     except Exception as e:
+        # Return valid JSON with traceback for debugging
         return json.dumps({
             "status": "ERROR",
-            "message": f"Failed to create draft: {e}"
+            "message": f"Failed to create draft: {e}",
+            "traceback": tb.format_exc(),
+            "paths": {
+                "base_dir": BASE_DIR,
+                "docs_dir": DOCS_DIR
+            }
         })
+
+
+# =============================================================================
+# v18.0: EXECUTION CLASS CLASSIFIER
+# =============================================================================
+def classify_exec_class(lane: str, desc: str, override: str = None) -> str:
+    """
+    Classify task execution class for parallel scheduling safety.
+
+    Args:
+        lane: Task lane (backend, frontend, qa, ops, docs)
+        desc: Task description
+        override: Explicit override from plan syntax (EXC, PAR, ADD)
+
+    Returns:
+        exec_class: "exclusive" | "parallel_safe" | "additive"
+
+    Rules:
+        - Override syntax (| X:EXC/PAR/ADD) always wins
+        - Read-only verbs → parallel_safe (review, audit, analyze, verify, summarize, document, report)
+        - Additive verbs WITHOUT exclusive verbs → additive (create, add, new, build)
+        - Exclusive verbs → exclusive (refactor, remove, update, rename, modify, change, delete, fix)
+        - Default → exclusive (safe default for mutation)
+    """
+    # Override always wins
+    if override:
+        override_map = {"EXC": "exclusive", "PAR": "parallel_safe", "ADD": "additive"}
+        return override_map.get(override.upper(), "exclusive")
+
+    desc_lower = desc.lower()
+
+    # Define verb categories
+    # Note: "build" excluded from additive - ambiguous (often modifies existing)
+    EXCLUSIVE_VERBS = ["refactor", "remove", "update", "rename", "modify", "change", "delete", "fix"]
+    READ_ONLY_VERBS = ["review", "audit", "analyze", "verify", "summarize", "document", "report"]
+    ADDITIVE_VERBS = ["create", "add"]  # Clear file creation patterns only
+
+    has_exclusive = any(verb in desc_lower for verb in EXCLUSIVE_VERBS)
+    has_read_only = any(verb in desc_lower for verb in READ_ONLY_VERBS)
+    has_additive = any(verb in desc_lower for verb in ADDITIVE_VERBS)
+
+    # Exclusive verbs win over everything (mutates existing state)
+    if has_exclusive:
+        return "exclusive"
+
+    # Read-only verbs → parallel_safe (safe to run concurrently)
+    if has_read_only:
+        return "parallel_safe"
+
+    # Additive verbs → additive (creates new files, doesn't modify existing)
+    if has_additive:
+        return "additive"
+
+    # Default: exclusive (safe default)
+    return "exclusive"
 
 
 @mcp.tool()
 def accept_plan(path: str) -> str:
     """
-    Parses a plan markdown file and hydrates the database with tasks.
+    v18.0: Parses a plan markdown file and hydrates SQLite with tasks.
 
     Args:
         path: Path to the plan markdown file
 
     Expected format:
-        - [ ] Type: Description
+        - [ ] Type: Description -- DoD: ... | Trace: ... [| P:URGENT|HIGH] [| X:EXC|PAR|ADD]
+              [| K:<lane:key>] [| Dep:<ref,...>] [| BlockedBy:<ref,...>]
         - [x] Type: Description (already done, skipped)
 
-    Returns summary of created tasks.
+    Returns summary of created tasks with v18.0 fields.
+
+    Idempotency:
+        - Plan hash computed from content; duplicate plans rejected (ALREADY_ACCEPTED)
+        - Task signature = sha1(lane:desc:trace); duplicate tasks within plan skipped
     """
+    import traceback as tb
+
     # v14.0: CONTEXT GATE - Block in BOOTSTRAP mode
     try:
         readiness = json.loads(get_context_readiness())
@@ -1530,69 +3768,1141 @@ def accept_plan(path: str) -> str:
         if not os.path.isabs(path):
             plans_dir = os.path.join(DOCS_DIR, "PLANS")
             path = os.path.join(plans_dir, path)
-        
+
         if not os.path.exists(path):
             return json.dumps({
                 "status": "ERROR",
                 "message": f"File not found: {path}"
             })
-        
+
         # Read the file
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        
-        # Parse task lines
-        # Pattern: - [ ] Type: Description
+
+        # v18.0: Compute source_plan_hash for idempotency
+        source_plan_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
+
+        def _normalize_key(raw_key: str, default_lane: str) -> str:
+            token = (raw_key or "").strip()
+            if not token:
+                return ""
+            if ":" in token:
+                prefix, rest = token.split(":", 1)
+                prefix = prefix.strip().lower()
+                rest = rest.strip()
+                return f"{prefix}:{rest}" if rest else ""
+            return f"{default_lane.lower()}:{token}"
+
+        def _normalize_dep_ref(raw_ref: str, default_lane: str):
+            token = (raw_ref or "").strip()
+            if not token:
+                return None
+            if token.isdigit():
+                return int(token)
+            return _normalize_key(token, default_lane)
+
+        # v18.0: Enhanced task pattern with optional modifiers
+        # - [ ] Type: Description -- DoD: ... | Trace: ... | P:URGENT | X:PAR | K:docs:foo | Dep:docs:bar
         task_pattern = r"^-\s*\[\s*\]\s*(\w+):\s*(.+)$"
-        
+
         created = []
-        state = load_state()
-        tasks = state.get("tasks", {})
-        
-        for line in content.split("\n"):
-            match = re.match(task_pattern, line.strip())
-            if match:
+        skipped_duplicates = 0
+        now = int(time.time())
+
+        # Track lane_rank per lane for ordering within lane
+        lane_ranks = {lane: 0 for lane in LANE_ORDER}
+
+        tasks_to_insert = []
+
+        # Single tight transaction: idempotency check + inserts + dep resolution
+        with get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE source_plan_hash = ?",
+                (source_plan_hash,)
+            ).fetchone()[0]
+            if existing > 0:
+                return json.dumps({
+                    "status": "ALREADY_ACCEPTED",
+                    "plan_hash": source_plan_hash,
+                    "message": f"Plan already accepted ({existing} tasks from this plan)"
+                })
+
+            existing_sigs = set(
+                row[0] for row in conn.execute(
+                    "SELECT task_signature FROM tasks WHERE task_signature != ''"
+                ).fetchall()
+            )
+
+            # Feature-detect optional columns for forward/backward compatibility
+            try:
+                task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            except Exception:
+                task_cols = set()
+            has_plan_key_col = "plan_key" in task_cols
+
+            for line in content.split("\n"):
+                match = re.match(task_pattern, line.strip())
+                if not match:
+                    continue
+
                 task_type = match.group(1).lower()
-                desc = match.group(2).strip()
-                
-                # Generate task ID
-                existing_ids = [t.get("id", "") for t in tasks.values()]
-                prefix = task_type[0].upper()
-                idx = 1
-                while f"T-{prefix}{idx}" in existing_ids:
-                    idx += 1
-                task_id = f"T-{prefix}{idx}"
-                
-                # Create task (initial creation, not mutation)
-                tasks[task_id] = {
-                    "id": task_id,
+                full_desc = match.group(2).strip()
+
+                # v18.0: Normalize lane
+                lane = task_type if task_type in LANE_WEIGHTS else "backend"
+
+                # Extract Trace if present
+                trace = ""
+                trace_match = re.search(r'\|\s*Trace:\s*([^\|]+)', full_desc)
+                if trace_match:
+                    trace = trace_match.group(1).strip()
+
+                # Extract priority override (P:URGENT or P:HIGH)
+                priority_override = None
+                priority_match = re.search(r'\|\s*P:(URGENT|HIGH)\b', full_desc, re.IGNORECASE)
+                if priority_match:
+                    priority_override = priority_match.group(1).upper()
+
+                # Extract exec_class override (X:EXC, X:PAR, X:ADD)
+                exec_class_override = None
+                exec_match = re.search(r'\|\s*X:(EXC|PAR|ADD)\b', full_desc, re.IGNORECASE)
+                if exec_match:
+                    exec_class_override = exec_match.group(1).upper()
+
+                # Extract optional plan key (K:) for dependency wiring
+                plan_key = ""
+                key_match = re.search(r'\|\s*K:\s*([^\|]+)', full_desc)
+                if key_match:
+                    plan_key = _normalize_key(key_match.group(1), lane)
+
+                # Remove internal tags from stored description (keep DoD/Trace/etc)
+                desc = re.sub(r'\|\s*K:\s*[^\|]+', '', full_desc).strip()
+
+                # v19.0+: Extract Dep: and BlockedBy:
+                deps_tokens = []
+                dep_match = re.search(r'\|\s*Dep:\s*([^\|]+)', full_desc)
+                if dep_match:
+                    deps_tokens.extend([d.strip() for d in dep_match.group(1).split(',') if d.strip()])
+                blocked_match = re.search(r'\|\s*BlockedBy:\s*([^\|]+)', full_desc)
+                if blocked_match:
+                    deps_tokens.extend([d.strip() for d in blocked_match.group(1).split(',') if d.strip()])
+
+                deps_norm = []
+                for tok in deps_tokens:
+                    ref = _normalize_dep_ref(tok, lane)
+                    if ref is not None:
+                        deps_norm.append(ref)
+
+                # v18.0: Compute priority
+                # URGENT=0, HIGH=5, else lane weight
+                if priority_override == "URGENT":
+                    priority = 0
+                elif priority_override == "HIGH":
+                    priority = 5
+                else:
+                    priority = LANE_WEIGHTS.get(lane, 50)
+
+                # v18.0: Classify exec_class
+                exec_class = classify_exec_class(lane, desc, exec_class_override)
+
+                # v18.0: Compute task_signature = sha1(lane:desc:trace)
+                sig_input = f"{lane}:{desc}:{trace}"
+                task_signature = hashlib.sha1(sig_input.encode("utf-8")).hexdigest()
+
+                # v18.0: Skip duplicate tasks (same signature already exists)
+                if task_signature in existing_sigs:
+                    skipped_duplicates += 1
+                    continue
+
+                # Add to existing_sigs to catch duplicates within same plan
+                existing_sigs.add(task_signature)
+
+                # v18.0: Compute lane_rank (order within lane)
+                lane_rank = lane_ranks.get(lane, 0)
+                lane_ranks[lane] = lane_rank + 1
+
+                tasks_to_insert.append({
                     "type": task_type,
                     "desc": desc,
-                    "status": "pending",  # SAFETY-ALLOW: status-write (initial task creation)
-                    "priority": 1,
-                    "created_at": int(time.time()),
-                    "source": os.path.basename(path)
-                }
-                
-                created.append({"id": task_id, "type": task_type, "desc": desc})
-        
-        # Save state
-        state["tasks"] = tasks
-        save_state(state)
-        
-        # Also refresh the plan preview cache
-        refresh_plan_preview()
-        
+                    "lane": lane,
+                    "priority": priority,
+                    "lane_rank": lane_rank,
+                    "created_at": now,
+                    "exec_class": exec_class,
+                    "task_signature": task_signature,
+                    "source_plan_hash": source_plan_hash,
+                    "trace": trace,
+                    "plan_key": plan_key,
+                    "deps_tokens": deps_norm,
+                })
+
+            inserted = []
+            key_to_id = {}
+            unresolved_deps = []
+
+            for task in tasks_to_insert:
+                if has_plan_key_col:
+                    cursor = conn.execute(
+                        """INSERT INTO tasks (
+                            type, desc, status, priority, updated_at,
+                            lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash, deps, plan_key
+                        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
+                        (
+                            task["type"],
+                            task["desc"],
+                            task["priority"],
+                            now,
+                            task["lane"],
+                            task["lane_rank"],
+                            task["created_at"],
+                            task["exec_class"],
+                            task["task_signature"],
+                            task["source_plan_hash"],
+                            "[]",  # deps resolved after we know IDs
+                            task.get("plan_key", "") or "",
+                        )
+                    )
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO tasks (
+                            type, desc, status, priority, updated_at,
+                            lane, lane_rank, created_at, exec_class, task_signature, source_plan_hash, deps
+                        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",  # SAFETY-ALLOW: status-write (initial task creation)
+                        (
+                            task["type"],
+                            task["desc"],
+                            task["priority"],
+                            now,
+                            task["lane"],
+                            task["lane_rank"],
+                            task["created_at"],
+                            task["exec_class"],
+                            task["task_signature"],
+                            task["source_plan_hash"],
+                            "[]",  # deps resolved after we know IDs
+                        )
+                    )
+
+                task_id = cursor.lastrowid
+                task["id"] = task_id
+                inserted.append(task)
+
+                if task.get("plan_key"):
+                    # Last write wins; ambiguity is surfaced via unresolved deps during resolution.
+                    key_to_id[task["plan_key"]] = task_id
+
+                created.append({
+                    "id": task_id,
+                    "type": task["type"],
+                    "desc": task["desc"],
+                    "lane": task["lane"],
+                    "priority": task["priority"],
+                    "lane_rank": task["lane_rank"],
+                    "created_at": task["created_at"],
+                    "exec_class": task["exec_class"],
+                    "task_signature": task["task_signature"],
+                })
+
+            # Resolve deps: key refs -> task IDs; keep unknown tokens to block + surface.
+            for task in inserted:
+                resolved = []
+                for ref in task.get("deps_tokens", []):
+                    if isinstance(ref, int):
+                        resolved.append(ref)
+                    elif isinstance(ref, str) and ref in key_to_id:
+                        resolved.append(key_to_id[ref])
+                    else:
+                        resolved.append(ref)
+
+                # De-duplicate while preserving order
+                seen = set()
+                deps_final = []
+                for ref in resolved:
+                    if ref in seen:
+                        continue
+                    seen.add(ref)
+                    deps_final.append(ref)
+
+                conn.execute(
+                    "UPDATE tasks SET deps=? WHERE id=?",
+                    (json.dumps(deps_final), task["id"])
+                )
+
+                unresolved = [d for d in deps_final if isinstance(d, str)]
+                if unresolved:
+                    unresolved_deps.append({"id": task["id"], "unresolved": unresolved[:5]})
+
+            conn.commit()
+
+        if unresolved_deps:
+            server_logger.warning(f"accept_plan: {len(unresolved_deps)} task(s) have unresolved deps (will remain blocked)")
+
+        # v18.0: Create plan_preview.json derived from SQLite
+        _write_plan_preview_from_sqlite()
+
         return json.dumps({
             "status": "OK",
             "created_count": len(created),
+            "skipped_duplicates": skipped_duplicates,
+            "plan_hash": source_plan_hash,
             "tasks": created,
+            "unresolved_deps": unresolved_deps[:10],
             "message": f"Created {len(created)} tasks from {os.path.basename(path)}"
         })
     except Exception as e:
         return json.dumps({
             "status": "ERROR",
-            "message": f"Failed to accept plan: {e}"
+            "message": f"Failed to accept plan: {e}",
+            "traceback": tb.format_exc()
+        })
+
+
+def _write_plan_preview_from_sqlite():
+    """
+    v18.0: Write plan_preview.json derived from SQLite tasks table.
+
+    Marks the file with source='sqlite:mesh.db' and _derived=True to indicate
+    it's a cache derived from SQLite (not authoritative).
+    """
+    try:
+        preview_path = get_plan_preview_path()
+
+        with get_db() as conn:
+            tasks = conn.execute(
+                """SELECT id, type, desc, status, lane, priority, lane_rank,
+                          created_at, exec_class, task_signature
+                   FROM tasks
+                   WHERE status IN ('pending', 'in_progress', 'blocked')
+                   ORDER BY priority ASC, lane_rank ASC, id ASC"""
+            ).fetchall()
+
+        # Group tasks by lane
+        streams = {}
+        for task in tasks:
+            lane = task["lane"] or task["type"]
+            if lane not in streams:
+                streams[lane] = {"name": lane.capitalize(), "tasks": []}
+            streams[lane]["tasks"].append({
+                "id": task["id"],
+                "desc": task["desc"],
+                "status": task["status"],
+                "priority": task["priority"],
+                "exec_class": task["exec_class"],
+            })
+
+        # Build preview structure
+        preview = {
+            "source": "sqlite:mesh.db",
+            "_derived": True,
+            "generated_at": int(time.time()),
+            "streams": list(streams.values()),
+        }
+
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        with open(preview_path, "w", encoding="utf-8") as f:
+            json.dump(preview, f, indent=2)
+
+    except Exception as e:
+        server_logger.warning(f"Failed to write plan_preview.json: {e}")
+
+
+# =============================================================================
+# v18.0: BRAIDED STREAM SCHEDULER
+# =============================================================================
+
+def _read_lane_pointer(conn=None) -> dict:
+    """
+    Read the lane pointer state from persistent storage.
+
+    Returns:
+        dict with "index" key (default 0 if file missing/corrupt)
+    """
+    # Prefer SQLite-backed pointer when a connection is available (transactional + concurrent-safe).
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key='scheduler_lane_pointer'"
+            ).fetchone()
+            if row and row[0]:
+                data = json.loads(row[0])
+                if isinstance(data, dict) and isinstance(data.get("index"), int):
+                    return data
+        except Exception:
+            pass  # Fail open to file-backed pointer
+
+    pointer_file = _get_lane_pointer_file()
+    try:
+        if os.path.exists(pointer_file):
+            with open(pointer_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data.get("index"), int):
+                    return data
+    except (json.JSONDecodeError, IOError, KeyError):
+        pass  # Corrupt or missing - reset to default
+    return {"index": 0}
+
+
+def _write_lane_pointer(index: int, lane: str = None, conn=None):
+    """
+    Write lane pointer state atomically (write temp then replace).
+
+    Args:
+        index: Lane index in LANE_ORDER (wraps around)
+        lane: Optional lane name for debugging
+    """
+    pointer_file = _get_lane_pointer_file()
+    os.makedirs(os.path.dirname(pointer_file), exist_ok=True)
+
+    # Wrap index
+    wrapped_index = index % len(LANE_ORDER) if index >= 0 else 0
+
+    data = {
+        "index": wrapped_index,
+        "lane": lane or LANE_ORDER[wrapped_index] if wrapped_index < len(LANE_ORDER) else None,
+        "updated_at": int(time.time())
+    }
+
+    # Persist in SQLite config when possible (keeps pointer in same transaction as scheduling).
+    if conn is not None:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('scheduler_lane_pointer', ?)",
+                (json.dumps(data),)
+            )
+        except Exception:
+            pass  # Fail open to file-backed pointer only
+
+    # Atomic write: temp file then replace
+    import uuid
+    temp_file = pointer_file + f".tmp.{uuid.uuid4().hex}"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(temp_file, pointer_file)
+    except Exception as e:
+        server_logger.warning(f"Failed to write lane pointer: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+def _write_scheduler_last_decision(conn, payload: dict):
+    """Persist last scheduler decision for UI/observability (best-effort)."""
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES ('scheduler_last_decision', ?)",
+            (json.dumps(payload),)
+        )
+    except Exception:
+        pass
+
+
+def _increment_config_counter(conn, key: str, delta: int = 1):
+    """Atomic-ish integer counter using config table (best-effort)."""
+    if conn is None:
+        return
+    try:
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, '0')", (key,))
+        conn.execute(
+            "UPDATE config SET value = CAST(value AS INTEGER) + ? WHERE key = ?",
+            (int(delta), key)
+        )
+    except Exception:
+        # Metrics must never break scheduling.
+        pass
+
+
+def _write_config_json(conn, key: str, payload: dict):
+    """Best-effort JSON value write to config table."""
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            (key, json.dumps(payload)),
+        )
+    except Exception:
+        pass
+
+
+def _normalize_task_lane_fields(conn, now: int) -> dict:
+    """
+    Repair legacy/partial rows so braided scheduling can operate safely.
+    - lane missing -> lane := lower(type) for known lanes
+    - lane_rank missing -> lane_rank := index in LANE_ORDER
+    - created_at missing (0) -> created_at := updated_at (or now)
+    Best-effort; no-op when schema lacks columns.
+    """
+    result = {"lane_filled": 0, "lane_rank_fixed": 0, "created_at_fixed": 0}
+    if conn is None:
+        return result
+
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    except Exception:
+        return result
+
+    if {"lane", "type"} <= cols:
+        try:
+            placeholders = ",".join("?" * len(LANE_ORDER))
+            cursor = conn.execute(
+                f"""UPDATE tasks
+                    SET lane = lower(type)
+                    WHERE (lane IS NULL OR lane = '')
+                      AND lower(type) IN ({placeholders})""",
+                list(LANE_ORDER),
+            )
+            result["lane_filled"] = cursor.rowcount
+        except Exception:
+            pass
+
+    if {"lane_rank", "lane"} <= cols:
+        try:
+            cursor = conn.execute(
+                """UPDATE tasks
+                   SET lane_rank = CASE lower(lane)
+                       WHEN 'backend' THEN 0
+                       WHEN 'frontend' THEN 1
+                       WHEN 'qa' THEN 2
+                       WHEN 'ops' THEN 3
+                       WHEN 'docs' THEN 4
+                       ELSE lane_rank
+                   END
+                   WHERE lower(lane) IN ('backend', 'frontend', 'qa', 'ops', 'docs')
+                     AND (lane_rank IS NULL OR lane_rank < 0 OR lane_rank > 4 OR (lane_rank = 0 AND lower(lane) != 'backend'))"""
+            )
+            result["lane_rank_fixed"] = cursor.rowcount
+        except Exception:
+            pass
+
+    if "created_at" in cols:
+        try:
+            if "updated_at" in cols:
+                cursor = conn.execute(
+                    """UPDATE tasks
+                       SET created_at = COALESCE(NULLIF(updated_at, 0), ?)
+                       WHERE created_at IS NULL OR created_at = 0""",
+                    (now,),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE tasks SET created_at = ? WHERE created_at IS NULL OR created_at = 0",
+                    (now,),
+                )
+            result["created_at_fixed"] = cursor.rowcount
+        except Exception:
+            pass
+
+    return result
+
+
+def _reap_stale_in_progress(conn, now: int) -> dict:
+    """
+    Crash recovery: requeue tasks stuck in_progress beyond a lease window.
+    Uses updated_at as last-seen heartbeat (workers may be killed mid-task).
+    """
+    try:
+        stale_after_s = int(os.getenv("MESH_STALE_IN_PROGRESS_SECS", "1800") or "1800")
+    except Exception:
+        stale_after_s = 1800
+
+    if stale_after_s <= 0:
+        return {"reaped": 0, "stale_after_s": stale_after_s, "cutoff": None}
+
+    cutoff = now - stale_after_s
+
+    sample_ids: list[int] = []
+    oldest_age_s: int | None = None
+    try:
+        rows = conn.execute(
+            """SELECT id, COALESCE(updated_at, 0) AS updated_at
+               FROM tasks
+               WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?
+               ORDER BY COALESCE(updated_at, 0) ASC
+               LIMIT 10""",
+            (cutoff,)
+        ).fetchall()
+        for r in rows[:5]:
+            try:
+                sample_ids.append(int(r["id"]))
+            except Exception:
+                continue
+        if rows:
+            try:
+                oldest_age_s = int(now - int(rows[0]["updated_at"] or 0))
+            except Exception:
+                oldest_age_s = None
+    except Exception:
+        pass
+
+    # Prefer updating retry_count if present, but fail-open on older schemas.
+    try:
+        cursor = conn.execute(
+            """UPDATE tasks
+               SET status='pending', worker_id=NULL, updated_at=?, retry_count=retry_count+1  -- SAFETY-ALLOW: status-write
+               WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
+            (now, cutoff)
+        )
+        return {
+            "reaped": cursor.rowcount,
+            "stale_after_s": stale_after_s,
+            "cutoff": cutoff,
+            "sample_ids": sample_ids,
+            "oldest_age_s": oldest_age_s,
+        }
+    except Exception as e:
+        try:
+            cursor = conn.execute(
+                """UPDATE tasks
+                   SET status='pending', worker_id=NULL, updated_at=?  -- SAFETY-ALLOW: status-write
+                   WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
+                (now, cutoff)
+            )
+            return {
+                "reaped": cursor.rowcount,
+                "stale_after_s": stale_after_s,
+                "cutoff": cutoff,
+                "warning": str(e),
+                "sample_ids": sample_ids,
+                "oldest_age_s": oldest_age_s,
+            }
+        except Exception as e2:
+            server_logger.warning(f"Stale task reaper failed: {e2}")
+            return {
+                "reaped": 0,
+                "stale_after_s": stale_after_s,
+                "cutoff": cutoff,
+                "error": str(e2),
+                "sample_ids": sample_ids,
+                "oldest_age_s": oldest_age_s,
+            }
+
+
+def _check_dependencies_satisfied(task_id: int, deps_json: str, conn) -> bool:
+    """
+    Check if all dependencies of a task are satisfied (completed).
+
+    Args:
+        task_id: The task to check
+        deps_json: JSON string of dependency task IDs
+        conn: SQLite connection
+
+    Returns:
+        True if all dependencies are completed, False otherwise
+
+    Behavior:
+        - Empty deps → True (no dependencies)
+        - Unknown dep IDs → False (block - safer than ignoring)
+        - All deps completed → True
+        - Any dep not completed → False
+    """
+    status = _dependency_status(task_id, deps_json, conn)
+    return bool(status.get("satisfied"))
+
+
+def _dependency_status(task_id: int, deps_json: str, conn) -> dict:
+    """
+    Return dependency status + reasons (used by scheduler/UI diagnostics).
+
+    deps is stored as JSON and may contain:
+      - ints (task IDs)
+      - numeric strings (treated as task IDs)
+      - opaque tokens (treated as unknown deps; block)
+    """
+    try:
+        deps_raw = json.loads(deps_json) if deps_json else []
+    except json.JSONDecodeError as e:
+        return {
+            "satisfied": False,
+            "reason": "INVALID_JSON",
+            "error": str(e),
+            "raw": deps_json,
+            "unknown_tokens": [deps_json] if deps_json else [],
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    if not deps_raw:
+        return {
+            "satisfied": True,
+            "reason": "NO_DEPS",
+            "unknown_tokens": [],
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    dep_ids: list[int] = []
+    unknown_tokens: list[str] = []
+    for item in deps_raw:
+        if isinstance(item, bool):
+            unknown_tokens.append(str(item))
+            continue
+        if isinstance(item, int):
+            dep_ids.append(item)
+            continue
+        if isinstance(item, str):
+            token = item.strip()
+            if token.isdigit():
+                dep_ids.append(int(token))
+            else:
+                unknown_tokens.append(token)
+            continue
+        unknown_tokens.append(str(item))
+
+    # De-duplicate while preserving order (avoid false "unknown" counts)
+    seen = set()
+    dep_ids_unique: list[int] = []
+    for dep_id in dep_ids:
+        if dep_id in seen:
+            continue
+        seen.add(dep_id)
+        dep_ids_unique.append(dep_id)
+
+    if not dep_ids_unique:
+        return {
+            "satisfied": False,
+            "reason": "UNKNOWN_DEPS",
+            "unknown_tokens": unknown_tokens,
+            "missing_ids": [],
+            "incomplete_ids": [],
+        }
+
+    placeholders = ",".join("?" * len(dep_ids_unique))
+    rows = conn.execute(
+        f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+        dep_ids_unique
+    ).fetchall()
+    status_by_id = {int(r["id"]): (r["status"] or "") for r in rows}
+
+    missing_ids = [dep_id for dep_id in dep_ids_unique if dep_id not in status_by_id]
+    if missing_ids or unknown_tokens:
+        return {
+            "satisfied": False,
+            "reason": "MISSING_DEPS" if missing_ids else "UNKNOWN_DEPS",
+            "unknown_tokens": unknown_tokens,
+            "missing_ids": missing_ids,
+            "incomplete_ids": [],
+        }
+
+    incomplete_ids = [
+        dep_id for dep_id, st in status_by_id.items()
+        if str(st).lower() != "completed"
+    ]
+    if incomplete_ids:
+        return {
+            "satisfied": False,
+            "reason": "INCOMPLETE_DEPS",
+            "unknown_tokens": [],
+            "missing_ids": [],
+            "incomplete_ids": incomplete_ids,
+        }
+
+    return {
+        "satisfied": True,
+        "reason": "OK",
+        "unknown_tokens": [],
+        "missing_ids": [],
+        "incomplete_ids": [],
+    }
+
+
+@mcp.tool()
+def worker_heartbeat(
+    worker_id: str,
+    worker_type: str = None,
+    allowed_lanes: list[str] = None,
+    task_ids: list[int] = None,
+) -> str:
+    """
+    v21.0: Update worker heartbeat for EXEC dashboard monitoring.
+
+    Workers should call this every N seconds (e.g., 30s) to register their presence.
+    The heartbeat table is used by /workers command and EXEC dashboard.
+
+    Args:
+        worker_id: Unique worker identifier (e.g., "backend_1423", "frontend_0912")
+        worker_type: Worker type (e.g., "backend", "frontend", "qa")
+        allowed_lanes: List of lanes this worker can process
+        task_ids: List of task IDs currently being processed by this worker
+
+    Returns:
+        JSON with status (OK or ERROR)
+    """
+    import time
+
+    if not worker_id:
+        return json.dumps({"status": "ERROR", "message": "worker_id required"})
+
+    try:
+        with get_db() as conn:
+            # Create heartbeats table if not exists
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                    worker_id TEXT PRIMARY KEY,
+                    worker_type TEXT,
+                    allowed_lanes TEXT,
+                    task_ids TEXT,
+                    status TEXT DEFAULT 'ok',
+                    last_seen INTEGER,
+                    created_at INTEGER
+                )
+            """)
+
+            now = int(time.time())
+            allowed_json = json.dumps(allowed_lanes or [])
+            task_json = json.dumps(task_ids or [])
+
+            # Upsert heartbeat
+            conn.execute("""
+                INSERT INTO worker_heartbeats (worker_id, worker_type, allowed_lanes, task_ids, status, last_seen, created_at)
+                VALUES (?, ?, ?, ?, 'ok', ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    worker_type = excluded.worker_type,
+                    allowed_lanes = excluded.allowed_lanes,
+                    task_ids = excluded.task_ids,
+                    status = 'ok',
+                    last_seen = excluded.last_seen
+            """, (worker_id, worker_type, allowed_json, task_json, now, now))
+            conn.commit()
+
+            return json.dumps({"status": "OK", "worker_id": worker_id, "last_seen": now})
+
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)[:100]})
+
+
+@mcp.tool()
+def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, worker_type: str = None) -> str:
+    """
+    v18.0: Braided stream scheduler - picks next task with round-robin across lanes.
+
+    Selection logic:
+    1. PREEMPTION: If any pending tasks with priority in (0=URGENT, 5=HIGH) exist,
+       pick the best by: priority ASC, lane_rank ASC, created_at ASC, id ASC
+       (ignores lane pointer for priority preemption)
+
+    2. BRAID: Otherwise, round-robin across lanes:
+       - Start at pointer index in LANE_ORDER
+       - Find first lane with pending tasks not in blocked_lanes
+       - Pick lane-local best task
+       - Advance pointer to next lane (wraps)
+
+    Args:
+        worker_id: Optional worker identifier for claiming task
+        blocked_lanes: Set of lane names to skip (default empty)
+
+    Returns:
+        JSON with task info or {"status": "NO_WORK"}
+    """
+    blocked_lane_set: set[str] = set()
+    if blocked_lanes:
+        if isinstance(blocked_lanes, str):
+            token = blocked_lanes.strip()
+            # Support callers that pass JSON arrays as strings (e.g. CLI wrappers).
+            if token.startswith("[") and token.endswith("]"):
+                try:
+                    data = json.loads(token)
+                    if isinstance(data, list):
+                        blocked_lane_set = {str(x).strip().lower() for x in data if str(x).strip()}
+                    else:
+                        blocked_lane_set = {token.lower()}
+                except json.JSONDecodeError:
+                    blocked_lane_set = {token.lower()}
+            else:
+                blocked_lane_set = {token.lower()}
+        else:
+            try:
+                blocked_lane_set = {str(x).strip().lower() for x in set(blocked_lanes) if x is not None and str(x).strip()}
+            except TypeError:
+                blocked_lane_set = {str(blocked_lanes).strip().lower()}
+
+    # =========================================================================
+    # v20.1: Server-side lane validation (fail closed)
+    # If worker_type is provided, enforce lane restrictions server-side.
+    # This prevents misrouting even if the client doesn't send blocked_lanes.
+    # =========================================================================
+    if worker_type:
+        policy = _resolve_worker_lane_policy(worker_id, worker_type)
+        if not policy.get("ok"):
+            server_logger.warning(
+                f"SCHEDULER_REJECTED | worker_id={worker_id} worker_type={worker_type} "
+                f"error={policy.get('error')}"
+            )
+            return json.dumps({
+                "status": "NO_WORK",
+                "reason": "WORKER_POLICY_ERROR",
+                "error": policy.get("error"),
+                "pending_total": 0,
+            })
+
+        # Compute blocked lanes = all lanes NOT in allowed_lanes
+        allowed_lanes = policy.get("allowed_lanes", set())
+        server_blocked_lanes = set(LANE_ORDER) - allowed_lanes
+        # Merge with client-provided blocked lanes (union)
+        blocked_lane_set = blocked_lane_set | server_blocked_lanes
+        server_logger.debug(
+            f"SCHEDULER_LANE_POLICY | worker_id={worker_id} role={policy.get('role')} "
+            f"allowed={allowed_lanes} server_blocked={server_blocked_lanes} final_blocked={blocked_lane_set}"
+        )
+
+    try:
+        with get_db() as conn:
+            now = int(time.time())
+            _increment_config_counter(conn, "scheduler_pick_calls_total", 1)
+
+            # Repair legacy rows that would otherwise be invisible to braided scheduling.
+            normalized = _normalize_task_lane_fields(conn, now)
+            if any(normalized.values()):
+                _increment_config_counter(conn, "scheduler_lane_normalize_total", 1)
+                _write_config_json(conn, "scheduler_lane_normalize_last", {"ts": now, **normalized})
+                server_logger.info(f"SCHEDULER_NORMALIZE | {json.dumps({'ts': now, **normalized})}")
+
+            policy = _resolve_worker_lane_policy(worker_id, worker_type)
+            if not policy.get("ok"):
+                _increment_config_counter(conn, "scheduler_denied_total", 1)
+                decision = {
+                    "picked_id": None,
+                    "reason": "denied",
+                    "error": policy.get("error"),
+                    "worker_id": worker_id,
+                    "worker_type": worker_type,
+                    "ts": now,
+                }
+                _write_scheduler_last_decision(conn, decision)
+                server_logger.warning(
+                    f"SCHEDULER_DENY | worker_id={worker_id} worker_type={worker_type} error={policy.get('error')}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "message": "Scheduler denied (worker role/lane policy)",
+                    "error": policy.get("error"),
+                })
+
+            worker_role = policy.get("role")
+            allowed_lanes: set[str] = set(policy.get("allowed_lanes") or set())
+            disallowed_lanes = set(LANE_ORDER) - allowed_lanes
+
+            # Merge policy enforcement into the existing blocked-lanes mechanism.
+            client_blocked_lanes = set(blocked_lane_set)
+            blocked_lane_set |= disallowed_lanes
+
+            eligible_lanes = [lane for lane in LANE_ORDER if lane not in blocked_lane_set]
+            if not eligible_lanes:
+                _increment_config_counter(conn, "scheduler_no_work_blocked_by_lanes_total", 1)
+                decision = {
+                    "picked_id": None,
+                    "reason": "no_work",
+                    "no_work_reason": "blocked_by_lanes",
+                    "worker_role": worker_role,
+                    "allowed_lanes": sorted(list(allowed_lanes)),
+                    "client_blocked_lanes": sorted(list(client_blocked_lanes)),
+                    "ts": now,
+                }
+                _write_scheduler_last_decision(conn, decision)
+                return json.dumps({
+                    "status": "NO_WORK",
+                    "message": "No eligible lanes for this worker (blocked by lane policy/preferences)",
+                    "no_work_reason": "blocked_by_lanes",
+                    "allowed_lanes": sorted(list(allowed_lanes)),
+                    "blocked_lanes": sorted(list(blocked_lane_set)),
+                })
+
+            reap = _reap_stale_in_progress(conn, now)
+            _increment_config_counter(conn, "scheduler_reaper_runs_total", 1)
+            if reap.get("reaped", 0):
+                _increment_config_counter(conn, "scheduler_reaper_reaped_total", int(reap.get("reaped", 0)))
+                _write_config_json(conn, "scheduler_reaper_last", {"ts": now, **reap})
+                server_logger.warning(
+                    f"Crash recovery: re-queued {reap['reaped']} stale in_progress task(s) "
+                    f"(cutoff={reap.get('cutoff')}, stale_after_s={reap.get('stale_after_s')}, "
+                    f"oldest_age_s={reap.get('oldest_age_s')}, sample_ids={reap.get('sample_ids')})"
+                )
+
+            # =========================================================
+            # Step 1: PREEMPTION CHECK (URGENT=0, HIGH=5)
+            # =========================================================
+            preempt_task = []
+            if eligible_lanes:
+                placeholders = ",".join("?" * len(eligible_lanes))
+                preempt_task = conn.execute(
+                    f"""SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                        FROM tasks
+                        WHERE status = 'pending' AND priority IN (0, 5)
+                          AND lane IN ({placeholders})
+                        ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
+                        LIMIT 10""",
+                    eligible_lanes
+                ).fetchall()
+
+            # Find first preempt task with satisfied dependencies
+            for task in preempt_task:
+                if task["lane"] in blocked_lane_set:
+                    continue
+                dep_status = _dependency_status(task["id"], task["deps"], conn)
+                if dep_status.get("satisfied"):
+                    # Atomic claim: UPDATE only if still pending (prevents double-claim)
+                    cursor = conn.execute(
+                        "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
+                        (worker_id, now, task["id"])
+                    )
+                    if cursor.rowcount == 0:
+                        # Task was claimed by another worker, try next
+                        continue
+                    decision_reason = "urgent" if int(task["priority"]) == 0 else "high"
+                    pointer = _read_lane_pointer(conn)
+                    decision = {
+                        "picked_id": task["id"],
+                        "lane": task["lane"],
+                        "priority": task["priority"],
+                        "reason": decision_reason,
+                        "preempted": True,
+                        "pointer_index": pointer.get("index", 0),
+                        "pointer_lane": pointer.get("lane"),
+                        "worker_id": worker_id,
+                        "ts": now,
+                    }
+                    _write_scheduler_last_decision(conn, decision)
+                    conn.commit()
+                    server_logger.info(
+                        f"SCHEDULER_DECISION | picked={task['id']} lane={task['lane']} "
+                        f"reason={decision_reason} preempted=1 pointer={decision.get('pointer_index')}"
+                    )
+
+                    return json.dumps({
+                        "status": "OK",
+                        "id": task["id"],
+                        "type": task["type"],
+                        "description": task["desc"],
+                        "lane": task["lane"],
+                        "priority": task["priority"],
+                        "lane_rank": task["lane_rank"],
+                        "exec_class": task["exec_class"],
+                        "preempted": True,
+                        "decision_reason": decision_reason,
+                        "pointer_index": decision.get("pointer_index", 0),
+                    })
+
+            # =========================================================
+            # Step 2: BRAID - Round-robin across lanes
+            # =========================================================
+            pointer = _read_lane_pointer(conn)
+            start_index = pointer.get("index", 0)
+
+            lane_debug = {}
+
+            # Try each lane starting from pointer position
+            for offset in range(len(LANE_ORDER)):
+                lane_index = (start_index + offset) % len(LANE_ORDER)
+                lane = LANE_ORDER[lane_index]
+
+                # Skip blocked lanes
+                if lane in blocked_lane_set:
+                    continue
+
+                # Find best pending task in this lane
+                task = conn.execute(
+                    """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                       FROM tasks
+                       WHERE status = 'pending' AND lane = ?
+                       ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
+                       LIMIT 10""",
+                    (lane,)
+                ).fetchall()
+
+                # Find first task with satisfied dependencies
+                for candidate in task:
+                    dep_status = _dependency_status(candidate["id"], candidate["deps"], conn)
+                    if dep_status.get("satisfied"):
+                        # Atomic claim: UPDATE only if still pending (prevents double-claim)
+                        cursor = conn.execute(
+                            "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
+                            (worker_id, now, candidate["id"])
+                        )
+                        if cursor.rowcount == 0:
+                            # Task was claimed by another worker, try next
+                            continue
+
+                        # Advance pointer to next lane (after the one we picked from)
+                        next_index = (lane_index + 1) % len(LANE_ORDER)
+                        _write_lane_pointer(next_index, LANE_ORDER[next_index], conn=conn)
+
+                        decision = {
+                            "picked_id": candidate["id"],
+                            "lane": candidate["lane"],
+                            "priority": candidate["priority"],
+                            "reason": "rotation",
+                            "preempted": False,
+                            "pointer_start_index": start_index,
+                            "pointer_next_index": next_index,
+                            "worker_id": worker_id,
+                            "ts": now,
+                        }
+                        _write_scheduler_last_decision(conn, decision)
+                        conn.commit()
+                        server_logger.info(
+                            f"SCHEDULER_DECISION | picked={candidate['id']} lane={candidate['lane']} "
+                            f"reason=rotation preempted=0 pointer={next_index}"
+                        )
+
+                        return json.dumps({
+                            "status": "OK",
+                            "id": candidate["id"],
+                            "type": candidate["type"],
+                            "description": candidate["desc"],
+                            "lane": candidate["lane"],
+                            "priority": candidate["priority"],
+                            "lane_rank": candidate["lane_rank"],
+                            "exec_class": candidate["exec_class"],
+                            "preempted": False,
+                            "decision_reason": "rotation",
+                            "pointer_index": next_index,
+                        })
+                    # Record first blocked reason per lane for diagnostics
+                    if lane not in lane_debug:
+                        lane_debug[lane] = {
+                            "blocked_reason": dep_status.get("reason"),
+                            "unknown_tokens": dep_status.get("unknown_tokens", [])[:3],
+                            "missing_ids": dep_status.get("missing_ids", [])[:3],
+                            "incomplete_ids": dep_status.get("incomplete_ids", [])[:3],
+                        }
+
+            # No work found in any lane
+            pending_total = 0
+            try:
+                pending_total = int(conn.execute("SELECT COUNT(*) FROM tasks WHERE status='pending'").fetchone()[0])
+            except Exception:
+                pending_total = 0
+
+            message = "No pending tasks available"
+            if pending_total > 0:
+                message = "No runnable tasks (pending tasks are blocked by dependencies)"
+                server_logger.warning(f"Scheduler idle: {pending_total} pending task(s) blocked by deps")
+
+            decision = {
+                "picked_id": None,
+                "reason": "no_work",
+                "pointer_index": start_index,
+                "pending_total": pending_total,
+                "blocked_lanes": lane_debug,
+                "worker_id": worker_id,
+                "ts": now,
+            }
+            _write_scheduler_last_decision(conn, decision)
+
+            return json.dumps({
+                "status": "NO_WORK",
+                "message": message,
+                "pending_total": pending_total,
+                "blocked_lanes": lane_debug,
+                "pointer_index": start_index,
+            })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "ERROR",
+            "message": f"Scheduler error: {e}"
         })
 
 
@@ -1689,7 +4999,7 @@ def detect_project_profile(project_root: str) -> str:
                     return "node_backend"
                     
                 return "node_general"
-            except:
+            except Exception:
                 return "node_general"
         
         # Check for Python projects
@@ -1705,7 +5015,7 @@ def detect_project_profile(project_root: str) -> str:
                             return "python_backend"
                         if "pandas" in content or "numpy" in content or "scikit" in content:
                             return "python_data"
-                    except:
+                    except Exception:
                         pass
             return "python_backend"
         
@@ -2222,17 +5532,17 @@ def get_release_readiness() -> str:
 
     if os.path.exists(ledger_path):
         try:
-            with open(ledger_path, "r") as f:
-                lines = f.readlines()
-                # Get last 3 valid JSON lines
-                for line in reversed(lines):
-                    if len(last_actions) >= 3:
-                        break
-                    try:
-                        last_actions.append(json.loads(line.strip()))
-                    except:
-                        pass
-        except:
+            # Bounded tail read (avoid unbounded readlines() on large ledgers)
+            lines = _tail_text_lines(ledger_path, max_lines=200, encoding="utf-8")
+            # Get last 3 valid JSON lines
+            for line in reversed(lines):
+                if len(last_actions) >= 3:
+                    break
+                try:
+                    last_actions.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+        except Exception:
             pass
 
     if not last_actions:
@@ -2332,7 +5642,7 @@ def get_ledger_report(days: int = 7) -> str:
                             entry_date = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                             if entry_date.replace(tzinfo=None) < cutoff:
                                 continue
-                        except:
+                        except Exception:
                             pass
 
                     # Actor Stats
@@ -2714,7 +6024,7 @@ def get_drift_report() -> str:
             return None
         try:
             return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except:
+        except Exception:
             return None
 
     now = datetime.now()
@@ -2770,7 +6080,7 @@ def get_drift_report() -> str:
                     dt = parse_iso(ts)
                     if dt:
                         ages.append((now - dt).total_seconds() / 3600)
-                except:
+                except Exception:
                     continue
 
             if ages:
@@ -3038,7 +6348,15 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
 
     # 2. Scan Codebase (multiple directories)
     scan_dirs = [scan_dir, "lib", "app", "api", "services", "core"]
-    code_extensions = [".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"]
+    code_extensions = (".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs")
+
+    # Regex: Find # Implements [ID] or # Implements [ID, ID2]
+    # Also matches // Implements [ID] for JS/TS
+    implements_re = re.compile(r'[#/]+\s*Implements\s*\[([A-Z0-9,\s\-_]+)\]', re.IGNORECASE)
+
+    # Internal caches to keep de-dup O(1) while preserving output format
+    seen_line_entries = {}  # src_id -> set("rel/path:line")
+    seen_orphans = set()    # (src_id, rel_path, line_num)
 
     for scan_path in scan_dirs:
         full_path = os.path.join(BASE_DIR, scan_path)
@@ -3050,7 +6368,7 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
             dirs[:] = [d for d in dirs if d not in ['node_modules', '__pycache__', '.git', 'venv', '.venv']]
 
             for file in files:
-                if not any(file.endswith(ext) for ext in code_extensions):
+                if not file.endswith(code_extensions):
                     continue
 
                 file_path = os.path.join(root, file)
@@ -3058,39 +6376,46 @@ def generate_provenance_report(scan_dir: str = "src") -> str:
 
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+                        for line_num, line in enumerate(f, start=1):
+                            # Fast path: avoid regex work when marker absent
+                            if "implements" not in line.lower():
+                                continue
+
+                            for match in implements_re.finditer(line):
+                                raw_ids = match.group(1)
+
+                                # Split "ID1, ID2"
+                                ids = [i.strip().upper() for i in raw_ids.split(",") if i.strip()]
+
+                                for src_id in ids:
+                                    # Init entry
+                                    if src_id not in provenance_data["sources"]:
+                                        provenance_data["sources"][src_id] = {"files": [], "lines": [], "tasks": []}
+
+                                    # Record hit (avoid duplicates)
+                                    file_entry = f"{rel_path}:{line_num}"
+                                    src_seen = seen_line_entries.get(src_id)
+                                    if src_seen is None:
+                                        src_seen = set()
+                                        seen_line_entries[src_id] = src_seen
+
+                                    if file_entry not in src_seen:
+                                        src_seen.add(file_entry)
+                                        provenance_data["sources"][src_id]["files"].append(rel_path)
+                                        provenance_data["sources"][src_id]["lines"].append(file_entry)
+
+                                    # Orphan check: Code claims source that doesn't exist
+                                    if valid_ids and src_id not in valid_ids:
+                                        orphan_key = (src_id, rel_path, line_num)
+                                        if orphan_key not in seen_orphans:
+                                            seen_orphans.add(orphan_key)
+                                            provenance_data["orphans"].append({
+                                                "id": src_id,
+                                                "file": rel_path,
+                                                "line": line_num
+                                            })
                 except Exception:
                     continue
-
-                # Regex: Find # Implements [ID] or # Implements [ID, ID2]
-                # Also matches // Implements [ID] for JS/TS
-                pattern = r'[#/]+\s*Implements\s*\[([A-Z0-9,\s\-_]+)\]'
-                matches = re.finditer(pattern, content, re.IGNORECASE)
-
-                for match in matches:
-                    raw_ids = match.group(1)
-                    # Find line number
-                    line_num = content[:match.start()].count('\n') + 1
-
-                    # Split "ID1, ID2"
-                    ids = [i.strip().upper() for i in raw_ids.split(",") if i.strip()]
-
-                    for src_id in ids:
-                        # Init entry
-                        if src_id not in provenance_data["sources"]:
-                            provenance_data["sources"][src_id] = {"files": [], "lines": [], "tasks": []}
-
-                        # Record hit (avoid duplicates)
-                        file_entry = f"{rel_path}:{line_num}"
-                        if file_entry not in provenance_data["sources"][src_id]["lines"]:
-                            provenance_data["sources"][src_id]["files"].append(rel_path)
-                            provenance_data["sources"][src_id]["lines"].append(file_entry)
-
-                        # Orphan check: Code claims source that doesn't exist
-                        if valid_ids and src_id not in valid_ids:
-                            orphan_entry = {"id": src_id, "file": rel_path, "line": line_num}
-                            if orphan_entry not in provenance_data["orphans"]:
-                                provenance_data["orphans"].append(orphan_entry)
 
     # 3. Link Tasks (The Intent)
     if STATE_MACHINE_AVAILABLE:
@@ -4670,7 +7995,7 @@ def get_planner_context(goal: str = "") -> str:
             with open(coverage_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 stats = data.get("summary", {})
-        except:
+        except Exception:
             pass
 
     return json.dumps({
@@ -5114,7 +8439,7 @@ def get_safe_librarian_files(files: str) -> str:
     if files.startswith("["):
         try:
             file_list = json.loads(files)
-        except:
+        except json.JSONDecodeError:
             file_list = [f.strip() for f in files.split(",")]
     else:
         file_list = [f.strip() for f in files.split(",")]
@@ -5801,7 +9126,7 @@ def get_mode() -> str:
                 return "converge"
             else:
                 return "vibe"
-        except:
+        except Exception:
             pass
     
     # Fall back to manual mode
@@ -5845,7 +9170,7 @@ def get_current_mode() -> str:
                 milestone = date.fromisoformat(f.read().strip())
             days_left = (milestone - date.today()).days
             auto_msg = f" (Auto: {days_left} days to milestone)"
-        except:
+        except Exception:
             pass
     
     icons = {"vibe": "🟢", "converge": "🟡", "ship": "🔴"}
@@ -5950,7 +9275,13 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
        - If Parent COMPLETED -> Execute Child
     """
     with get_db() as conn:
-        run_watchdog(conn)
+        now = int(time.time())
+        reap = _reap_stale_in_progress(conn, now)
+        if reap.get("reaped", 0):
+            server_logger.warning(
+                f"Crash recovery: re-queued {reap['reaped']} stale in_progress task(s) "
+                f"(cutoff={reap.get('cutoff')}, stale_after_s={reap.get('stale_after_s')})"
+            )
         
         # 1. THROTTLING
         if worker_type == TaskType.BACKEND:
@@ -5967,37 +9298,52 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
         )
         
         for task in cursor.fetchall():
-            deps = json.loads(task['deps'])
-            
-            if deps:
-                # Check status of ALL dependencies
-                placeholders = ','.join('?' for _ in deps)
-                dep_rows = conn.execute(
-                    f"SELECT status FROM tasks WHERE id IN ({placeholders})", deps
-                ).fetchall()
-                
-                statuses = [r[0] for r in dep_rows]
-                
-                # CONDITION 1: CASCADING BLOCK (Partial Halt)
-                # If any parent failed or is blocked, this task must block
-                if 'failed' in statuses or 'blocked' in statuses:
-                    if task['status'] != 'blocked':
+            deps_json = task["deps"]
+            task_status = str(task["status"]).lower() if task["status"] else ""
+            dep_status = _dependency_status(task["id"], deps_json, conn)
+
+            # Dependency hardening: unknown/missing deps block (never runnable).
+            if not dep_status.get("satisfied"):
+                reason = dep_status.get("reason")
+
+                # Structural blockers: keep task blocked (and surface via status)
+                if reason in ("UNKNOWN_DEPS", "MISSING_DEPS", "INVALID_JSON"):
+                    if task_status != "blocked":
                         conn.execute(
                             "UPDATE tasks SET status='blocked', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                            (int(time.time()), task['id'])
+                            (now, task["id"])
                         )
-                    continue  # Skip to next task
+                    continue
 
-                # CONDITION 2: WAIT
-                # If any parent is not completed, we must wait
-                if any(s != 'completed' for s in statuses):
-                    # Auto-recover from blocked if parent was fixed
-                    if task['status'] == 'blocked':  # SAFETY-ALLOW: status-write
+                # Incomplete deps: cascade block on failed/blocked parents; otherwise wait.
+                if reason == "INCOMPLETE_DEPS":
+                    incomplete_ids = dep_status.get("incomplete_ids", []) or []
+                    if incomplete_ids:
+                        placeholders = ",".join("?" * len(incomplete_ids))
+                        dep_rows = conn.execute(
+                            f"SELECT status FROM tasks WHERE id IN ({placeholders})",
+                            incomplete_ids
+                        ).fetchall()
+                        statuses = [str(r[0]).lower() for r in dep_rows]
+
+                        if "failed" in statuses or "blocked" in statuses:
+                            if task_status != "blocked":
+                                conn.execute(
+                                    "UPDATE tasks SET status='blocked', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
+                                    (now, task["id"])
+                                )
+                            continue
+
+                    # Auto-recover from blocked -> pending when deps are no longer failed/blocked
+                    if task_status == "blocked":
                         conn.execute(
                             "UPDATE tasks SET status='pending', updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                            (int(time.time()), task['id'])
+                            (now, task["id"])
                         )
-                    continue  # Skip to next task
+                    continue
+
+                # Default: fail closed (don't execute)
+                continue
             
             # v10.5: ALSO check JSON state machine dependencies
             task_id_str = str(task['id'])
@@ -6014,11 +9360,33 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
 
             # Context Injection
             deps_context = ""
-            if deps:
+            dep_ids_for_context: list[int] = []
+            try:
+                deps_raw = json.loads(deps_json) if deps_json else []
+            except Exception:
+                deps_raw = []
+            for item in deps_raw:
+                if isinstance(item, int):
+                    dep_ids_for_context.append(item)
+                elif isinstance(item, str) and item.strip().isdigit():
+                    dep_ids_for_context.append(int(item.strip()))
+
+            if dep_ids_for_context:
+                # De-duplicate while preserving order
+                seen = set()
+                dep_ids_unique: list[int] = []
+                for dep_id in dep_ids_for_context:
+                    if dep_id in seen:
+                        continue
+                    seen.add(dep_id)
+                    dep_ids_unique.append(dep_id)
+
+                placeholders = ",".join("?" * len(dep_ids_unique))
                 rows = conn.execute(
-                    f"SELECT id, output FROM tasks WHERE id IN ({','.join(map(str, deps))})"
+                    f"SELECT id, output FROM tasks WHERE id IN ({placeholders})",
+                    dep_ids_unique
                 ).fetchall()
-                for r in rows: 
+                for r in rows:
                     deps_context += f"\n[Task {r['id']} Output]: {r['output']}"
             
             # Include mode in task context
@@ -6031,17 +9399,20 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
             
             full_desc = f"{task['desc']}\n\n=== CONTEXT ==={deps_context}{mode_context}"
             
-            conn.execute(
-                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                (worker_id, int(time.time()), task['id'])
+            claimed_at = int(time.time())
+            cursor = conn.execute(
+                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status IN ('pending', 'blocked')",  # SAFETY-ALLOW: status-write
+                (worker_id, claimed_at, task["id"])
             )
+            if cursor.rowcount == 0:
+                continue
             # v10.5: Sync in_progress status to JSON state machine
             if STATE_MACHINE_AVAILABLE:
                 try:
-                    update_task_status(str(task['id']), "IN_PROGRESS")
+                    update_task_status(str(task["id"]), "IN_PROGRESS")
                 except Exception:
                     pass  # Non-critical, continue execution
-            return f'{{"id": {task["id"]}, "description": "{full_desc}"}}'
+            return json.dumps({"id": task["id"], "description": full_desc})
 
     return "NO_WORK"
 
@@ -6166,7 +9537,7 @@ def find_paired_test(source_ids: list, task_archetype: str = None) -> dict:
             test_sources_raw = test["source_ids"] if test["source_ids"] else "[]"
             try:
                 test_sources = set(json.loads(test_sources_raw))
-            except:
+            except Exception:
                 test_sources = set()
 
             # Check if they share at least one relevant source
@@ -6214,7 +9585,7 @@ def validate_task_completion(task_id: int) -> dict:
     source_ids_raw = task["source_ids"] if task["source_ids"] else "[]"
     try:
         source_ids = json.loads(source_ids_raw)
-    except:
+    except json.JSONDecodeError:
         source_ids = []
 
     archetype = task["archetype"] if task["archetype"] else "GENERIC"
@@ -6239,7 +9610,7 @@ def validate_task_completion(task_id: int) -> dict:
             with open(prov_path, "r", encoding="utf-8") as f:
                 prov_data = json.load(f)
                 provenance_sources = prov_data.get("sources", {})
-        except:
+        except Exception:
             pass
 
     # 4. Load registry for smart resolution
@@ -6249,7 +9620,7 @@ def validate_task_completion(task_id: int) -> dict:
         try:
             with open(registry_path, "r", encoding="utf-8") as f:
                 registry = json.load(f)
-        except:
+        except Exception:
             pass
 
     # 5. Track if any source requires testing
@@ -6361,7 +9732,7 @@ def validate_registry_alignment() -> str:
                 # Regex to find ## [ID] or [ID] patterns
                 ids = re.findall(r"\[([A-Z0-9_-]+-[A-Z0-9_-]+(?:-\d+)?)\]", content)
                 found_ids.extend(ids)
-            except:
+            except Exception:
                 pass
 
     # 3. Validate each ID against registry
@@ -6736,7 +10107,7 @@ def check_gatekeeper(task_id: int) -> str:
         if task["source_ids"]:
             try:
                 source_ids = json.loads(task["source_ids"])
-            except:
+            except json.JSONDecodeError:
                 pass
         archetype = task["archetype"] if task["archetype"] else "GENERIC"
 
@@ -6747,7 +10118,7 @@ def check_gatekeeper(task_id: int) -> str:
         try:
             with open(registry_path, "r", encoding="utf-8") as f:
                 registry = json.load(f)
-        except:
+        except Exception:
             pass
 
     # Build authority breakdown with smart resolution
@@ -6975,7 +10346,7 @@ def append_ledger_entry(task_id: int, decision: str, notes: str, actor: str = "H
     if task["source_ids"]:
         try:
             source_ids = json.loads(task["source_ids"]) if task["source_ids"].startswith("[") else [task["source_ids"]]
-        except:
+        except (json.JSONDecodeError, TypeError):
             source_ids = [task["source_ids"]]
 
     # 3. Snapshot Authority (The "Constitution" at this moment)
@@ -7190,7 +10561,7 @@ def submit_review_decision(task_id: int, decision: str, notes: str, actor: str) 
         try:
             with open(packet_path, "r", encoding="utf-8") as f:
                 packet_meta = json.load(f).get("meta", {})
-        except:
+        except Exception:
             pass
 
     # Write the immutable ledger entry with explicit actor
@@ -8426,7 +11797,7 @@ def get_project_status() -> str:
             with open(MILESTONE_FILE, 'r') as f:
                 milestone = date.fromisoformat(f.read().strip())
             days_left = (milestone - date.today()).days
-        except:
+        except Exception:
             pass
     
     with get_db() as conn:
@@ -8865,7 +12236,7 @@ def get_jit_context() -> Dict:
                 content = f.read()
                 # Get last 2000 chars for context window efficiency
                 context["decisions"] = content[-2000:] if len(content) > 2000 else content
-        except:
+        except Exception:
             pass
     
     # 2. Resolved decisions from DB
@@ -8898,7 +12269,7 @@ def get_jit_context() -> Dict:
                 "SELECT key, value FROM session_context"
             ).fetchall()
             context["session"] = {s[0]: json.loads(s[1]) for s in session}
-    except:
+    except Exception:
         pass
     
     return context
@@ -9472,7 +12843,7 @@ class CLIBasedLLM:
         if match:
             try:
                 return json.loads(match.group(1))
-            except:
+            except json.JSONDecodeError:
                 pass
         
         # Attempt 3: Naive brace finding (First { to Last })
@@ -9482,7 +12853,7 @@ class CLIBasedLLM:
             if start != -1 and end > start:
                 json_str = text[start:end]
                 return json.loads(json_str)
-        except:
+        except json.JSONDecodeError:
             pass
             
         # Failure - log truncated output for debugging
@@ -10217,7 +13588,7 @@ def answer_question(qid: str, answer: str) -> str:
     # 5. Log
     try:
         log_rigor_action(RigorLevel.BUILD, "ANSWER", f"{qid}: {answer[:40]}")
-    except:
+    except Exception:
         pass
     
     if remaining == 0 or task_ready:
@@ -10295,7 +13666,7 @@ def submit_review(task_id: str, review_content: str) -> str:
     # 4. Log
     try:
         log_rigor_action(RigorLevel.IRONCLAD, "REVIEW", f"Task {task_id}: {status}")
-    except:
+    except Exception:
         pass
     
     if status == "PASS":
@@ -10422,7 +13793,7 @@ def get_review(task_id: str) -> str:
             with open(status["path"], 'r', encoding='utf-8') as f:
                 content = f.read()
             status["content"] = content
-        except:
+        except Exception:
             pass
     
     return json.dumps(status, indent=2)
@@ -10842,7 +14213,7 @@ def system_doctor() -> str:
                 "status": "OK" if mode == "wal" else "WARN",  # SAFETY-ALLOW: status-write
                 "mode": mode
             }
-    except:
+    except Exception:
         health["checks"]["wal_mode"] = {"status": "UNKNOWN"}  # SAFETY-ALLOW: status-write
     
     # Check 3: Required Modules
@@ -10855,7 +14226,7 @@ def system_doctor() -> str:
         try:
             __import__(mod)
             modules[mod] = True
-        except:
+        except Exception:
             pass
     health["checks"]["modules"] = modules
     
@@ -11680,7 +15051,7 @@ def graceful_shutdown(signum, frame):
     try:
         # If there's a global connection pool, close it here
         pass
-    except:
+    except Exception:
         pass
     
     print("   ✅ Atomic Mesh Server stopped cleanly.")

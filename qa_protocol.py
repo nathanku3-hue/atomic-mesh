@@ -22,6 +22,7 @@ import json
 import asyncio
 import subprocess
 import shutil
+import shlex
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -160,12 +161,29 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
     # Saves: 500-1000 tokens on QA2 formatting complaints
     # =========================================================================
     print("🧹 Pre-Flight: Running Auto-Formatters...")
+
+    def _run_cmd(cmd, *, timeout_s: int):
+        """
+        SECURITY: Avoid shell=True unless command requires shell metacharacters.
+        Returns subprocess.CompletedProcess.
+        """
+        if isinstance(cmd, (list, tuple)):
+            return subprocess.run(list(cmd), shell=False, capture_output=True, timeout=timeout_s)
+
+        cmd_str = str(cmd).strip()
+        # If the config contains shell operators, fall back (explicitly).
+        if any(op in cmd_str for op in ["|", "&", ";", ">", "<"]):
+            return subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=os.getcwd())
+
+        argv = shlex.split(cmd_str, posix=(os.name != "nt"))
+        return subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout_s, cwd=os.getcwd())
+
     try:
         if "python" in project_profile:
             # Ruff: Fast Python formatter + linter
             if shutil.which("ruff"):
-                subprocess.run("ruff format . --quiet", shell=True, capture_output=True, timeout=30)
-                subprocess.run("ruff check --fix --quiet .", shell=True, capture_output=True, timeout=30)
+                _run_cmd(["ruff", "format", ".", "--quiet"], timeout_s=30)
+                _run_cmd(["ruff", "check", "--fix", "--quiet", "."], timeout_s=30)
                 print("   ✅ Python formatted (ruff)")
             else:
                 print("   ⚠️ ruff not installed (pip install ruff)")
@@ -173,7 +191,7 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
         elif "typescript" in project_profile or "node" in project_profile:
             # Prettier: Standard TS/JS formatter
             if os.path.exists("package.json"):
-                subprocess.run("npx prettier --write . --log-level warn", shell=True, capture_output=True, timeout=60)
+                _run_cmd(["npx", "prettier", "--write", ".", "--log-level", "warn"], timeout_s=60)
                 print("   ✅ TypeScript formatted (prettier)")
     except subprocess.TimeoutExpired:
         print("   ⚠️ Formatter timed out (continuing)")
@@ -208,7 +226,7 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
                         pkg = json.load(f)
                         if "test" in pkg.get("scripts", {}):
                             cmd = profile_commands["unit"]
-                except:
+                except Exception:
                     pass
     
     if not cmd:
@@ -217,14 +235,7 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
     print(f"🧪 Pre-Flight: Running '{cmd}'...")
     
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=os.getcwd()
-        )
+        result = _run_cmd(cmd, timeout_s=timeout)
         
         if result.returncode == 0:
             print("   ✅ Pre-Flight Tests Passed")

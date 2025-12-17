@@ -7,7 +7,8 @@ param (
 )
 
 $ID = "${Type}_$(Get-Date -Format 'HHmm')"
-$MeshRoot = "C:\Tools\atomic-mesh"
+$MeshRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $MeshRoot) { $MeshRoot = (Get-Location).Path }
 # --- MULTI-PROJECT ISOLATION: Use current directory for logs ---
 $CurrentDir = (Get-Location).Path
 $LogDir = "$CurrentDir\logs"
@@ -19,6 +20,21 @@ if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | 
 if (!(Test-Path $CombinedLog)) { "" | Out-File $CombinedLog -Encoding UTF8 }
 
 $MCP_CLIENT = "$MeshRoot\mcp_client.py"
+
+function Get-BlockedLanes {
+    param([string]$WorkerType)
+    $effective = if ($null -eq $WorkerType) { "" } else { [string]$WorkerType }
+    $t = $effective.ToLower()
+    switch ($t) {
+        # Codex/generalist: owns backend/qa/ops by default (leave docs/frontend to Claude worker)
+        "backend" { return @("frontend", "docs") }
+        # Claude/creative: owns frontend/docs by default (leave backend/qa/ops to Codex worker)
+        "frontend" { return @("backend", "qa", "ops") }
+        # Explicit QA worker (if launched): restrict to qa lane only
+        "qa" { return @("backend", "frontend", "ops", "docs") }
+        default { return @() }
+    }
+}
 
 # --- TOAST NOTIFICATION HELPER ---
 function Show-Toast {
@@ -57,7 +73,19 @@ while ($true) {
     # Poll using Python MCP client
     $JsonResult = $null
     try {
-        $JsonResult = python $MCP_CLIENT pick_task "{`"worker_type`": `"$Type`", `"worker_id`": `"$ID`"}" 2>&1 | Out-String
+        $blocked = Get-BlockedLanes -WorkerType $Type
+        $argsObj = @{
+            worker_id = $ID
+            blocked_lanes = $blocked
+        }
+        $argsJson = ($argsObj | ConvertTo-Json -Compress)
+        # Capture stdout only (stderr includes MCP protocol logs)
+        $JsonResult = python $MCP_CLIENT pick_task_braided $argsJson 2>$null | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "   ⚠️ MCP call failed (exit $LASTEXITCODE). Retrying..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 5
+            continue
+        }
     }
     catch {
         Write-Host "   ⚠️ MCP connection error. Retrying..." -ForegroundColor Yellow
@@ -71,19 +99,26 @@ while ($true) {
         continue
     }
 
-    # Parse task ID with null safety
-    $TaskIDMatch = [regex]::Match($JsonResult, '"id":\s*(\d+)')
-    if (-not $TaskIDMatch.Success) {
+    $JsonText = $JsonResult.Trim()
+    $TaskData = $null
+    try {
+        $TaskData = $JsonText | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
         Start-Sleep -Seconds 3
         continue
     }
-    $TaskID = $TaskIDMatch.Groups[1].Value
+
+    if (-not $TaskData -or $TaskData.status -ne "OK") {
+        Start-Sleep -Seconds 3
+        continue
+    }
+
+    $TaskID = $TaskData.id
+    $Desc = if ($TaskData.description) { [string]$TaskData.description } else { "No description" }
+    $Lane = if ($TaskData.lane) { [string]$TaskData.lane } else { $Type }
     
-    # Parse description with null safety
-    $DescMatch = [regex]::Match($JsonResult, '"description":\s*"([^"]*)"')
-    $Desc = if ($DescMatch.Success) { $DescMatch.Groups[1].Value } else { "No description" }
-    
-    $Header = "⚡ [$Type] Task $TaskID"
+    $Header = "⚡ [$Type/$Lane] Task $TaskID"
     Write-Host "`n$Header" -ForegroundColor $Color
     
     # Log Header to both files
