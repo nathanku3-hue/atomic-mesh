@@ -12,6 +12,11 @@ if (-not $MeshRoot) { $MeshRoot = (Get-Location).Path }
 # --- MULTI-PROJECT ISOLATION: Use current directory for logs ---
 $CurrentDir = (Get-Location).Path
 $LogDir = "$CurrentDir\logs"
+
+# v21.0: Ensure worker uses same DB as control panel
+$DB_FILE = Join-Path $MeshRoot "mesh.db"
+if (-not $env:ATOMIC_MESH_DB) { $env:ATOMIC_MESH_DB = $DB_FILE }
+Write-Host "  DB: $env:ATOMIC_MESH_DB" -ForegroundColor DarkGray
 $LogFile = "$LogDir\$(Get-Date -Format 'yyyy-MM-dd')-$Type.log"
 $CombinedLog = "$LogDir\combined.log"  # Shared log for Control Panel
 
@@ -69,13 +74,45 @@ Write-Host "🛡️ Worker $ID ($Type) online via $Tool." -ForegroundColor $Colo
 
 Set-Location $MeshRoot
 
+$NoWorkStreak = 0
+$MaxNoWorkSeconds = 10
+$HeartbeatIntervalSec = 30
+try { if ($env:MESH_WORKER_HEARTBEAT_SECS) { $HeartbeatIntervalSec = [int]$env:MESH_WORKER_HEARTBEAT_SECS } } catch { $HeartbeatIntervalSec = 30 }
+if ($HeartbeatIntervalSec -lt 5) { $HeartbeatIntervalSec = 5 }
+
+$LeaseRenewIntervalSec = 30
+try { if ($env:MESH_LEASE_RENEW_SECS) { $LeaseRenewIntervalSec = [int]$env:MESH_LEASE_RENEW_SECS } } catch { $LeaseRenewIntervalSec = 30 }
+if ($LeaseRenewIntervalSec -lt 5) { $LeaseRenewIntervalSec = 5 }
+
+$LastHeartbeatAt = Get-Date 0
+
 while ($true) {
+    # v21.0: Send heartbeat before polling (non-blocking, failure doesn't stop worker)
+    try {
+        if (((Get-Date) - $LastHeartbeatAt).TotalSeconds -ge $HeartbeatIntervalSec) {
+            $blocked = Get-BlockedLanes -WorkerType $Type
+            $allowedLanes = @("backend", "frontend", "qa", "ops", "docs") | Where-Object { $_ -notin $blocked }
+            $heartbeatArgs = @{
+                worker_id = $ID
+                worker_type = $Type
+                allowed_lanes = $allowedLanes
+                task_ids = @()  # Will be updated when task is picked
+            }
+            $heartbeatJson = ($heartbeatArgs | ConvertTo-Json -Compress)
+            python $MCP_CLIENT worker_heartbeat $heartbeatJson 2>$null | Out-Null
+            $LastHeartbeatAt = Get-Date
+        }
+    } catch {
+        # Heartbeat failure is non-fatal - continue working
+    }
+
     # Poll using Python MCP client
     $JsonResult = $null
     try {
         $blocked = Get-BlockedLanes -WorkerType $Type
         $argsObj = @{
             worker_id = $ID
+            worker_type = $Type
             blocked_lanes = $blocked
         }
         $argsJson = ($argsObj | ConvertTo-Json -Compress)
@@ -92,10 +129,13 @@ while ($true) {
         Start-Sleep -Seconds 5
         continue
     }
-    
+
     # Check for NO_WORK or empty result
     if ([string]::IsNullOrWhiteSpace($JsonResult) -or $JsonResult -match "NO_WORK") {
-        Start-Sleep -Seconds 3
+        $NoWorkStreak = [Math]::Min($NoWorkStreak + 1, 6)
+        $sleepSeconds = [int]([Math]::Min($MaxNoWorkSeconds, [Math]::Pow(2, $NoWorkStreak - 1)))
+        $jitterMs = Get-Random -Minimum 0 -Maximum 750
+        Start-Sleep -Milliseconds ([int]($sleepSeconds * 1000 + $jitterMs))
         continue
     }
 
@@ -105,19 +145,44 @@ while ($true) {
         $TaskData = $JsonText | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
-        Start-Sleep -Seconds 3
+        $NoWorkStreak = [Math]::Min($NoWorkStreak + 1, 6)
+        $sleepSeconds = [int]([Math]::Min($MaxNoWorkSeconds, [Math]::Pow(2, $NoWorkStreak - 1)))
+        $jitterMs = Get-Random -Minimum 0 -Maximum 750
+        Start-Sleep -Milliseconds ([int]($sleepSeconds * 1000 + $jitterMs))
         continue
     }
 
     if (-not $TaskData -or $TaskData.status -ne "OK") {
-        Start-Sleep -Seconds 3
+        $NoWorkStreak = [Math]::Min($NoWorkStreak + 1, 6)
+        $sleepSeconds = [int]([Math]::Min($MaxNoWorkSeconds, [Math]::Pow(2, $NoWorkStreak - 1)))
+        $jitterMs = Get-Random -Minimum 0 -Maximum 750
+        Start-Sleep -Milliseconds ([int]($sleepSeconds * 1000 + $jitterMs))
         continue
     }
 
     $TaskID = $TaskData.id
     $Desc = if ($TaskData.description) { [string]$TaskData.description } else { "No description" }
     $Lane = if ($TaskData.lane) { [string]$TaskData.lane } else { $Type }
-    
+    $LeaseId = $null
+    try { $LeaseId = [string]$TaskData.lease_id } catch { $LeaseId = $null }
+
+    $NoWorkStreak = 0
+
+    # v21.0: Update heartbeat with current task ID
+    try {
+        $blocked = Get-BlockedLanes -WorkerType $Type
+        $allowedLanes = @("backend", "frontend", "qa", "ops", "docs") | Where-Object { $_ -notin $blocked }
+        $heartbeatArgs = @{
+            worker_id = $ID
+            worker_type = $Type
+            allowed_lanes = $allowedLanes
+            task_ids = @($TaskID)
+        }
+        $heartbeatJson = ($heartbeatArgs | ConvertTo-Json -Compress)
+        python $MCP_CLIENT worker_heartbeat $heartbeatJson 2>$null | Out-Null
+        $LastHeartbeatAt = Get-Date
+    } catch {}
+
     $Header = "⚡ [$Type/$Lane] Task $TaskID"
     Write-Host "`n$Header" -ForegroundColor $Color
     
@@ -148,8 +213,42 @@ while ($true) {
     
     $Output = ""
     $StartTime = Get-Date
+    $LeaseJob = $null
 
     try {
+        # v21.1: Background lease renewal + heartbeat during long executions
+        if (-not [string]::IsNullOrWhiteSpace($LeaseId)) {
+            try {
+                $LeaseJob = Start-Job -ScriptBlock {
+                    param($MeshRoot, $McpClient, $WorkerId, $WorkerType, $AllowedLanes, $TaskId, $LeaseId, $IntervalSeconds)
+                    Set-Location $MeshRoot
+                    while ($true) {
+                        try {
+                            $renewArgs = @{
+                                task_id   = [int]$TaskId
+                                worker_id = [string]$WorkerId
+                                lease_id  = [string]$LeaseId
+                            }
+                            $renewJson = ($renewArgs | ConvertTo-Json -Compress)
+                            python $McpClient renew_task_lease $renewJson 2>$null | Out-Null
+
+                            $hbArgs = @{
+                                worker_id     = [string]$WorkerId
+                                worker_type   = [string]$WorkerType
+                                allowed_lanes = $AllowedLanes
+                                task_ids      = @([int]$TaskId)
+                            }
+                            $hbJson = ($hbArgs | ConvertTo-Json -Compress)
+                            python $McpClient worker_heartbeat $hbJson 2>$null | Out-Null
+                        }
+                        catch {}
+                        Start-Sleep -Seconds ([int]$IntervalSeconds)
+                    }
+                } -ArgumentList $MeshRoot, $MCP_CLIENT, $ID, $Type, $allowedLanes, $TaskID, $LeaseId, $LeaseRenewIntervalSec | Out-Null
+            }
+            catch {}
+        }
+
         if ($Tool -eq "claude") {
             $Output = claude --print "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
         }
@@ -160,13 +259,27 @@ while ($true) {
     catch {
         $Output = "Execution error: $_"
     }
+    finally {
+        if ($LeaseJob) {
+            try { Stop-Job -Job $LeaseJob -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+            try { Remove-Job -Job $LeaseJob -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+    }
     
     $Duration = [Math]::Round(((Get-Date) - $StartTime).TotalSeconds, 1)
 
     # --- REPORTING ---
     if ($LASTEXITCODE -eq 0) {
         Write-Host "   ✅ Success (${Duration}s)" -ForegroundColor $Color
-        python $MCP_CLIENT complete_task "{`"task_id`": $TaskID, `"output`": `"Done in ${Duration}s`", `"success`": true}" 2>&1 | Out-Null
+        $completeArgs = @{
+            task_id   = [int]$TaskID
+            output    = "Done in ${Duration}s"
+            success   = $true
+            worker_id = [string]$ID
+            lease_id  = [string]$LeaseId
+        }
+        $completeJson = ($completeArgs | ConvertTo-Json -Compress)
+        python $MCP_CLIENT complete_task $completeJson 2>$null | Out-Null
     }
     else {
         Write-Host "   ❌ FAILURE (Exit $LASTEXITCODE, ${Duration}s)" -ForegroundColor Red
@@ -182,6 +295,14 @@ while ($true) {
         }
         catch {}
         
-        python $MCP_CLIENT complete_task "{`"task_id`": $TaskID, `"output`": `"Exit $LASTEXITCODE`", `"success`": false}" 2>&1 | Out-Null
+        $completeArgs = @{
+            task_id   = [int]$TaskID
+            output    = "Exit $LASTEXITCODE"
+            success   = $false
+            worker_id = [string]$ID
+            lease_id  = [string]$LeaseId
+        }
+        $completeJson = ($completeArgs | ConvertTo-Json -Compress)
+        python $MCP_CLIENT complete_task $completeJson 2>$null | Out-Null
     }
 }

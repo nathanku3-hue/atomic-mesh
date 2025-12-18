@@ -30,6 +30,7 @@ def _init_minimal_db(db_path: str):
             status TEXT DEFAULT 'pending',
             output TEXT,
             worker_id TEXT,
+            lease_id TEXT DEFAULT '',
             updated_at INTEGER,
             retry_count INTEGER DEFAULT 0,
             priority INTEGER DEFAULT 10,
@@ -134,4 +135,3 @@ def test_core_loop_draft_accept_pick(tmp_path, monkeypatch):
     assert picked.get("status") == "OK", f"pick_task_braided should find work: {picked}"
     assert picked.get("id") is not None
     assert picked.get("lane") in ("backend", "frontend", "qa", "ops", "docs")
-

@@ -108,6 +108,23 @@ Get-Process python | Where-Object { $_.CommandLine -like "*mesh*" } | Stop-Proce
 
 ---
 
+## Ops Knobs
+
+- `MESH_STALE_IN_PROGRESS_SECS` - Crash recovery reaper window (default `1800`); tasks older than this are re-queued from `in_progress` → `pending`.
+- `MESH_SQLITE_WAL_AUTOCHECKPOINT` - WAL auto-checkpoint pages (default `1000`); set `0` to disable auto-checkpointing.
+- `MESH_REQUIRE_WORKER_ROLE` - When set (`1`/`true`/`yes`), deny scheduler picks unless a worker role can be inferred (fail-closed production mode).
+- `LIBRARIAN_RECENT_TTL` - Seconds to cache recent-file/lock scans (default `13`); set lower for sub-second dashboard ticks, or bypass per-call with `bypass_cache=True`.
+- `MESH_WORKER_HEARTBEAT_SECS` - Worker heartbeat interval for EXEC dashboard (default `30`; min `5`).
+- `MESH_LEASE_RENEW_SECS` - Lease renewal interval while a task is running (default `30`; min `5`).
+
+### Worker Leases (Operational Notes)
+
+- Workers claim tasks with a `lease_id` (claim token) and periodically renew it via `renew_task_lease()` to keep `updated_at` fresh.
+- Renewal is best-effort: if renewals fail long enough to exceed `MESH_STALE_IN_PROGRESS_SECS`, the stale reaper will re-queue the task back to `pending` for crash recovery.
+- `complete_task()` is fail-closed: if `(worker_id, lease_id)` no longer matches (task reaped/reassigned), completion is rejected with `reason=LEASE_MISMATCH` (and logged as `COMPLETE_TASK_DENY`).
+
+---
+
 ## Governance Rules (v13.0.1)
 
 ✅ **Static Safety Check** passes (no unsafe status mutations)

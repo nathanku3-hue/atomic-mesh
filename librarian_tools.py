@@ -748,7 +748,7 @@ def librarian_full_scan(project_root: str, db_path: str = None, ignore_untracked
 
 # === PATCH 1: ACTIVE FILE LOCK ===
 
-def get_locked_files(db_path: str, project_root: str) -> List[str]:
+def get_locked_files(db_path: str, project_root: str, bypass_cache: bool = False) -> List[str]:
     """
     Get files currently being worked on by Workers/Auditor.
     These files should NOT be touched by the Librarian.
@@ -786,7 +786,7 @@ def get_locked_files(db_path: str, project_root: str) -> List[str]:
         print(f"   ⚠️ Could not check locked files: {e}")
     
     # 3. Files modified in last 5 minutes (safety buffer)
-    recent_files = get_recently_modified_files(project_root, minutes=5)
+    recent_files = get_recently_modified_files(project_root, minutes=5, bypass_cache=bypass_cache)
     locked.update(recent_files)
     
     return list(locked)

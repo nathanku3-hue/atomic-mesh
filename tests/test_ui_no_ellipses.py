@@ -254,7 +254,6 @@ class TestDecisionCategoryMapping:
         raw = "| 010 | 2025-12-15 | SEC | Read-Only Mode for Data | Rationale | Scope | Task | Status |"
         result = self.format_decision_for_display(raw)
         assert "  " not in result, f"Double spaces found: {result}"
-feat/v17.2-lane-counts
 
 
 class TestPlanScreenDeclutter:
@@ -383,5 +382,3 @@ class TestPlanScreenDeclutter:
         # The source should be part of the returned model
         assert '"source"' in content or "'source'" in content or "source =" in content, \
             "Pipeline status should still include source in its return model"
-=======
-main

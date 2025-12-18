@@ -190,3 +190,36 @@ def test_get_recently_modified_files_cache(monkeypatch, tmp_path):
     third = set(librarian_tools.get_recently_modified_files(str(base), minutes=5))
     assert third == first
     assert scan_calls["count"] > first_calls
+
+
+def test_get_recently_modified_files_bypass_cache(monkeypatch, tmp_path):
+    """bypass_cache=True should force a fresh scan even within TTL."""
+    import librarian_tools
+
+    base = tmp_path / "proj"
+    base.mkdir(parents=True)
+    file_a = base / "a.txt"
+    file_a.write_text("a", encoding="utf-8")
+
+    monkeypatch.setattr(librarian_tools, "_recent_cache", {})
+    monkeypatch.setattr(librarian_tools, "_RECENT_CACHE_TTL", 999)
+
+    scan_calls = {"count": 0}
+    real_scandir = librarian_tools.os.scandir
+
+    def tracking_scandir(path):
+        scan_calls["count"] += 1
+        return real_scandir(path)
+
+    monkeypatch.setattr(librarian_tools.os, "scandir", tracking_scandir)
+
+    first = set(librarian_tools.get_recently_modified_files(str(base), minutes=5))
+    assert file_a.as_posix() in [p.replace("\\", "/") for p in first]
+    first_calls = scan_calls["count"]
+
+    file_b = base / "b.txt"
+    file_b.write_text("b", encoding="utf-8")
+
+    second = set(librarian_tools.get_recently_modified_files(str(base), minutes=5, bypass_cache=True))
+    assert scan_calls["count"] > first_calls
+    assert file_b.as_posix() in [p.replace("\\", "/") for p in second]

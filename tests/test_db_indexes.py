@@ -85,3 +85,80 @@ def test_hot_queries_use_indexes(mesh_with_db):
     )
 
     conn.close()
+
+
+def test_init_db_upgrades_legacy_schema(tmp_path, monkeypatch):
+    """
+    Ensure init_db can upgrade a legacy tasks table (db_pool.py schema)
+    and still create performance indexes without errors.
+    """
+    base_dir = tmp_path / "legacy_env"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    db_path = base_dir / "mesh.db"
+    db_path.touch()
+
+    # Create legacy tasks table (db_pool.py schema)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            desc TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            priority INTEGER DEFAULT 1,
+            worker_id TEXT,
+            retry_count INTEGER DEFAULT 0,
+            output TEXT,
+            created_at INTEGER,
+            updated_at INTEGER
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Run init_db to apply migrations + indexes
+    monkeypatch.setenv("MESH_BASE_DIR", str(base_dir))
+    monkeypatch.setenv("ATOMIC_MESH_DB", str(db_path))
+    monkeypatch.chdir(base_dir)
+
+    if "mesh_server" in sys.modules:
+        del sys.modules["mesh_server"]
+    import importlib
+    import mesh_server
+
+    mesh_server = importlib.reload(mesh_server)
+    mesh_server.init_db()
+
+    # Verify required columns were added
+    conn = sqlite3.connect(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info('tasks')").fetchall()}
+    required_cols = {
+        "auditor_status",
+        "archetype",
+        "lane",
+        "lane_rank",
+        "created_at",
+        "exec_class",
+        "task_signature",
+        "source_plan_hash",
+        "plan_key",
+    }
+    missing = required_cols - cols
+    assert not missing, f"Missing columns after migration: {missing}"
+
+    # Verify indexes exist
+    index_names = {row[1] for row in conn.execute("PRAGMA index_list('tasks')")}
+    expected_indexes = {
+        "idx_tasks_pick_preempt",
+        "idx_tasks_pick_lane",
+        "idx_tasks_auditor_status_status",
+        "idx_tasks_status_archetype",
+        "idx_tasks_status_updated_at",
+        "idx_tasks_source_plan_hash",
+        "idx_tasks_task_signature",
+    }
+    missing_idx = expected_indexes - index_names
+    assert not missing_idx, f"Missing indexes after migration: {missing_idx}"
+    conn.close()

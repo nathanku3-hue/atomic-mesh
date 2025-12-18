@@ -164,16 +164,27 @@ def run_preflight_tests(project_profile: str = None) -> Dict:
 
     def _run_cmd(cmd, *, timeout_s: int):
         """
-        SECURITY: Avoid shell=True unless command requires shell metacharacters.
+        SECURITY: No shell=True. If a command needs shell operators, it must be
+        modeled explicitly (argv list) instead of a single string.
         Returns subprocess.CompletedProcess.
         """
         if isinstance(cmd, (list, tuple)):
-            return subprocess.run(list(cmd), shell=False, capture_output=True, timeout=timeout_s)
+            return subprocess.run(
+                list(cmd),
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                cwd=os.getcwd(),
+            )
 
         cmd_str = str(cmd).strip()
-        # If the config contains shell operators, fall back (explicitly).
+        # If the config contains shell operators, refuse rather than falling back to shell=True.
         if any(op in cmd_str for op in ["|", "&", ";", ">", "<"]):
-            return subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=os.getcwd())
+            raise ValueError(
+                f"Refusing to run command containing shell operators: {cmd_str!r}. "
+                "Use an argv list in config (no shell=True)."
+            )
 
         argv = shlex.split(cmd_str, posix=(os.name != "nt"))
         return subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout_s, cwd=os.getcwd())

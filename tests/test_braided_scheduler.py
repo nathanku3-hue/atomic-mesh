@@ -47,6 +47,7 @@ def scheduler_workspace(tmp_path):
             status TEXT DEFAULT 'pending',
             output TEXT,
             worker_id TEXT,
+            lease_id TEXT DEFAULT '',
             updated_at INTEGER,
             retry_count INTEGER DEFAULT 0,
             priority INTEGER DEFAULT 10,
@@ -919,6 +920,85 @@ class TestConcurrencyAndRecovery:
         assert row["status"] == "in_progress"
         assert row["worker_id"] == "recovery_worker"
         assert row["retry_count"] >= 1, "Reaper should bump retry_count on stale recovery"
+
+    def test_reaper_clears_lease_id(self, scheduler_workspace, monkeypatch):
+        """Crash recovery should clear old lease_id when re-queuing stale in_progress tasks."""
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+
+        from mesh_server import get_db, _reap_stale_in_progress
+
+        now = int(time.time())
+        stale_ts = now - 10_000
+        with get_db() as conn:
+            conn.execute(
+                """INSERT INTO tasks (type, desc, status, priority, lane, lane_rank, created_at, deps, updated_at, worker_id, lease_id, retry_count)
+                   VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("backend", "Stale leased task", 10, "backend", 0, stale_ts, "[]", stale_ts, "dead_worker", "old_lease", 0),
+            )
+            conn.commit()
+
+            reap = _reap_stale_in_progress(conn, now)
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT status, worker_id, lease_id FROM tasks WHERE desc='Stale leased task'"
+            ).fetchone()
+
+        assert reap.get("reaped") == 1
+        assert row["status"] == "pending"
+        assert row["worker_id"] is None
+        assert not row["lease_id"], f"Expected lease_id cleared, got {row['lease_id']!r}"
+
+    def test_complete_task_enforces_lease_id(self, scheduler_workspace, monkeypatch):
+        """A worker must provide the correct claim token to complete a leased task."""
+        import mesh_server
+
+        monkeypatch.setattr('mesh_server.BASE_DIR', str(scheduler_workspace))
+        monkeypatch.setattr('mesh_server.DB_PATH', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.DB_FILE', str(scheduler_workspace / "mesh.db"))
+        monkeypatch.setattr('mesh_server.STATE_DIR', str(scheduler_workspace / "control" / "state"))
+        monkeypatch.setattr('mesh_server.LANE_POINTER_FILE', str(scheduler_workspace / "control" / "state" / "scheduler_lane_pointer.json"))
+        monkeypatch.setattr('mesh_server.validate_task_completion', lambda _task_id: {"ok": True, "errors": [], "warnings": []})
+
+        from mesh_server import pick_task_braided, complete_task
+
+        db_path = scheduler_workspace / "mesh.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        base_time = int(time.time())
+        insert_task(conn, 'backend', 'Lease-enforced task', priority=10, created_at=base_time)
+        conn.commit()
+        conn.close()
+
+        set_lane_pointer(0)
+
+        claimed = json.loads(pick_task_braided("backend_worker_1", worker_type="backend"))
+        assert claimed.get("status") == "OK", f"Expected claim OK, got {claimed}"
+        assert claimed.get("lease_id"), "Expected lease_id in claim response"
+
+        task_id = int(claimed["id"])
+        lease_id = str(claimed["lease_id"])
+
+        bad = complete_task(task_id, "bad-complete", True, worker_id="backend_worker_1", lease_id="wrong")
+        bad_res = json.loads(bad)
+        assert bad_res.get("status") == "ERROR"
+        assert bad_res.get("reason") == "LEASE_MISMATCH"
+
+        ok = complete_task(task_id, "ok-complete", True, worker_id="backend_worker_1", lease_id=lease_id)
+        assert "REVIEWING" in ok
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+        assert row["status"] == "reviewing"
 
     def test_unknown_deps_block_and_surface_reason(self, scheduler_workspace, monkeypatch):
         import mesh_server

@@ -8,6 +8,7 @@ import re
 import hashlib
 from datetime import date, datetime
 from enum import Enum
+from contextlib import contextmanager
 from mcp.server.fastmcp import FastMCP
 from typing import List, Dict
 
@@ -135,8 +136,15 @@ def _resolve_worker_lane_policy(worker_id: str | None, worker_type: str | None) 
     role = explicit_role or inferred_role
     if not role:
         # Backward compatibility: if no role can be determined, allow all lanes.
-        # This ensures existing tests and callers that don't specify worker_type
-        # continue to work. Server-side enforcement only applies when role is known.
+        # Production hardening: allow opt-in fail-closed behavior via env.
+        require_role = str(os.getenv("MESH_REQUIRE_WORKER_ROLE", "")).strip().lower() in {"1", "true", "yes"}
+        if require_role:
+            return {
+                "ok": False,
+                "role": None,
+                "allowed_lanes": set(),
+                "error": "MISSING_WORKER_ROLE",
+            }
         return {
             "ok": True,
             "role": None,
@@ -635,13 +643,47 @@ def get_safe_files_for_librarian(file_list: List[str]) -> List[str]:
     
     return safe_files
 
+@contextmanager
 def get_db():
+    """SQLite connection context manager (always closes).
+
+    NOTE: sqlite3.Connection's context manager commits/rolls back but does not
+    close the connection. Closing here avoids leaked connections/locks across
+    long-running processes and test suites.
+    """
+    conn = open_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def open_db() -> sqlite3.Connection:
+    """Open a raw SQLite connection (caller must close).
+
+    Prefer `with get_db() as conn:` for most code paths so connections don't leak.
+    This helper exists for one-off scripts and REPL usage.
+    """
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
     # WAL mode for concurrent access - set once per connection
     conn.execute("PRAGMA journal_mode=WAL;")
     # Speed/durability balance for WAL (production default; override via env if needed)
     conn.execute("PRAGMA synchronous=NORMAL;")
+    # Keep WAL growth bounded for long-running services.
+    try:
+        wal_autockpt = int(os.getenv("MESH_SQLITE_WAL_AUTOCHECKPOINT", "1000") or "1000")
+    except Exception:
+        wal_autockpt = 1000
+    if wal_autockpt > 0:
+        conn.execute(f"PRAGMA wal_autocheckpoint={wal_autockpt};")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
@@ -716,6 +758,7 @@ def init_db():
                 status TEXT DEFAULT 'pending',
                 output TEXT,
                 worker_id TEXT,
+                lease_id TEXT DEFAULT '',
                 updated_at INTEGER,
                 retry_count INTEGER DEFAULT 0,
                 priority INTEGER DEFAULT 1,
@@ -734,10 +777,17 @@ def init_db():
             )
         """)
 
-            # v10.5 Self-Healing Migration: Add new columns to existing DBs
-            existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+            # v10.5 Self-Healing Migration: Add missing columns to existing DBs
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
 
             migrations = [
+                # v20.0: Backfill core columns for older schemas (e.g., db_pool.py init)
+                ("deps", "TEXT DEFAULT '[]'", "v20.0"),
+                ("files_changed", "TEXT DEFAULT '[]'", "v20.0"),
+                ("test_result", "TEXT DEFAULT 'SKIPPED'", "v20.0"),
+                ("strictness", "TEXT DEFAULT 'normal'", "v20.0"),
+                ("auditor_status", "TEXT DEFAULT 'pending'", "v20.0"),
+                ("auditor_feedback", "TEXT DEFAULT '[]'", "v20.0"),
                 ("source_ids", "TEXT DEFAULT '[]'", "v10.3"),
                 ("archetype", "TEXT DEFAULT 'GENERIC'", "v10.5"),
                 ("dependencies", "TEXT DEFAULT '[]'", "v10.5"),
@@ -755,6 +805,7 @@ def init_db():
                 ("task_signature", "TEXT DEFAULT ''", "v18.0"),
                 ("source_plan_hash", "TEXT DEFAULT ''", "v18.0"),
                 ("plan_key", "TEXT DEFAULT ''", "v19.10"),
+                ("lease_id", "TEXT DEFAULT ''", "v21.1"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -762,113 +813,145 @@ def init_db():
                     try:
                         conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
                         server_logger.info(f"{version}: Added {col_name} column to tasks table")
+                        existing_cols.add(col_name)
                     except Exception:
                         pass  # Column already exists
 
-            # v19.10: Cheap-win indexes for scheduler hot paths
-            # - Preemption: status + priority ordering
-            # - Lane scan: status + lane ordering
-            try:
-                conn.execute(
+            # v19.10+: Create indexes for scheduler and dashboards (idempotent)
+            index_defs = [
+                (
+                    "idx_tasks_pick_preempt",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_pick_preempt "
-                    "ON tasks(status, priority, lane_rank, created_at, id)"
-                )
-                conn.execute(
+                    "ON tasks(status, priority, lane_rank, created_at, id)",
+                    {"status", "priority", "lane_rank", "created_at", "id"},
+                ),
+                (
+                    "idx_tasks_pick_lane",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_pick_lane "
-                    "ON tasks(status, lane, priority, lane_rank, created_at, id)"
-                )
-
-                # v20.0: Targeted indexes for dashboard/query hot paths
-                conn.execute(
+                    "ON tasks(status, lane, priority, lane_rank, created_at, id)",
+                    {"status", "lane", "priority", "lane_rank", "created_at", "id"},
+                ),
+                (
+                    "idx_tasks_auditor_status_status",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_auditor_status_status "
-                    "ON tasks(auditor_status, status)"
-                )
-                conn.execute(
+                    "ON tasks(auditor_status, status)",
+                    {"auditor_status", "status"},
+                ),
+                (
+                    "idx_tasks_status_archetype",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_status_archetype "
-                    "ON tasks(status, archetype)"
-                )
-                conn.execute(
+                    "ON tasks(status, archetype)",
+                    {"status", "archetype"},
+                ),
+                (
+                    "idx_tasks_status_updated_at",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated_at "
-                    "ON tasks(status, updated_at)"
-                )
-                conn.execute(
+                    "ON tasks(status, updated_at)",
+                    {"status", "updated_at"},
+                ),
+                (
+                    "idx_tasks_source_plan_hash",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_source_plan_hash "
-                    "ON tasks(source_plan_hash)"
-                )
-                conn.execute(
+                    "ON tasks(source_plan_hash)",
+                    {"source_plan_hash"},
+                ),
+                (
+                    "idx_tasks_task_signature",
                     "CREATE INDEX IF NOT EXISTS idx_tasks_task_signature "
-                    "ON tasks(task_signature)"
+                    "ON tasks(task_signature)",
+                    {"task_signature"},
+                ),
+            ]
+
+            for name, sql, required_cols in index_defs:
+                if not required_cols.issubset(existing_cols):
+                    missing = sorted(required_cols - existing_cols)
+                    server_logger.warning(f"Index creation skipped ({name}): missing columns {missing}")
+                    continue
+                try:
+                    conn.execute(sql)
+                except Exception as e:
+                    server_logger.warning(f"Index creation skipped ({name}): {e}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    worker_id TEXT,
+                    updated_at INTEGER
                 )
-            except Exception as e:
-                server_logger.warning(f"Index creation skipped: {e}")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS artifacts (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                worker_id TEXT,
-                updated_at INTEGER
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Decisions table for red/yellow/green priority queue
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                priority TEXT NOT NULL,
-                question TEXT NOT NULL,
-                context TEXT,
-                status TEXT DEFAULT 'pending',
-                answer TEXT,
-                created_at INTEGER
-            )
-        """)
-        # NEW: Audit log table for Auditor agent
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                action TEXT,
-                strictness TEXT,
-                reason TEXT,
-                retry_count INTEGER,
-                created_at INTEGER
-            )
-        """)
-        # NEW: Librarian operations log
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS librarian_ops (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                manifest_id TEXT,
-                action TEXT,
-                from_path TEXT,
-                to_path TEXT,
-                risk_level TEXT,
-                status TEXT DEFAULT 'pending',
-                blocked_reason TEXT,
-                created_at INTEGER,
-                executed_at INTEGER
-            )
-        """)
-        # NEW: Restore points for librarian
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS restore_points (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                manifest_id TEXT,
-                script_path TEXT,
-                operations_json TEXT,
-                created_at INTEGER,
-                expires_at INTEGER,
-                status TEXT DEFAULT 'active'
-            )
-        """)
-        # Initialize config if not exists
-        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'vibe')")
-        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('last_review', ?)", (str(int(time.time())),))
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            # Decisions table for red/yellow/green priority queue
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    priority TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    context TEXT,
+                    status TEXT DEFAULT 'pending',
+                    answer TEXT,
+                    created_at INTEGER
+                )
+            """)
+            # NEW: Audit log table for Auditor agent
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER,
+                    action TEXT,
+                    strictness TEXT,
+                    reason TEXT,
+                    retry_count INTEGER,
+                    created_at INTEGER
+                )
+            """)
+            # NEW: Librarian operations log
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS librarian_ops (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT,
+                    action TEXT,
+                    from_path TEXT,
+                    to_path TEXT,
+                    risk_level TEXT,
+                    status TEXT DEFAULT 'pending',
+                    blocked_reason TEXT,
+                    created_at INTEGER,
+                    executed_at INTEGER
+                )
+            """)
+            # NEW: Restore points for librarian
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS restore_points (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT,
+                    script_path TEXT,
+                    operations_json TEXT,
+                    created_at INTEGER,
+                    expires_at INTEGER,
+                    status TEXT DEFAULT 'active'
+                )
+            """)
+            # v21.0: Worker heartbeats for EXEC dashboard
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                    worker_id TEXT PRIMARY KEY,
+                    worker_type TEXT,
+                    allowed_lanes TEXT DEFAULT '[]',
+                    task_ids TEXT DEFAULT '[]',
+                    status TEXT DEFAULT 'idle',
+                    last_seen INTEGER,
+                    created_at INTEGER
+                )
+            """)
+            # Initialize config if not exists
+            conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'vibe')")
+            conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('last_review', ?)", (str(int(time.time())),))
     
     except sqlite3.Error as e:
         server_logger.critical(f"Database initialization failed: {e}")
@@ -1205,6 +1288,8 @@ def get_exec_snapshot() -> str:
                 ).fetchone()
                 if row and row["value"]:
                     dec_data = json.loads(row["value"])
+                    # v21.1: Include full scheduler decision for UI/ops diagnostics
+                    snapshot["scheduler"]["last_decision"] = dec_data
                     snapshot["scheduler"]["last_pick"] = {
                         "task_id": dec_data.get("picked_id"),
                         "lane": dec_data.get("lane"),
@@ -1290,8 +1375,9 @@ def get_exec_snapshot() -> str:
 
             # === ACTIVE TASKS ===
             try:
+                # v21.0: Query only columns that exist in tasks table
                 rows = conn.execute("""
-                    SELECT id, lane, type, status, desc, updated_at, worker_id, parent_task_id, deps
+                    SELECT id, lane, type, status, desc, updated_at, worker_id, deps
                     FROM tasks
                     WHERE status = 'in_progress'
                     ORDER BY updated_at DESC
@@ -1325,11 +1411,12 @@ def get_exec_snapshot() -> str:
                         "title": (row["desc"] or "")[:50],
                         "age_s": age_s,
                         "worker_id": row["worker_id"],
-                        "parent_id": row["parent_task_id"],
+                        "parent_id": None,  # parent_task_id column doesn't exist yet
                         "deps_blocked": deps_blocked,
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                # Log error for debugging but don't crash
+                server_logger.warning(f"get_exec_snapshot active_tasks error: {e}")
 
             # === ALERTS ===
             # Check for various alert conditions
@@ -2396,7 +2483,7 @@ def _decision_enforcement_tasks(ctx: dict, task_counter: dict) -> dict:
     return result
 
 
-def build_plan_from_context(ctx: dict) -> str:
+def build_plan_from_context(ctx: dict, *, structured: bool = False) -> str | dict:
     """
     Generate production execution-grade multi-stream plan markdown.
 
@@ -2863,6 +2950,37 @@ def build_plan_from_context(ctx: dict) -> str:
         _plan_debug(f"DEP VALIDATION: {len(invalid_deps_found)} invalid deps/blockers stripped")
 
     # =================================================================
+    # STRUCTURED OUTPUT (canonical; avoids markdown parsing drift)
+    # =================================================================
+    if structured:
+        is_sufficient, _ = _context_is_sufficient(ctx)
+        streams_list: list[dict] = []
+
+        for stream_name in ["Docs", "Backend", "Frontend", "QA", "Ops"]:
+            tasks = streams.get(stream_name, [])
+            if not tasks:
+                continue
+
+            out_tasks: list[dict] = []
+            for task in tasks:
+                t = dict(task)
+                t.pop("_spine", None)
+                t.pop("_enforcement", None)
+                plan_key = t.pop("_key", None)
+                if plan_key:
+                    t["plan_key"] = f"{stream_name}:{plan_key}"
+                t["lane"] = stream_name.lower()
+                out_tasks.append(t)
+
+            streams_list.append({"name": stream_name, "tasks": out_tasks})
+
+        return {
+            "status": "OK" if is_sufficient else "INSUFFICIENT_CONTEXT",
+            "streams": streams_list,
+            "warnings": dep_warnings,
+        }
+
+    # =================================================================
     # BUILD MARKDOWN OUTPUT
     # =================================================================
 
@@ -2950,91 +3068,12 @@ def build_plan_from_context(ctx: dict) -> str:
 
 
 def build_plan_from_context_structured(ctx: dict) -> dict:
+    """Canonical structured plan output.
+
+    Uses the same internal task engine as markdown output to prevent drift between
+    structured and markdown plan generation.
     """
-    Generate a structured plan dict with status and streams.
-
-    This is a structured alternative to build_plan_from_context() which
-    returns markdown. Use this when you need programmatic access to plan data.
-
-    Returns:
-        dict: {"status": "OK"|"INSUFFICIENT_CONTEXT", "streams": [...]}
-    """
-    # Check if context is sufficient (status only; tasks still generated deterministically)
-    is_sufficient, _ = _context_is_sufficient(ctx)
-
-    plan_md = build_plan_from_context(ctx)
-    streams_list = []
-    current_stream = None
-
-    for raw_line in plan_md.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # Stream header: "## [Backend]"
-        if line.startswith("## [") and line.endswith("]"):
-            name = line[len("## ["):-1].strip()
-            current_stream = {"name": name, "tasks": []}
-            streams_list.append(current_stream)
-            continue
-
-        # Task line: "- [ ] Backend: Title — DoD: ... | Trace: ..."
-        if current_stream and line.startswith("- [ ]"):
-            task = {"raw": line}
-
-            # Lane + title (best-effort)
-            try:
-                # Strip checkbox prefix
-                body = line.split("]", 1)[1].strip()
-                m = re.match(r"^(\w+):\s*(.+?)(?:\s+—\s+|$)", body)
-                if m:
-                    task["lane"] = m.group(1).lower()
-                    task["title"] = m.group(2).strip()
-                else:
-                    task["lane"] = str(current_stream.get("name", "")).lower()
-                    task["title"] = body
-            except Exception:
-                task["lane"] = str(current_stream.get("name", "")).lower()
-                task["title"] = line
-
-            # Common tags (best-effort; keep raw for anything else)
-            trace_match = re.search(r"\|\s*Trace:\s*([^|]+)", line)
-            if trace_match:
-                task["trace"] = trace_match.group(1).strip()
-
-            detail_match = re.search(r"\|\s*Detail:\s*([^|]+)", line)
-            if detail_match:
-                task["detail"] = detail_match.group(1).strip()
-
-            dep_match = re.search(r"\|\s*Dep:\s*([^|]+)", line)
-            if dep_match:
-                task["dep"] = dep_match.group(1).strip()
-
-            blocked_match = re.search(r"\|\s*BlockedBy:\s*([^|]+)", line)
-            if blocked_match:
-                task["blocked_by"] = blocked_match.group(1).strip()
-
-            level_match = re.search(r"\|\s*Level:\s*([^|]+)", line)
-            if level_match:
-                task["level"] = level_match.group(1).strip()
-
-            priority_match = re.search(r"\|\s*P:([A-Z]+)\b", line)
-            if priority_match:
-                task["priority"] = priority_match.group(1).strip().upper()
-
-            key_match = re.search(r"\|\s*K:\s*([^|]+)", line)
-            if key_match:
-                task["plan_key"] = key_match.group(1).strip()
-
-            if "| Scaffold" in line:
-                task["scaffold"] = True
-
-            current_stream["tasks"].append(task)
-
-    return {
-        "status": "OK" if is_sufficient else "INSUFFICIENT_CONTEXT",
-        "streams": streams_list
-    }
+    return build_plan_from_context(ctx, structured=True)
 
 
 def _assess_plan_quality(plan: dict, context: dict) -> dict:
@@ -3818,6 +3857,15 @@ def accept_plan(path: str) -> str:
         with get_db() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
+            # v21.1: Ensure config table exists (some test/minimal DBs only create tasks).
+            # Needed for accepted_plan_path and other lightweight scheduler metadata.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
             existing = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE source_plan_hash = ?",
                 (source_plan_hash,)
@@ -4034,6 +4082,13 @@ def accept_plan(path: str) -> str:
                 if unresolved:
                     unresolved_deps.append({"id": task["id"], "unresolved": unresolved[:5]})
 
+            conn.commit()
+
+            # v21.0: Store accepted plan path for EXEC dashboard
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                ("accepted_plan_path", path)
+            )
             conn.commit()
 
         if unresolved_deps:
@@ -4337,13 +4392,28 @@ def _reap_stale_in_progress(conn, now: int) -> dict:
     except Exception:
         pass
 
-    # Prefer updating retry_count if present, but fail-open on older schemas.
+    # Prefer updating retry_count and clearing lease_id if present, but fail-open on older schemas.
+    cols: set[str] = set()
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    except Exception:
+        cols = set()
+
+    set_parts = ["status='pending'", "worker_id=NULL"]
+    if "lease_id" in cols:
+        set_parts.append("lease_id=NULL")
+    set_parts.append("updated_at=?")
+    params: list[object] = [now]
+    if "retry_count" in cols:
+        set_parts.append("retry_count=retry_count+1")
+    params.append(cutoff)
+
     try:
         cursor = conn.execute(
-            """UPDATE tasks
-               SET status='pending', worker_id=NULL, updated_at=?, retry_count=retry_count+1  -- SAFETY-ALLOW: status-write
-               WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
-            (now, cutoff)
+            f"""UPDATE tasks
+                SET {", ".join(set_parts)}  -- SAFETY-ALLOW: status-write
+                WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
+            params,
         )
         return {
             "reaped": cursor.rowcount,
@@ -4353,31 +4423,15 @@ def _reap_stale_in_progress(conn, now: int) -> dict:
             "oldest_age_s": oldest_age_s,
         }
     except Exception as e:
-        try:
-            cursor = conn.execute(
-                """UPDATE tasks
-                   SET status='pending', worker_id=NULL, updated_at=?  -- SAFETY-ALLOW: status-write
-                   WHERE status='in_progress' AND COALESCE(updated_at, 0) < ?""",
-                (now, cutoff)
-            )
-            return {
-                "reaped": cursor.rowcount,
-                "stale_after_s": stale_after_s,
-                "cutoff": cutoff,
-                "warning": str(e),
-                "sample_ids": sample_ids,
-                "oldest_age_s": oldest_age_s,
-            }
-        except Exception as e2:
-            server_logger.warning(f"Stale task reaper failed: {e2}")
-            return {
-                "reaped": 0,
-                "stale_after_s": stale_after_s,
-                "cutoff": cutoff,
-                "error": str(e2),
-                "sample_ids": sample_ids,
-                "oldest_age_s": oldest_age_s,
-            }
+        server_logger.warning(f"Stale task reaper failed: {e}")
+        return {
+            "reaped": 0,
+            "stale_after_s": stale_after_s,
+            "cutoff": cutoff,
+            "error": str(e),
+            "sample_ids": sample_ids,
+            "oldest_age_s": oldest_age_s,
+        }
 
 
 def _check_dependencies_satisfied(task_id: int, deps_json: str, conn) -> bool:
@@ -4567,10 +4621,70 @@ def worker_heartbeat(
             """, (worker_id, worker_type, allowed_json, task_json, now, now))
             conn.commit()
 
+            server_logger.debug(f"HEARTBEAT | worker={worker_id} type={worker_type} tasks={task_ids}")
             return json.dumps({"status": "OK", "worker_id": worker_id, "last_seen": now})
 
     except Exception as e:
         return json.dumps({"status": "ERROR", "message": str(e)[:100]})
+
+
+@mcp.tool()
+def renew_task_lease(task_id: int, worker_id: str, lease_id: str) -> str:
+    """
+    v21.1: Lease renewal for long-running tasks.
+
+    Updates tasks.updated_at for an in_progress task only if the caller still holds
+    the claim (worker_id + lease_id match). This prevents the stale reaper from
+    re-queuing legitimate long-running work and creating double-runs.
+    """
+    if not task_id or not worker_id or not lease_id:
+        return json.dumps({
+            "status": "ERROR",
+            "message": "task_id, worker_id, lease_id required",
+        })
+
+    now = int(time.time())
+    try:
+        with get_db() as conn:
+            cols = set()
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            except Exception:
+                cols = set()
+
+            if "lease_id" in cols:
+                cursor = conn.execute(
+                    """UPDATE tasks
+                       SET updated_at=?
+                       WHERE id=? AND status='in_progress' AND worker_id=? AND lease_id=?""",
+                    (now, int(task_id), str(worker_id), str(lease_id)),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE tasks
+                       SET updated_at=?
+                       WHERE id=? AND status='in_progress' AND worker_id=?""",
+                    (now, int(task_id), str(worker_id)),
+                )
+
+            if cursor.rowcount == 0:
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "LEASE_MISMATCH_OR_NOT_IN_PROGRESS",
+                    "task_id": int(task_id),
+                })
+
+            return json.dumps({
+                "status": "OK",
+                "task_id": int(task_id),
+                "updated_at": now,
+            })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "ERROR",
+            "message": f"{e}"[:200],
+        })
 
 
 @mcp.tool()
@@ -4646,6 +4760,8 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
             f"SCHEDULER_LANE_POLICY | worker_id={worker_id} role={policy.get('role')} "
             f"allowed={allowed_lanes} server_blocked={server_blocked_lanes} final_blocked={blocked_lane_set}"
         )
+
+    import uuid
 
     try:
         with get_db() as conn:
@@ -4742,15 +4858,18 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                     continue
                 dep_status = _dependency_status(task["id"], task["deps"], conn)
                 if dep_status.get("satisfied"):
+                    lease_id = uuid.uuid4().hex
                     # Atomic claim: UPDATE only if still pending (prevents double-claim)
                     cursor = conn.execute(
-                        "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
-                        (worker_id, now, task["id"])
+                        "UPDATE tasks SET status='in_progress', worker_id=?, lease_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
+                        (worker_id, lease_id, now, task["id"])
                     )
                     if cursor.rowcount == 0:
                         # Task was claimed by another worker, try next
                         continue
                     decision_reason = "urgent" if int(task["priority"]) == 0 else "high"
+                    _increment_config_counter(conn, "scheduler_claimed_total", 1)
+                    _increment_config_counter(conn, f"scheduler_claimed_{decision_reason}_total", 1)
                     pointer = _read_lane_pointer(conn)
                     decision = {
                         "picked_id": task["id"],
@@ -4761,6 +4880,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         "pointer_index": pointer.get("index", 0),
                         "pointer_lane": pointer.get("lane"),
                         "worker_id": worker_id,
+                        "lease_id": lease_id,
                         "ts": now,
                     }
                     _write_scheduler_last_decision(conn, decision)
@@ -4779,6 +4899,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         "priority": task["priority"],
                         "lane_rank": task["lane_rank"],
                         "exec_class": task["exec_class"],
+                        "lease_id": lease_id,
                         "preempted": True,
                         "decision_reason": decision_reason,
                         "pointer_index": decision.get("pointer_index", 0),
@@ -4815,10 +4936,11 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                 for candidate in task:
                     dep_status = _dependency_status(candidate["id"], candidate["deps"], conn)
                     if dep_status.get("satisfied"):
+                        lease_id = uuid.uuid4().hex
                         # Atomic claim: UPDATE only if still pending (prevents double-claim)
                         cursor = conn.execute(
-                            "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
-                            (worker_id, now, candidate["id"])
+                            "UPDATE tasks SET status='in_progress', worker_id=?, lease_id=?, updated_at=? WHERE id=? AND status='pending'  -- SAFETY-ALLOW: status-write",
+                            (worker_id, lease_id, now, candidate["id"])
                         )
                         if cursor.rowcount == 0:
                             # Task was claimed by another worker, try next
@@ -4827,6 +4949,9 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         # Advance pointer to next lane (after the one we picked from)
                         next_index = (lane_index + 1) % len(LANE_ORDER)
                         _write_lane_pointer(next_index, LANE_ORDER[next_index], conn=conn)
+
+                        _increment_config_counter(conn, "scheduler_claimed_total", 1)
+                        _increment_config_counter(conn, "scheduler_claimed_rotation_total", 1)
 
                         decision = {
                             "picked_id": candidate["id"],
@@ -4837,6 +4962,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                             "pointer_start_index": start_index,
                             "pointer_next_index": next_index,
                             "worker_id": worker_id,
+                            "lease_id": lease_id,
                             "ts": now,
                         }
                         _write_scheduler_last_decision(conn, decision)
@@ -4855,6 +4981,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                             "priority": candidate["priority"],
                             "lane_rank": candidate["lane_rank"],
                             "exec_class": candidate["exec_class"],
+                            "lease_id": lease_id,
                             "preempted": False,
                             "decision_reason": "rotation",
                             "pointer_index": next_index,
@@ -4877,8 +5004,12 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
 
             message = "No pending tasks available"
             if pending_total > 0:
+                _increment_config_counter(conn, "scheduler_no_work_blocked_by_deps_total", 1)
                 message = "No runnable tasks (pending tasks are blocked by dependencies)"
                 server_logger.warning(f"Scheduler idle: {pending_total} pending task(s) blocked by deps")
+            else:
+                _increment_config_counter(conn, "scheduler_no_work_empty_total", 1)
+            _increment_config_counter(conn, "scheduler_no_work_total", 1)
 
             decision = {
                 "picked_id": None,
@@ -9398,11 +9529,13 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
                 mode_context += "\nREQUIRED: Run full test suite. No TODOs allowed."
             
             full_desc = f"{task['desc']}\n\n=== CONTEXT ==={deps_context}{mode_context}"
-            
+
             claimed_at = int(time.time())
+            import uuid
+            lease_id = uuid.uuid4().hex
             cursor = conn.execute(
-                "UPDATE tasks SET status='in_progress', worker_id=?, updated_at=? WHERE id=? AND status IN ('pending', 'blocked')",  # SAFETY-ALLOW: status-write
-                (worker_id, claimed_at, task["id"])
+                "UPDATE tasks SET status='in_progress', worker_id=?, lease_id=?, updated_at=? WHERE id=? AND status IN ('pending', 'blocked')",  # SAFETY-ALLOW: status-write
+                (worker_id, lease_id, claimed_at, task["id"])
             )
             if cursor.rowcount == 0:
                 continue
@@ -9412,7 +9545,7 @@ def pick_task(worker_type: TaskType, worker_id: str) -> str:
                     update_task_status(str(task["id"]), "IN_PROGRESS")
                 except Exception:
                     pass  # Non-critical, continue execution
-            return json.dumps({"id": task["id"], "description": full_desc})
+            return json.dumps({"id": task["id"], "description": full_desc, "lease_id": lease_id})
 
     return "NO_WORK"
 
@@ -9930,7 +10063,15 @@ Remember:
 
 
 @mcp.tool()
-def complete_task(task_id: int, output: str, success: bool = True, files_changed: str = "[]", test_result: str = "SKIPPED") -> str:
+def complete_task(
+    task_id: int,
+    output: str,
+    success: bool = True,
+    files_changed: str = "[]",
+    test_result: str = "SKIPPED",
+    worker_id: str | None = None,
+    lease_id: str | None = None,
+) -> str:
     """
     Worker submission endpoint - moves task to REVIEWING stage.
 
@@ -9968,16 +10109,145 @@ def complete_task(task_id: int, output: str, success: bool = True, files_changed
             server_logger.info(f"v10.11: {warning}")
 
     with get_db() as conn:
-        # Get task info for potential QA generation
-        task = conn.execute("SELECT type, desc FROM tasks WHERE id=?", (task_id,)).fetchone()
+        cols = set()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        except Exception:
+            cols = set()
+
+        has_lease_id = "lease_id" in cols
+        select_cols = ["type", "desc", "status", "worker_id", "retry_count"]
+        if has_lease_id:
+            select_cols.append("lease_id")
+
+        # Get task info for QA generation + claim enforcement
+        task = conn.execute(
+            f"SELECT {', '.join(select_cols)} FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if not task:
+            return json.dumps({
+                "status": "ERROR",
+                "reason": "TASK_NOT_FOUND",
+                "message": f"Task {task_id} not found",
+            })
+
+        db_status = str(task["status"] or "").lower()
+        db_worker = str(task["worker_id"] or "")
+        db_lease = str(task["lease_id"] or "") if has_lease_id else ""
+
+        # Enforce claim token when present (production safety).
+        require_claim = bool(db_lease)
+        if require_claim:
+            if not worker_id or not lease_id:
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=MISSING_CLAIM worker_id={worker_id}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "MISSING_CLAIM",
+                    "message": "worker_id and lease_id are required to complete this task",
+                    "task_id": task_id,
+                })
+            if db_worker and str(worker_id) != db_worker:
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=WORKER_MISMATCH expected={db_worker} got={worker_id}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "WORKER_MISMATCH",
+                    "message": "Task is not claimed by this worker",
+                    "task_id": task_id,
+                    "expected_worker_id": db_worker,
+                    "provided_worker_id": str(worker_id),
+                })
+            if str(lease_id) != db_lease:
+                def _lease_hint(v: str) -> str:
+                    token = str(v or "")
+                    if not token:
+                        return ""
+                    # Avoid leaking the full claim token into logs; prefix is enough for diagnostics.
+                    return token[:8]
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=LEASE_MISMATCH worker_id={worker_id} "
+                    f"expected_lease_prefix={_lease_hint(db_lease)} got_lease_prefix={_lease_hint(lease_id)}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "LEASE_MISMATCH",
+                    "message": "Task lease_id does not match; claim may have been reaped/reassigned",
+                    "task_id": task_id,
+                })
+        else:
+            # Backward-compatible: if no lease_id is present, optionally enforce worker_id.
+            if worker_id and db_worker and str(worker_id) != db_worker:
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=WORKER_MISMATCH expected={db_worker} got={worker_id}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "WORKER_MISMATCH",
+                    "message": "Task is not claimed by this worker",
+                    "task_id": task_id,
+                    "expected_worker_id": db_worker,
+                    "provided_worker_id": str(worker_id),
+                })
 
         if success:
+            if db_status == "reviewing":
+                return f"Task already submitted for review (REVIEWING). Use /approve {task_id} to complete."
+
+            if db_status != "in_progress":
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=TASK_NOT_IN_PROGRESS status={task['status']}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "TASK_NOT_IN_PROGRESS",
+                    "message": "Task must be in_progress to be completed by a worker",
+                    "task_id": task_id,
+                    "current_status": task["status"],
+                })
+
             # v10.17.0 HARD LOCK: Move to REVIEWING, not COMPLETE
             # The Gavel (submit_review_decision) is the ONLY path to COMPLETE
-            conn.execute(
-                "UPDATE tasks SET status='reviewing', output=?, files_changed=?, test_result=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                (output, files_changed, test_result, int(time.time()), task_id)
+            now = int(time.time())
+            where_tail = "AND status='in_progress'"
+            set_parts = ["status='reviewing'", "output=?"]
+            params: list[object] = [output]
+            if "files_changed" in cols:
+                set_parts.append("files_changed=?")
+                params.append(files_changed)
+            if "test_result" in cols:
+                set_parts.append("test_result=?")
+                params.append(test_result)
+            set_parts.append("updated_at=?")
+            params.append(now)
+            params.append(task_id)
+
+            if require_claim:
+                where_tail += " AND worker_id=? AND lease_id=?"
+                params.extend([str(worker_id), str(lease_id)])
+            elif worker_id:
+                where_tail += " AND (worker_id IS NULL OR worker_id=?)"
+                params.append(str(worker_id))
+
+            cursor = conn.execute(
+                f"""UPDATE tasks
+                    SET {", ".join(set_parts)}
+                    WHERE id=? {where_tail}""",  # SAFETY-ALLOW: status-write
+                params,
             )
+            if cursor.rowcount == 0:
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=CLAIM_LOST worker_id={worker_id}"
+                )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "CLAIM_LOST",
+                    "message": "Task claim no longer valid (may have been reaped/reassigned)",
+                    "task_id": task_id,
+                })
 
             # v10.5: Sync to JSON state machine - REVIEWING not COMPLETE
             if STATE_MACHINE_AVAILABLE:
@@ -9996,24 +10266,92 @@ def complete_task(task_id: int, output: str, success: bool = True, files_changed
                     (qa_desc, json.dumps([task_id]), int(time.time()))
                 )
                 qa_msg = f" → QA Task {cursor.lastrowid} auto-generated."
-            
+
             # v10.17.0: Task moves to REVIEWING, not COMPLETE
             return f"Task submitted for review (REVIEWING).{qa_msg} Use /approve {task_id} to complete."
         else:
-            row = conn.execute("SELECT retry_count FROM tasks WHERE id=?", (task_id,)).fetchone()
-            current_retries = row[0] if row else 0
-            
-            if current_retries < 3:
-                conn.execute(
-                    "UPDATE tasks SET status='pending', worker_id=NULL, retry_count=retry_count+1, output=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                    (f"Retry #{current_retries + 1}: {output}", int(time.time()), task_id)
+            if db_status != "in_progress":
+                server_logger.warning(
+                    f"COMPLETE_TASK_DENY | task_id={task_id} reason=TASK_NOT_IN_PROGRESS status={task['status']}"
                 )
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "TASK_NOT_IN_PROGRESS",
+                    "message": "Task must be in_progress to be re-queued by a worker",
+                    "task_id": task_id,
+                    "current_status": task["status"],
+                })
+
+            try:
+                current_retries = int(task["retry_count"] or 0)
+            except Exception:
+                current_retries = 0
+
+            if current_retries < 3:
+                now = int(time.time())
+                where_tail = "AND status='in_progress'"
+                params = [f"Retry #{current_retries + 1}: {output}", now, task_id]
+
+                if require_claim:
+                    where_tail += " AND worker_id=? AND lease_id=?"
+                    params.extend([str(worker_id), str(lease_id)])
+                elif worker_id:
+                    where_tail += " AND (worker_id IS NULL OR worker_id=?)"
+                    params.append(str(worker_id))
+
+                lease_clear = ",\n                            lease_id=NULL" if has_lease_id else ""
+                cursor = conn.execute(
+                    f"""UPDATE tasks
+                        SET status='pending',
+                            worker_id=NULL{lease_clear},
+                            retry_count=retry_count+1,
+                            output=?,
+                            updated_at=?
+                        WHERE id=? {where_tail}""",  # SAFETY-ALLOW: status-write
+                    params,
+                )
+                if cursor.rowcount == 0:
+                    server_logger.warning(
+                        f"COMPLETE_TASK_DENY | task_id={task_id} reason=CLAIM_LOST worker_id={worker_id}"
+                    )
+                    return json.dumps({
+                        "status": "ERROR",
+                        "reason": "CLAIM_LOST",
+                        "message": "Task claim no longer valid (may have been reaped/reassigned)",
+                        "task_id": task_id,
+                    })
                 return f"Task Failed. Auto-retrying ({current_retries + 1}/3)..."
             else:
-                conn.execute(
-                    "UPDATE tasks SET status='failed', output=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
-                    (output, int(time.time()), task_id)
+                now = int(time.time())
+                where_tail = "AND status='in_progress'"
+                params = [output, now, task_id]
+
+                if require_claim:
+                    where_tail += " AND worker_id=? AND lease_id=?"
+                    params.extend([str(worker_id), str(lease_id)])
+                elif worker_id:
+                    where_tail += " AND (worker_id IS NULL OR worker_id=?)"
+                    params.append(str(worker_id))
+
+                cursor = conn.execute(
+                    f"""UPDATE tasks
+                        SET status='failed',
+                            {"lease_id=NULL," if has_lease_id else ""}
+                            output=?,
+                            updated_at=?
+                        WHERE id=? {where_tail}""",  # SAFETY-ALLOW: status-write
+                    params,
                 )
+                if cursor.rowcount == 0:
+                    server_logger.warning(
+                        f"COMPLETE_TASK_DENY | task_id={task_id} reason=CLAIM_LOST worker_id={worker_id}"
+                    )
+                    return json.dumps({
+                        "status": "ERROR",
+                        "reason": "CLAIM_LOST",
+                        "message": "Task claim no longer valid (may have been reaped/reassigned)",
+                        "task_id": task_id,
+                    })
                 # v10.5: Sync failure status to JSON state machine
                 if STATE_MACHINE_AVAILABLE:
                     try:
