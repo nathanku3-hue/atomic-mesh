@@ -27,7 +27,7 @@ function Test-CtrlCExit {
     # First press - show warning and start timer
     $script:CtrlCState.LastPressUtc = $now
     $script:CtrlCState.ShowWarning = $true
-    if ($State) { $State.MarkDirty("input") }
+    if ($State) { $State.MarkDirty("ctrlc") }
     return $false
 }
 
@@ -50,7 +50,7 @@ function Update-CtrlCWarning {
 
     if ($elapsed -gt $script:CtrlCState.TimeoutMs) {
         $script:CtrlCState.ShowWarning = $false
-        if ($State) { $State.MarkDirty("input") }
+        if ($State) { $State.MarkDirty("ctrlc") }
     }
 }
 
@@ -529,13 +529,6 @@ function Start-ControlPanel {
                 $state.SkippedFrames++
             }
 
-            # Reposition cursor to input box (golden: InputLeft + 4 + display buffer length)
-            # Account for truncation: boxWidth = width - 2 - 1, innerWidth = boxWidth - 2, maxLen = innerWidth - 3
-            $maxInputLen = $width - 2 - 1 - 2 - 3  # = width - 8
-            $displayLen = [Math]::Min($state.InputBuffer.Length, $maxInputLen)
-            $cursorCol = 2 + 4 + $displayLen
-            try { [Console]::SetCursorPosition($cursorCol, $rowInput) } catch {}
-
             $state.ClearDirty()
         }
         elseif ($state.HasDirty()) {
@@ -549,8 +542,6 @@ function Start-ControlPanel {
 
             if ($state.IsDirty("input")) {
                 Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
-                # Also render Ctrl+C warning (shares "input" region)
-                Render-CtrlCWarning -RowInput $rowInput -Width $width
             }
 
             if ($state.IsDirty("toast")) {
@@ -561,11 +552,9 @@ function Start-ControlPanel {
                 Render-HintBar -Row $footerRow -Width $width -State $state
             }
 
-            # Reposition cursor to input box (golden: InputLeft + 4 + display buffer length)
-            $maxInputLen = $width - 2 - 1 - 2 - 3  # = width - 8
-            $displayLen = [Math]::Min($state.InputBuffer.Length, $maxInputLen)
-            $cursorCol = 2 + 4 + $displayLen
-            try { [Console]::SetCursorPosition($cursorCol, $rowInput) } catch {}
+            if ($state.IsDirty("ctrlc")) {
+                Render-CtrlCWarning -RowInput $rowInput -Width $width
+            }
 
             $state.ClearDirty()
         }
