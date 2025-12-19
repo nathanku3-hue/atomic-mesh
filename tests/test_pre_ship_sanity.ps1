@@ -138,7 +138,7 @@ Test-Check "Tab cycles mode when input empty" {
 }
 
 # -----------------------------------------------------------------------------
-# CHECK 4: /go switches to GO page immediately
+# CHECK 4: /go switches to GO page (requires accepted plan)
 # -----------------------------------------------------------------------------
 Test-Check "/go switches to GO page" {
     $state = [UiState]::new()
@@ -146,6 +146,7 @@ Test-Check "/go switches to GO page" {
 
     $snapshot = [UiSnapshot]::new()
     $snapshot.PlanState = [PlanState]::new()
+    $snapshot.PlanState.Status = "ACCEPTED"  # Guard: /go requires accepted plan
 
     $result = Invoke-CommandRouter -Command "/go" -State $state -Snapshot $snapshot
 
@@ -1921,6 +1922,56 @@ Test-Check "Slow snapshot triggers fail-open mode" {
     # 4. Verify PLAN content still renders (not blank)
     if ($output -notmatch "PLAN") {
         return "Content not rendered: missing PLAN label"
+    }
+
+    return $true
+}
+
+# =============================================================================
+# COMMAND GUARDS (CHECK 63-64)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CHECK 63: /go blocks without accepted plan
+# -----------------------------------------------------------------------------
+Test-Check "/go blocks without accepted plan" {
+    $state = [UiState]::new()
+    $state.CurrentPage = "PLAN"
+
+    $snapshot = [UiSnapshot]::new()
+    $snapshot.PlanState = [PlanState]::new()
+    $snapshot.PlanState.Status = "DRAFT"  # Not accepted
+
+    $result = Invoke-CommandRouter -Command "/go" -State $state -Snapshot $snapshot
+
+    # Should stay on PLAN page (blocked)
+    if ($state.CurrentPage -ne "PLAN") {
+        return "Should stay on PLAN when blocked: page=$($state.CurrentPage)"
+    }
+
+    # Toast should mention /accept-plan
+    if ($state.Toast.Message -notmatch "accept-plan") {
+        return "Toast should mention /accept-plan: $($state.Toast.Message)"
+    }
+
+    return $true
+}
+
+# -----------------------------------------------------------------------------
+# CHECK 64: /accept-plan blocks without draft
+# -----------------------------------------------------------------------------
+Test-Check "/accept-plan blocks without draft" {
+    $state = [UiState]::new()
+
+    $snapshot = [UiSnapshot]::new()
+    $snapshot.PlanState = [PlanState]::new()
+    $snapshot.PlanState.Status = "ACCEPTED"  # Already accepted, no draft
+
+    $result = Invoke-CommandRouter -Command "/accept-plan" -State $state -Snapshot $snapshot
+
+    # Toast should mention /draft-plan
+    if ($state.Toast.Message -notmatch "draft-plan") {
+        return "Toast should mention /draft-plan: $($state.Toast.Message)"
     }
 
     return $true

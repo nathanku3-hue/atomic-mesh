@@ -59,53 +59,75 @@ function Invoke-CommandRouter {
             }
         }
         "accept-plan" {
-            $snapshotRef.PlanState.Accepted = $true
-            $snapshotRef.PlanState.Status = "ACCEPTED"
-            $snapshotRef.PlanState.NextHint = "/go"
-            # P6: Show task count in feedback
-            $taskCount = 0
-            if ($snapshotRef.LaneMetrics -and $snapshotRef.LaneMetrics.Count -gt 0) {
-                foreach ($lane in $snapshotRef.LaneMetrics) {
-                    $taskCount += $lane.Queued + $lane.Active + $lane.Tokens
-                }
+            # Guard: must have draft before accepting
+            $planStatus = $snapshotRef.PlanState.Status
+            if ($planStatus -ne "DRAFT") {
+                $state.Toast.Set("$($script:Icons.Warning) No draft to accept - run /draft-plan first", "warning", 4)
+                $logMessage = "Accept blocked: no draft (status=$planStatus)"
             }
-            if ($taskCount -gt 0) {
-                $state.Toast.Set("$($script:Icons.Success) Plan accepted - Created $taskCount task(s)", "info", 3)
-                $logMessage = "Accepted plan with $taskCount tasks"
-            } else {
-                $state.Toast.Set("$($script:Icons.Success) Plan accepted", "info", 3)
-                $logMessage = "Accepted plan"
+            else {
+                $snapshotRef.PlanState.Accepted = $true
+                $snapshotRef.PlanState.Status = "ACCEPTED"
+                $snapshotRef.PlanState.NextHint = "/go"
+                # P6: Show task count in feedback
+                $taskCount = 0
+                if ($snapshotRef.LaneMetrics -and $snapshotRef.LaneMetrics.Count -gt 0) {
+                    foreach ($lane in $snapshotRef.LaneMetrics) {
+                        $taskCount += $lane.Queued + $lane.Active + $lane.Tokens
+                    }
+                }
+                if ($taskCount -gt 0) {
+                    $state.Toast.Set("$($script:Icons.Success) Plan accepted - Created $taskCount task(s)", "info", 3)
+                    $logMessage = "Accepted plan with $taskCount tasks"
+                } else {
+                    $state.Toast.Set("$($script:Icons.Success) Plan accepted", "info", 3)
+                    $logMessage = "Accepted plan"
+                }
             }
         }
         "go" {
-            # P2: /go retry logic (3 retries, 100ms delays for DB locks)
-            $maxRetries = 3
-            $retryDelayMs = 100
-            $success = $false
-            $lastError = $null
-
-            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-                try {
-                    # Golden Contract: /go SWITCHES to GO page
-                    $state.SetPage("GO")
-                    $success = $true
-                    break
+            # Guard: must have accepted plan before /go
+            $planStatus = $snapshotRef.PlanState.Status
+            if ($planStatus -ne "ACCEPTED") {
+                if ($planStatus -eq "DRAFT") {
+                    $state.Toast.Set("$($script:Icons.Warning) Draft not accepted - run /accept-plan first", "warning", 4)
+                    $logMessage = "Go blocked: draft not accepted"
                 }
-                catch {
-                    $lastError = $_.Exception.Message
-                    if ($attempt -lt $maxRetries) {
-                        Start-Sleep -Milliseconds $retryDelayMs
-                    }
+                else {
+                    $state.Toast.Set("$($script:Icons.Warning) No plan - run /draft-plan first", "warning", 4)
+                    $logMessage = "Go blocked: no plan (status=$planStatus)"
                 }
-            }
-
-            if ($success) {
-                $state.Toast.Set("$($script:Icons.Success) Execution started", "info", 2)
-                $logMessage = "Go executed"
             }
             else {
-                $state.Toast.Set("$($script:Icons.Error) Go failed: $lastError", "error", 5)
-                $logMessage = "Go failed after $maxRetries retries"
+                # P2: /go retry logic (3 retries, 100ms delays for DB locks)
+                $maxRetries = 3
+                $retryDelayMs = 100
+                $success = $false
+                $lastError = $null
+
+                for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                    try {
+                        # Golden Contract: /go SWITCHES to GO page
+                        $state.SetPage("GO")
+                        $success = $true
+                        break
+                    }
+                    catch {
+                        $lastError = $_.Exception.Message
+                        if ($attempt -lt $maxRetries) {
+                            Start-Sleep -Milliseconds $retryDelayMs
+                        }
+                    }
+                }
+
+                if ($success) {
+                    $state.Toast.Set("$($script:Icons.Success) Execution started", "info", 2)
+                    $logMessage = "Go executed"
+                }
+                else {
+                    $state.Toast.Set("$($script:Icons.Error) Go failed: $lastError", "error", 5)
+                    $logMessage = "Go failed after $maxRetries retries"
+                }
             }
         }
         "help" {
