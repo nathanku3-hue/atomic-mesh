@@ -533,6 +533,7 @@ function Start-ControlPanel {
         }
         elseif ($state.HasDirty()) {
             # PARTIAL RENDER: Only update dirty regions (no Clear)
+            Begin-ConsoleFrame  # Ensure frame is valid for partial renders
             try { [Console]::CursorVisible = $false } catch {}
 
             if ($state.IsDirty("picker")) {
