@@ -525,6 +525,13 @@ function Start-ControlPanel {
                 $state.SkippedFrames++
             }
 
+            # Reposition cursor to input box (golden: InputLeft + 4 + display buffer length)
+            # Account for truncation: boxWidth = width - 2 - 1, innerWidth = boxWidth - 2, maxLen = innerWidth - 3
+            $maxInputLen = $width - 2 - 1 - 2 - 3  # = width - 8
+            $displayLen = [Math]::Min($state.InputBuffer.Length, $maxInputLen)
+            $cursorCol = 2 + 4 + $displayLen
+            try { [Console]::SetCursorPosition($cursorCol, $rowInput) } catch {}
+
             $state.ClearDirty()
         }
         elseif ($state.HasDirty()) {
@@ -549,6 +556,12 @@ function Start-ControlPanel {
             if ($state.IsDirty("footer")) {
                 Render-HintBar -Row $footerRow -Width $width -State $state
             }
+
+            # Reposition cursor to input box (golden: InputLeft + 4 + display buffer length)
+            $maxInputLen = $width - 2 - 1 - 2 - 3  # = width - 8
+            $displayLen = [Math]::Min($state.InputBuffer.Length, $maxInputLen)
+            $cursorCol = 2 + 4 + $displayLen
+            try { [Console]::SetCursorPosition($cursorCol, $rowInput) } catch {}
 
             $state.ClearDirty()
         }
