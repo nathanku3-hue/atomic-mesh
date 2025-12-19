@@ -161,8 +161,6 @@ function Render-CommandDropdown {
         [int]$MaxVisible = 5
     )
 
-    if (-not (Get-ConsoleFrameValid)) { return }
-
     $pickerState = Get-PickerState
     if (-not $pickerState -or -not $pickerState.IsActive) { return }
 
@@ -227,8 +225,6 @@ function Clear-CommandDropdown {
         [int]$Width,
         [int]$Lines = 6
     )
-
-    if (-not (Get-ConsoleFrameValid)) { return }
 
     for ($i = 0; $i -lt $Lines; $i++) {
         $row = $StartRow + $i
