@@ -263,8 +263,10 @@ function Render-InputBox {
     $bottomBorder = [char]0x2514 + ([string][char]0x2500 * $innerWidth) + [char]0x2518
     TryWriteAt -Row $bottomRow -Col $left -Text $bottomBorder -Color "DarkGray" | Out-Null
 
-    # Golden transplant: cursor position at InputLeft + 4 (line 8376)
-    # (Cursor positioning handled by caller in live mode)
+    # Golden transplant: cursor position at InputLeft + 4 + buffer length (line 8376)
+    # Position cursor where next character will be typed
+    $cursorCol = $left + 4 + $displayBuffer.Length
+    try { [Console]::SetCursorPosition($cursorCol, $RowInput) } catch {}
 }
 
 # Legacy function for backward compatibility with tests
