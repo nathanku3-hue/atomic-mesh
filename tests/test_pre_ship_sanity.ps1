@@ -2072,15 +2072,20 @@ Test-Check "Ctrl+C requires double-press within 2s" {
         return "First Ctrl+C should NOT exit"
     }
 
-    # Toast should show warning
-    if ($state.Toast.Message -notmatch "Ctrl\+C") {
-        return "Toast should mention Ctrl+C: $($state.Toast.Message)"
+    # ShowWarning flag should be set (warning renders below input box)
+    if (-not $script:CtrlCState.ShowWarning) {
+        return "ShowWarning should be true after first Ctrl+C"
     }
 
     # Second press within timeout should return true (exit)
     $shouldExit2 = Test-CtrlCExit -State $state
     if (-not $shouldExit2) {
         return "Second Ctrl+C within timeout SHOULD exit"
+    }
+
+    # ShowWarning should be cleared on exit
+    if ($script:CtrlCState.ShowWarning) {
+        return "ShowWarning should be false after exit triggered"
     }
 
     # Reset and wait for timeout (simulate with direct state manipulation)

@@ -4,6 +4,7 @@
 $script:CtrlCState = @{
     LastPressUtc = [datetime]::MinValue
     TimeoutMs = 2000
+    ShowWarning = $false
 }
 
 function Test-CtrlCExit {
@@ -19,20 +20,69 @@ function Test-CtrlCExit {
 
     if ($elapsed -le $script:CtrlCState.TimeoutMs) {
         # Second press within timeout - exit
+        $script:CtrlCState.ShowWarning = $false
         return $true
     }
 
     # First press - show warning and start timer
     $script:CtrlCState.LastPressUtc = $now
-    if ($State -and $State.Toast) {
-        $State.Toast.Set("Press Ctrl+C again within 2s to exit", "warning", 2)
-        $State.MarkDirty("toast")
-    }
+    $script:CtrlCState.ShowWarning = $true
+    if ($State) { $State.MarkDirty("input") }
     return $false
 }
 
 function Reset-CtrlCState {
     $script:CtrlCState.LastPressUtc = [datetime]::MinValue
+    $script:CtrlCState.ShowWarning = $false
+}
+
+function Update-CtrlCWarning {
+    <#
+    .SYNOPSIS
+        Clears the warning if timeout has expired.
+    #>
+    param($State)
+
+    if (-not $script:CtrlCState.ShowWarning) { return }
+
+    $now = [datetime]::UtcNow
+    $elapsed = ($now - $script:CtrlCState.LastPressUtc).TotalMilliseconds
+
+    if ($elapsed -gt $script:CtrlCState.TimeoutMs) {
+        $script:CtrlCState.ShowWarning = $false
+        if ($State) { $State.MarkDirty("input") }
+    }
+}
+
+function Render-CtrlCWarning {
+    <#
+    .SYNOPSIS
+        Renders Ctrl+C warning below input box, aligned with left edge.
+        Skips when dropdown is active (shares same row).
+    #>
+    param(
+        [int]$RowInput,
+        [int]$Width
+    )
+
+    if (-not (Get-ConsoleFrameValid)) { return }
+
+    # Skip if dropdown is active (it uses the same row)
+    $pickerState = Get-PickerState
+    if ($pickerState.IsActive) { return }
+
+    $warningRow = $RowInput + 2  # Below input box bottom border
+    $left = 2  # Align with input box left edge (InputLeft)
+
+    if ($script:CtrlCState.ShowWarning) {
+        $msg = "Press Ctrl+C again within 2s to exit"
+        $padded = $msg.PadRight($Width - $left)
+        TryWriteAt -Row $warningRow -Col $left -Text $padded -Color "Yellow" | Out-Null
+    } else {
+        # Clear the line
+        $blank = " " * ($Width - $left)
+        TryWriteAt -Row $warningRow -Col $left -Text $blank -Color "White" | Out-Null
+    }
 }
 
 # =============================================================================
@@ -250,6 +300,9 @@ function Start-ControlPanel {
             }
         }
 
+        # Check for Ctrl+C warning expiry (auto-clear after timeout)
+        Update-CtrlCWarning -State $state
+
         # Data refresh (marks dirty only if data meaningfully changed)
         # Uses ProjectPath for DB/snapshot location (where user is working)
         $snapshot = Invoke-DataRefreshTick -State $state -DataIntervalMs $DataIntervalMs -NowUtc $now -SnapshotLoader $SnapshotLoader -RepoRoot $projectPath
@@ -451,6 +504,9 @@ function Start-ControlPanel {
             # Render golden boxed input (3-row structure)
             Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
 
+            # Render Ctrl+C warning below input box (aligned with left edge)
+            Render-CtrlCWarning -RowInput $rowInput -Width $width
+
             # DROPDOWN: Render command picker below input box if active
             $pickerState = Get-PickerState
             if ($pickerState.IsActive) {
@@ -482,6 +538,8 @@ function Start-ControlPanel {
 
             if ($state.IsDirty("input")) {
                 Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
+                # Also render Ctrl+C warning (shares "input" region)
+                Render-CtrlCWarning -RowInput $rowInput -Width $width
             }
 
             if ($state.IsDirty("toast")) {

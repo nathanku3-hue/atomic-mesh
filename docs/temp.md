@@ -141,3 +141,39 @@ Extended fix to all model classes:
 Now using duck typing - objects work as long as they have expected properties.
 
 **Note:** You must restart your PowerShell session to clear cached old class types.
+
+---
+
+## Ctrl+C Protection
+
+**Commit:** `e65b132`
+
+Prevents accidental exit - requires double-press within 2 seconds.
+
+**Implementation:**
+```powershell
+$script:CtrlCState = @{
+    LastPressUtc = [datetime]::MinValue
+    TimeoutMs = 2000
+    ShowWarning = $false
+}
+
+function Test-CtrlCExit { ... }  # Returns true only on 2nd press within timeout
+function Render-CtrlCWarning { ... }  # Renders warning below input box
+```
+
+- First press → Warning below input box: "Press Ctrl+C again within 2s to exit"
+- Second press within 2s → Exit
+- Warning auto-clears after 2s timeout
+- `[Console]::TreatControlCAsInput = $true` captures Ctrl+C as key
+- Warning skipped when dropdown is active (shares same row)
+
+**Layout:**
+```
+┌─────────────────────────────────────────────┐
+│ > /draft-plan                               │ ← rowInput
+└─────────────────────────────────────────────┘
+  Press Ctrl+C again within 2s to exit          ← rowInput + 2 (aligned with left edge)
+```
+
+**Tests:** 68/68 pass (CHECK 68 added)
