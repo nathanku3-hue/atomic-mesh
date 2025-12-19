@@ -216,11 +216,11 @@ if ($content -match 'Draw-PlanScreen[\s\S]*?\$leftHeader\s*=\s*"NEEDS PLAN"' -an
     Fail "PLAN header stateful labels" "Expected all 4 header states: RUNNING, READY, NEEDS ACCEPTANCE, NEEDS PLAN"
 }
 
-# 18) PLAN screen shows F2/F4 hotkeys
-if ($content -match 'Draw-PlanScreen[\s\S]*?F2:.*F4:') {
-    Pass "PLAN screen shows F2/F4 hotkeys"
+# 18) PLAN screen shows F2 hotkey (F4 removed - not in golden)
+if ($content -match 'Draw-PlanScreen[\s\S]*?F2:') {
+    Pass "PLAN screen shows F2 hotkey"
 } else {
-    Fail "PLAN screen hotkeys" "Expected F2 and F4 hotkeys in Draw-PlanScreen"
+    Fail "PLAN screen hotkeys" "Expected F2 hotkey in Draw-PlanScreen"
 }
 
 # 19) PLAN screen uses Draw-PlanRow helper for unified row rendering
