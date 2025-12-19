@@ -75,7 +75,7 @@ function Render-CtrlCWarning {
     $left = 2  # Align with input box left edge (InputLeft)
 
     if ($script:CtrlCState.ShowWarning) {
-        $msg = "Press Ctrl+C again within 2s to exit"
+        $msg = "Press Ctrl+C again"
         $padded = $msg.PadRight($Width - $left)
         TryWriteAt -Row $warningRow -Col $left -Text $padded -Color "Yellow" | Out-Null
     } else {

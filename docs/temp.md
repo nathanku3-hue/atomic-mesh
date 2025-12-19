@@ -162,7 +162,7 @@ function Test-CtrlCExit { ... }  # Returns true only on 2nd press within timeout
 function Render-CtrlCWarning { ... }  # Renders warning below input box
 ```
 
-- First press → Warning below input box: "Press Ctrl+C again within 2s to exit"
+- First press → Warning below input box: "Press Ctrl+C again"
 - Second press within 2s → Exit
 - Warning auto-clears after 2s timeout
 - `[Console]::TreatControlCAsInput = $true` captures Ctrl+C as key
@@ -173,7 +173,7 @@ function Render-CtrlCWarning { ... }  # Renders warning below input box
 ┌─────────────────────────────────────────────┐
 │ > /draft-plan                               │ ← rowInput
 └─────────────────────────────────────────────┘
-  Press Ctrl+C again within 2s to exit          ← rowInput + 2 (aligned with left edge)
+  Press Ctrl+C again                            ← rowInput + 2 (aligned with left edge)
 ```
 
 **Tests:** 68/68 pass (CHECK 68 added)
