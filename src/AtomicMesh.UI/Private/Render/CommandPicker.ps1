@@ -240,7 +240,7 @@ function Clear-CommandDropdown {
 # =============================================================================
 function Render-PickerArea {
     param(
-        [UiState]$State,
+        $State,
         [int]$RowInput,
         [int]$Width
     )

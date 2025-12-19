@@ -110,3 +110,20 @@ else { partial redraws per region }
 **Cause:** PowerShell classes are scope-bound. Module reload creates a "new" UiSnapshot type that can't be assigned to the old typed `[UiSnapshot]$LastSnapshot` property.
 
 **Fix:** Changed `[UiSnapshot]$LastSnapshot` → `[object]$LastSnapshot` in UiCache.ps1
+
+---
+
+## Bug Fix: All Cross-Class Type References
+
+**Commit:** `f96f7bc`
+
+Extended fix to all model classes:
+
+| Class | Properties Changed |
+|-------|-------------------|
+| UiState | Toast, EventLog, Cache → `[object]` |
+| UiSnapshot | PlanState, LaneMetrics, SchedulerDecision, Alerts → `[object]` |
+| UiEventLog | Events → `ArrayList`, Add param → `[object]` |
+| UiCache | LastSnapshot → `[object]` |
+
+**Tests:** 67/67 pass

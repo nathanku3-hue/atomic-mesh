@@ -1,7 +1,7 @@
 function Invoke-KeyRouter {
     param(
         [ConsoleKeyInfo]$KeyInfo,
-        [UiState]$State
+        $State
     )
 
     if (-not $KeyInfo -or -not $State) { return "noop" }

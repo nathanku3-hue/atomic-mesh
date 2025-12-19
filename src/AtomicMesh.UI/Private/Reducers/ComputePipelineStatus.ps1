@@ -19,7 +19,7 @@
 #>
 function Get-PipelineRightColumn {
     param(
-        [UiSnapshot]$Snapshot
+        $Snapshot
     )
 
     # Default directives if no snapshot

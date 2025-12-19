@@ -7,8 +7,8 @@ function Render-Header {
     param(
         [int]$StartRow,
         [int]$Width,
-        [UiSnapshot]$Snapshot,
-        [UiState]$State
+        $Snapshot,
+        $State
     )
 
     if (-not (Get-ConsoleFrameValid)) { return }
@@ -289,7 +289,7 @@ function Render-HintBar {
     param(
         [int]$Row,
         [int]$Width,
-        [UiState]$State,
+        $State,
         [bool]$DevHintsEnabled = $false
     )
 

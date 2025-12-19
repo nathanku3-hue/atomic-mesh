@@ -10,8 +10,8 @@ $script:Icons = @{
 function Invoke-CommandRouter {
     param(
         [string]$Command,
-        [UiState]$State,
-        [UiSnapshot]$Snapshot
+        $State,
+        $Snapshot
     )
 
     if (-not $Command) { return "noop" }

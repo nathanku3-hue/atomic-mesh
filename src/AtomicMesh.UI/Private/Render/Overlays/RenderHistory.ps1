@@ -1,6 +1,6 @@
 function Render-HistoryOverlay {
     param(
-        [UiState]$State,
+        $State,
         [int]$StartRow = 0
     )
 

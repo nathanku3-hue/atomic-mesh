@@ -1,6 +1,6 @@
 function Render-StatsOverlay {
     param(
-        [UiState]$State,
+        $State,
         [int]$Width
     )
 

@@ -50,7 +50,7 @@ function Normalize-AdapterError {
 }
 
 function Get-SnapshotHash {
-    param([UiSnapshot]$Snapshot)
+    param($Snapshot)
 
     if (-not $Snapshot) { return "null" }
 
@@ -88,7 +88,7 @@ function Get-SnapshotHash {
 
 function Invoke-DataRefreshTick {
     param(
-        [UiState]$State,
+        $State,
         [int]$DataIntervalMs,
         [datetime]$NowUtc,
         [ScriptBlock]$SnapshotLoader,

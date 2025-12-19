@@ -1,6 +1,6 @@
 function Compute-NextHint {
     param(
-        [PlanState]$PlanState,
+        $PlanState,
         [hashtable]$RawSnapshot
     )
 

@@ -41,8 +41,8 @@ function Print-Row {
 
 function Render-Plan {
     param(
-        [UiSnapshot]$Snapshot,
-        [UiState]$State,
+        $Snapshot,
+        $State,
         [int]$StartRow = 0,
         [int]$BottomRow = -1   # Golden: RowInput - 2 (frame-fill target)
     )
