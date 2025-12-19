@@ -98,3 +98,15 @@ else { partial redraws per region }
 - `CommandPicker.ps1`: `Render-PickerArea` handles shrink/close
 
 **Tests:** 67/67 pre-ship + 10/10 golden (CHECK 65-67 added)
+
+---
+
+## Bug Fix: UiCache Type Mismatch
+
+**Commit:** `3ba0b9f`
+
+**Problem:** `Cannot convert "UiSnapshot" value of type "UiSnapshot" to type "UiSnapshot"`
+
+**Cause:** PowerShell classes are scope-bound. Module reload creates a "new" UiSnapshot type that can't be assigned to the old typed `[UiSnapshot]$LastSnapshot` property.
+
+**Fix:** Changed `[UiSnapshot]$LastSnapshot` → `[object]$LastSnapshot` in UiCache.ps1

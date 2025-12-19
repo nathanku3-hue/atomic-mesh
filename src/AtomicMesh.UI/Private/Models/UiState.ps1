@@ -9,9 +9,11 @@ class UiState {
     [int]$HistoryScrollOffset
     [bool]$HistoryDetailsVisible
 
-    [UiToast]$Toast
-    [UiEventLog]$EventLog
-    [UiCache]$Cache
+    # NOTE: Using [object] to avoid type mismatch on module reload
+    # PowerShell classes are scope-bound; reload creates "new" types
+    [object]$Toast       # UiToast
+    [object]$EventLog    # UiEventLog
+    [object]$Cache       # UiCache
     [datetime]$NowUtc
     [int]$RenderFrames
     [int]$SkippedFrames

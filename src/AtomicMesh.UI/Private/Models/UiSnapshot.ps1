@@ -1,8 +1,9 @@
+# NOTE: Using [object] to avoid type mismatch on module reload
 class UiSnapshot {
-    [PlanState]$PlanState
-    [LaneMetrics[]]$LaneMetrics
-    [SchedulerDecision]$SchedulerDecision
-    [UiAlerts]$Alerts
+    [object]$PlanState           # PlanState
+    [object[]]$LaneMetrics       # LaneMetrics[]
+    [object]$SchedulerDecision   # SchedulerDecision
+    [object]$Alerts              # UiAlerts
     [string]$AdapterError
 
     # GOLDEN NUANCE fields (v4) - populated from tools/snapshot.py

@@ -1,26 +1,27 @@
+# NOTE: Using [object] to avoid type mismatch on module reload
 class UiEventLog {
-    [System.Collections.Generic.List[UiEvent]]$Events
+    [System.Collections.ArrayList]$Events
     [int]$Capacity
 
     UiEventLog() {
         $this.Capacity = 200
-        $this.Events = [System.Collections.Generic.List[UiEvent]]::new()
+        $this.Events = [System.Collections.ArrayList]::new()
     }
 
     UiEventLog([int]$capacity) {
         $this.Capacity = if ($capacity -gt 0) { $capacity } else { 200 }
-        $this.Events = [System.Collections.Generic.List[UiEvent]]::new()
+        $this.Events = [System.Collections.ArrayList]::new()
     }
 
-    [void]Add([UiEvent]$event) {
+    [void]Add([object]$event) {
         if (-not $event) { return }
-        $this.Events.Add($event)
+        $this.Events.Add($event) | Out-Null
         while ($this.Events.Count -gt $this.Capacity) {
             $this.Events.RemoveAt(0)
         }
     }
 
-    [UiEvent[]]GetAll() {
+    [object[]]GetAll() {
         return $this.Events.ToArray()
     }
 }
