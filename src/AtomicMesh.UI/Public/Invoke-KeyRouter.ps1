@@ -49,7 +49,7 @@ function Invoke-KeyRouter {
                 else {
                     # Close overlay
                     $State.OverlayMode = "None"
-                    $State.MarkDirty("overlay")
+                    $State.MarkDirty("content")  # Overlay close = content redraw
                     return "overlay"
                 }
             }

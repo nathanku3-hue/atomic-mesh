@@ -1,4 +1,29 @@
 $script:FrameState = @{ Skip = $false }
+$script:ClearScreenCount = 0  # For testing: track Clear-Screen calls
+
+# Clear-Screen wrapper (testable, avoids full refresh flicker)
+function Clear-Screen {
+    $script:ClearScreenCount++
+    if ($script:CaptureMode) {
+        # In capture mode, clear the buffer
+        for ($r = 0; $r -lt $script:CaptureHeight; $r++) {
+            $script:CaptureBuffer[$r] = [char[]](" " * $script:CaptureWidth)
+        }
+        return
+    }
+    try {
+        [Console]::Clear()
+    }
+    catch {}
+}
+
+function Get-ClearScreenCount {
+    return $script:ClearScreenCount
+}
+
+function Reset-ClearScreenCount {
+    $script:ClearScreenCount = 0
+}
 
 # Capture mode for golden-master testing
 $script:CaptureMode = $false

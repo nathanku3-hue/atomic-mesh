@@ -127,7 +127,7 @@ function Invoke-DataRefreshTick {
         # Check if snapshot meaningfully changed
         $newHash = Get-SnapshotHash -Snapshot $snapshot
         if ($newHash -ne $State.LastSnapshotHash) {
-            $State.MarkDirty("data")
+            $State.MarkDirty("content")  # Data change = content redraw
             $State.LastSnapshotHash = $newHash
         }
 
@@ -146,7 +146,7 @@ function Invoke-DataRefreshTick {
         if ($newError -ne $State.LastAdapterError) {
             $State.Cache.LastSnapshot.AdapterError = $newError
             $State.LastAdapterError = $newError
-            $State.MarkDirty("error")
+            $State.MarkDirty("content")  # Error display = content redraw
         }
 
         return $State.Cache.LastSnapshot
@@ -218,7 +218,7 @@ function Start-ControlPanel {
         if ($width -ne $state.LastWidth -or $height -ne $state.LastHeight) {
             $state.LastWidth = $width
             $state.LastHeight = $height
-            $state.MarkDirty("resize")
+            $state.MarkDirty("all")  # Resize = full redraw
         }
 
         # Input handling with GOLDEN DROPDOWN CONTRACT
@@ -264,7 +264,8 @@ function Start-ControlPanel {
                         $result = Invoke-CommandRouter -Command $state.InputBuffer -State $state -Snapshot $snapshot
                         $state.InputBuffer = ""
                         $inputChanged = $true
-                        $state.MarkDirty("command")
+                        $state.MarkDirty("content")  # Commands change content
+                        $state.MarkDirty("input")    # Input cleared
                         if ($result -eq "quit") {
                             $stopRequested = $true
                             break
@@ -281,9 +282,9 @@ function Start-ControlPanel {
                 }
 
                 # Golden key handling: Tab, F2, Escape (when dropdown not active)
+                # These may change content (overlay, mode) - KeyRouter marks appropriate regions
                 if ($key.Key -in [ConsoleKey]::Tab, [ConsoleKey]::F2, [ConsoleKey]::Escape) {
                     Invoke-KeyRouter -KeyInfo $key -State $state | Out-Null
-                    $state.MarkDirty("key")
                     continue
                 }
 
@@ -291,7 +292,8 @@ function Start-ControlPanel {
                     $result = Invoke-CommandRouter -Command $state.InputBuffer -State $state -Snapshot $snapshot
                     $state.InputBuffer = ""
                     $inputChanged = $true
-                    $state.MarkDirty("command")
+                    $state.MarkDirty("content")  # Commands change content
+                    $state.MarkDirty("input")    # Input cleared
                     if ($result -eq "quit") {
                         $stopRequested = $true
                         break
@@ -347,14 +349,25 @@ function Start-ControlPanel {
         if ($state.InputBuffer -ne $state.LastInputBuffer) {
             $state.LastInputBuffer = $state.InputBuffer
             $inputChanged = $true
+            $state.MarkDirty("input")
         }
 
-        # Only render when dirty
-        if ($state.IsDirty) {
+        # Layout constants (needed for all render paths)
+        $layout = Get-PromptLayout -Width $width -Height $height
+        $rowInput = $layout.RowInput
+        $footerRow = $layout.RowFooter
+        $toastRow = $layout.RowToast
+        $contentStartRow = 4
+
+        # Determine if full render needed
+        $needsFull = $state.IsDirty("all") -or $state.IsDirty("content")
+
+        if ($needsFull -and $state.HasDirty()) {
+            # FULL RENDER: Clear screen and render everything
             Begin-ConsoleFrame
             try {
                 [Console]::CursorVisible = $false
-                [Console]::Clear()
+                Clear-Screen
             }
             catch {}
 
@@ -366,15 +379,6 @@ function Start-ControlPanel {
 
             # Render header at row 0
             Render-Header -StartRow 0 -Width $width -Snapshot $snapshot -State $state
-
-            # Content starts after header (row 4)
-            $contentStartRow = 4
-
-            # Use centralized layout constants (GOLDEN TRANSPLANT: lines 4148-4166)
-            $layout = Get-PromptLayout -Width $width -Height $height
-            $rowInput = $layout.RowInput
-            $footerRow = $layout.RowFooter
-            $toastRow = $layout.RowToast
 
             # Render content with frame-fill to footer row
             switch ($state.CurrentPage.ToUpper()) {
@@ -400,6 +404,9 @@ function Start-ControlPanel {
             if ($pickerState.IsActive) {
                 $dropdownRow = $rowInput + 2  # Below input box bottom border
                 Render-CommandDropdown -StartRow $dropdownRow -Width $width
+                $state.LastPickerHeight = (Get-PickerState).FilteredCommands.Count
+            } else {
+                $state.LastPickerHeight = 0
             }
 
             $frameOk = End-ConsoleFrame
@@ -412,10 +419,28 @@ function Start-ControlPanel {
 
             $state.ClearDirty()
         }
-        elseif ($inputChanged) {
-            # Partial redraw: only update input content when input changes but nothing else is dirty
-            $layout = Get-PromptLayout -Width $width -Height $height
-            Render-InputBox -Buffer $state.InputBuffer -RowInput $layout.RowInput -Width $width
+        elseif ($state.HasDirty()) {
+            # PARTIAL RENDER: Only update dirty regions (no Clear)
+            try { [Console]::CursorVisible = $false } catch {}
+
+            if ($state.IsDirty("picker")) {
+                # Picker partial redraw with clearing
+                Render-PickerArea -State $state -RowInput $rowInput -Width $width
+            }
+
+            if ($state.IsDirty("input")) {
+                Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
+            }
+
+            if ($state.IsDirty("toast")) {
+                Render-ToastLine -Toast $state.Toast -Row $toastRow -Width $width
+            }
+
+            if ($state.IsDirty("footer")) {
+                Render-HintBar -Row $footerRow -Width $width -State $state
+            }
+
+            $state.ClearDirty()
         }
 
         Start-Sleep -Milliseconds $RenderIntervalMs

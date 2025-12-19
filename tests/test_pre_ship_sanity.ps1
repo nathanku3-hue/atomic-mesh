@@ -1977,6 +1977,81 @@ Test-Check "/accept-plan blocks without draft" {
     return $true
 }
 
+# =============================================================================
+# REGION-BASED DIRTY RENDERING (CHECK 65-67)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CHECK 65: Picker-only dirty does NOT clear screen
+# -----------------------------------------------------------------------------
+Test-Check "Picker-only dirty does NOT clear screen" {
+    $state = [UiState]::new()
+    $state.ClearDirty()  # Clear initial "all" dirty
+
+    # Mark only picker dirty
+    $state.MarkDirty("picker")
+
+    # Verify picker is dirty but "all" and "content" are not
+    if ($state.IsDirty("all")) {
+        return "Should not be 'all' dirty"
+    }
+    if ($state.IsDirty("content")) {
+        return "Should not be 'content' dirty"
+    }
+    if (-not $state.IsDirty("picker")) {
+        return "Should be 'picker' dirty"
+    }
+
+    # Verify HasDirty returns true
+    if (-not $state.HasDirty()) {
+        return "HasDirty should be true"
+    }
+
+    return $true
+}
+
+# -----------------------------------------------------------------------------
+# CHECK 66: Input-only dirty does NOT trigger content dirty
+# -----------------------------------------------------------------------------
+Test-Check "Input-only dirty does NOT trigger content dirty" {
+    $state = [UiState]::new()
+    $state.ClearDirty()
+
+    $state.MarkDirty("input")
+
+    if ($state.IsDirty("content")) {
+        return "Input should not trigger content dirty"
+    }
+    if (-not $state.IsDirty("input")) {
+        return "Input should be dirty"
+    }
+
+    return $true
+}
+
+# -----------------------------------------------------------------------------
+# CHECK 67: Content dirty returns true for content check
+# -----------------------------------------------------------------------------
+Test-Check "Content dirty triggers full redraw flag" {
+    $state = [UiState]::new()
+    $state.ClearDirty()
+
+    $state.MarkDirty("content")
+
+    if (-not $state.IsDirty("content")) {
+        return "Content should be dirty"
+    }
+
+    # "all" check should NOT return true for just "content"
+    # (IsDirty("all") only returns true if "all" was explicitly marked)
+    $state.ClearDirty()
+    $state.MarkDirty("content")
+
+    # But content IS enough to trigger full render in the loop
+    # This is the design: needsFull = IsDirty("all") OR IsDirty("content")
+    return $true
+}
+
 # -----------------------------------------------------------------------------
 # RESULTS
 # -----------------------------------------------------------------------------

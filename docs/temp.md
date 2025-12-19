@@ -20,3 +20,57 @@ main (HEAD)
 - 81 files, +31,546 / -10,483 lines
 
 Ready for manual smoke (2 min): Launch → /go → /plan → F2 → ESC → resize.
+
+---
+
+## Command Guards Added
+
+| Command | Guard | Message if blocked |
+|---------|-------|-------------------|
+| `/go` | Requires `ACCEPTED` | "Draft not accepted - run /accept-plan first" |
+| `/go` | Requires any plan | "No plan - run /draft-plan first" |
+| `/accept-plan` | Requires `DRAFT` | "No draft to accept - run /draft-plan first" |
+
+**Tests:** 64/64 pass (added CHECK 63-64)
+
+**Commit:** `a33942e`
+
+---
+
+## Code Review: Guard Implementation
+
+**What we did:** Inline guards in `Invoke-CommandRouter.ps1` switch cases.
+
+| Aspect | Verdict |
+|--------|---------|
+| Single file change | ✅ Good - localized |
+| Co-located guard + logic | ✅ Good - easy to read |
+| Tests added | ✅ Good - verified behavior |
+| Clear user feedback | ✅ Good - actionable hints |
+
+**Cleaner alternatives (if guards grow):**
+- Separate `Test-CanAcceptPlan` functions
+- Declarative guard table with RequiredStatus + Hint
+
+**Verdict:** Pragmatic for 2 simple guards. Refactor if complexity grows.
+
+---
+
+## Refresh Optimization Options
+
+**Problem:** Picker/input changes trigger `MarkDirty()` → full `[Console]::Clear()` → flicker.
+
+| Option | Description | Effort | Benefit |
+|--------|-------------|--------|---------|
+| **A: Region flags** | Separate dirty flags per region | Medium | Best - targeted redraws |
+| **B: Picker bypass** | Don't `Clear()` when only picker changed | Low | Good - fixes main issue |
+| **C: Diff rendering** | Compare frames, write only changed cells | High | Overkill |
+
+**Recommended: Option A** - Right abstraction, minimal code increase.
+
+Design:
+```powershell
+[HashSet[string]]$DirtyRegions  # "input", "picker", "toast", "content", "all"
+if ($state.IsDirty("all")) { Clear + full }
+else { partial redraws per region }
+```

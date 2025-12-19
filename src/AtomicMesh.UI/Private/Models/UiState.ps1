@@ -1,3 +1,5 @@
+using namespace System.Collections.Generic
+
 class UiState {
     [string]$CurrentPage      # BOOTSTRAP | PLAN | GO
     [string]$CurrentMode      # OPS | PLAN | RUN | SHIP (Golden mode ring)
@@ -17,15 +19,16 @@ class UiState {
     [string]$InputBuffer
     [datetime]$LastDataRefreshUtc
 
-    # Dirty-driven rendering fields
-    [bool]$IsDirty
-    [string]$DirtyReason
+    # Region-based dirty rendering
+    # Regions: "all", "content", "picker", "input", "toast", "footer"
+    [HashSet[string]]$DirtyRegions
     [string]$LastSnapshotHash
     [int]$LastWidth
     [int]$LastHeight
     [bool]$AutoRefreshEnabled
     [string]$LastInputBuffer
     [string]$LastAdapterError
+    [int]$LastPickerHeight    # For picker area clearing
 
     UiState() {
         # Golden state defaults
@@ -47,25 +50,38 @@ class UiState {
         $this.InputBuffer = ""
         $this.LastDataRefreshUtc = [datetime]::MinValue
 
-        # Dirty-driven rendering init
-        $this.IsDirty = $true
-        $this.DirtyReason = "init"
+        # Region-based dirty init
+        $this.DirtyRegions = [HashSet[string]]::new()
+        $this.DirtyRegions.Add("all") | Out-Null  # Initial full render
         $this.LastSnapshotHash = ""
         $this.LastWidth = 0
         $this.LastHeight = 0
         $this.AutoRefreshEnabled = $true
         $this.LastInputBuffer = ""
         $this.LastAdapterError = ""
+        $this.LastPickerHeight = 0
     }
 
-    [void] MarkDirty([string]$reason) {
-        $this.IsDirty = $true
-        $this.DirtyReason = $reason
+    # Mark a specific region dirty (default: "all" for full render)
+    [void] MarkDirty([string]$region) {
+        if ([string]::IsNullOrWhiteSpace($region)) { $region = "all" }
+        $this.DirtyRegions.Add($region) | Out-Null
     }
 
+    # Check if a region is dirty (returns true if "all" is dirty)
+    [bool] IsDirty([string]$region) {
+        if ($this.DirtyRegions.Contains("all")) { return $true }
+        return $this.DirtyRegions.Contains($region)
+    }
+
+    # Check if any region is dirty
+    [bool] HasDirty() {
+        return $this.DirtyRegions.Count -gt 0
+    }
+
+    # Clear all dirty flags
     [void] ClearDirty() {
-        $this.IsDirty = $false
-        $this.DirtyReason = ""
+        $this.DirtyRegions.Clear()
     }
 
     # Golden Contract: Toggle overlay on/off
@@ -75,7 +91,7 @@ class UiState {
         } else {
             $this.OverlayMode = $mode
         }
-        $this.MarkDirty("overlay")
+        $this.MarkDirty("content")  # Overlay changes require content redraw
     }
 
     # Golden Contract: Cycle mode ring (OPS -> PLAN -> RUN -> SHIP -> OPS)
@@ -83,7 +99,7 @@ class UiState {
         $ring = @("OPS", "PLAN", "RUN", "SHIP")
         $idx = [Array]::IndexOf($ring, $this.CurrentMode)
         $this.CurrentMode = $ring[($idx + 1) % $ring.Length]
-        $this.MarkDirty("mode")
+        $this.MarkDirty("content")  # Mode affects pipeline colors
     }
 
     # Golden Contract: Cycle history subview (TASKS -> DOCS -> SHIP -> TASKS)
@@ -91,28 +107,28 @@ class UiState {
         $tabs = @("TASKS", "DOCS", "SHIP")
         $idx = [Array]::IndexOf($tabs, $this.HistorySubview)
         $this.HistorySubview = $tabs[($idx + 1) % $tabs.Length]
-        $this.MarkDirty("historyTab")
+        $this.MarkDirty("content")  # Tab change = content change
     }
 
     # Golden Contract: Set page (BOOTSTRAP | PLAN | GO)
     [void] SetPage([string]$page) {
         if ($this.CurrentPage -ne $page) {
             $this.CurrentPage = $page
-            $this.MarkDirty("page")
+            $this.MarkDirty("content")  # Page switch = full content
         }
     }
 
     # Golden Contract: Toggle history details pane (Enter key in History overlay)
     [void] ToggleHistoryDetails() {
         $this.HistoryDetailsVisible = -not $this.HistoryDetailsVisible
-        $this.MarkDirty("historyDetails")
+        $this.MarkDirty("content")
     }
 
     # Golden Contract: Close history details pane (ESC priority)
     [void] CloseHistoryDetails() {
         if ($this.HistoryDetailsVisible) {
             $this.HistoryDetailsVisible = $false
-            $this.MarkDirty("historyDetails")
+            $this.MarkDirty("content")
         }
     }
 }

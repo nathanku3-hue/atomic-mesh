@@ -233,3 +233,38 @@ function Clear-CommandDropdown {
         TryWriteAt -Row $row -Col 0 -Text (" " * $Width) -Color "White" | Out-Null
     }
 }
+
+# =============================================================================
+# Render-PickerArea: Partial redraw for picker region
+# Clears old area when picker shrinks/closes, renders current state
+# =============================================================================
+function Render-PickerArea {
+    param(
+        [UiState]$State,
+        [int]$RowInput,
+        [int]$Width
+    )
+
+    $dropdownRow = $RowInput + 2  # Below input box bottom border
+    $pickerState = Get-PickerState
+    $newHeight = 0
+
+    if ($pickerState.IsActive) {
+        $newHeight = [Math]::Min($pickerState.Commands.Count, 5)  # MaxVisible = 5
+        if ($pickerState.Commands.Count -gt 5) { $newHeight++ }   # +1 for scroll hint
+    }
+
+    # Clear the maximum of old and new heights to remove stale entries
+    $clearHeight = [Math]::Max($State.LastPickerHeight, $newHeight)
+    if ($clearHeight -gt 0) {
+        Clear-CommandDropdown -StartRow $dropdownRow -Width $Width -Lines ($clearHeight + 1)
+    }
+
+    # Render dropdown if active
+    if ($pickerState.IsActive) {
+        Render-CommandDropdown -StartRow $dropdownRow -Width $Width
+    }
+
+    # Update state for next partial render
+    $State.LastPickerHeight = $newHeight
+}
