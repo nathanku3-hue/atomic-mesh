@@ -1375,22 +1375,35 @@ def get_exec_snapshot() -> str:
 
             # === ACTIVE TASKS ===
             try:
-                # v21.0: Query only columns that exist in tasks table
-                rows = conn.execute("""
-                    SELECT id, lane, type, status, desc, updated_at, worker_id, deps
+                # v21.0: Check which columns exist in tasks table
+                task_cols_info = conn.execute("PRAGMA table_info(tasks)").fetchall()
+                task_cols = {col["name"] for col in task_cols_info} if task_cols_info else set()
+
+                # Build query with only existing columns
+                base_cols = ["id", "status"]
+                optional_cols = ["lane", "type", "desc", "updated_at", "worker_id", "deps"]
+                select_cols = base_cols + [c for c in optional_cols if c in task_cols]
+
+                rows = conn.execute(f"""
+                    SELECT {', '.join(select_cols)}
                     FROM tasks
                     WHERE status = 'in_progress'
-                    ORDER BY updated_at DESC
+                    ORDER BY {'updated_at' if 'updated_at' in task_cols else 'id'} DESC
                     LIMIT 10
                 """).fetchall()
                 for row in rows:
-                    lane = row["lane"] or row["type"] or "unknown"
-                    age_s = now - int(row["updated_at"]) if row["updated_at"] else 0
-                    # Count blocked deps
+                    # v21.0: Safe column access for schema compatibility
+                    row_dict = dict(row)
+                    lane_val = row_dict.get("lane") or row_dict.get("type") or "unknown"
+                    updated_at = row_dict.get("updated_at")
+                    age_s = now - int(updated_at) if updated_at else 0
+
+                    # Count blocked deps (if deps column exists)
                     deps_blocked = 0
-                    if row["deps"]:
+                    deps_val = row_dict.get("deps")
+                    if deps_val:
                         try:
-                            deps_list = json.loads(row["deps"])
+                            deps_list = json.loads(deps_val)
                             if deps_list:
                                 # Count incomplete deps
                                 dep_ids = [d for d in deps_list if isinstance(d, int) or (isinstance(d, str) and d.isdigit())]
@@ -1405,12 +1418,12 @@ def get_exec_snapshot() -> str:
                             pass
 
                     snapshot["active_tasks"].append({
-                        "id": row["id"],
-                        "lane": lane,
-                        "status": row["status"],
-                        "title": (row["desc"] or "")[:50],
+                        "id": row_dict.get("id"),
+                        "lane": lane_val,
+                        "status": row_dict.get("status"),
+                        "title": (row_dict.get("desc") or "")[:50],
                         "age_s": age_s,
-                        "worker_id": row["worker_id"],
+                        "worker_id": row_dict.get("worker_id"),
                         "parent_id": None,  # parent_task_id column doesn't exist yet
                         "deps_blocked": deps_blocked,
                     })

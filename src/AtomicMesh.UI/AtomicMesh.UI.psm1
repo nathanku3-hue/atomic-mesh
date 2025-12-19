@@ -27,15 +27,19 @@ $files = @(
     'Private/Reducers/ComputePlanState.ps1',
     'Private/Reducers/ComputeLaneMetrics.ps1',
     'Private/Reducers/ComputeNextHint.ps1',
+    'Private/Reducers/ComputePipelineStatus.ps1',
+
+    # Layout (GOLDEN TRANSPLANT: lines 4114-4166)
+    'Private/Layout/LayoutConstants.ps1',
 
     # Renderers
     'Private/Render/RenderCommon.ps1',
     'Private/Render/RenderPlan.ps1',
     'Private/Render/RenderGo.ps1',
     'Private/Render/RenderBootstrap.ps1',
+    'Private/Render/CommandPicker.ps1',
     'Private/Render/Overlays/RenderHistory.ps1',
-    'Private/Render/Overlays/RenderStreamDetails.ps1',
-    'Private/Render/Overlays/RenderStats.ps1',
+    # NON-GOLDEN: RenderStreamDetails and RenderStats removed (F4/F6 not in golden)
 
     # Routers + entrypoints
     'Public/Invoke-KeyRouter.ps1',

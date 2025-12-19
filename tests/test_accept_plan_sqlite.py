@@ -929,5 +929,99 @@ def test_all_response_statuses_are_json():
     assert "ERROR" in valid_statuses
 
 
+# =============================================================================
+# v21.0: Regression Test - accept_plan stores path in config for EXEC dashboard
+# =============================================================================
+
+def test_accept_plan_stores_path_in_config(temp_workspace, sample_plan_file, monkeypatch):
+    """
+    Regression test: accept_plan stores accepted_plan_path in config table.
+
+    Root cause: EXEC dashboard showed null plan info because accept_plan
+    didn't store the path in config table for get_exec_snapshot to retrieve.
+
+    Expected: Config table has 'accepted_plan_path' key with the plan path.
+    """
+    from mesh_server import accept_plan
+
+    # Patch directories
+    monkeypatch.setattr('mesh_server.BASE_DIR', str(temp_workspace))
+    monkeypatch.setattr('mesh_server.DB_FILE', str(temp_workspace / "mesh.db"))
+    monkeypatch.setattr('mesh_server.DOCS_DIR', str(temp_workspace / "docs"))
+    monkeypatch.setattr('mesh_server.STATE_DIR', str(temp_workspace / "control" / "state"))
+    monkeypatch.setattr('mesh_server.get_context_readiness', lambda: '{"status": "EXECUTION"}')
+
+    # Create config table if not exists
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    # Accept plan
+    result = accept_plan(str(sample_plan_file))
+    data = json.loads(result)
+    assert data["status"] == "OK", f"Expected OK, got: {data}"
+
+    # Verify config has accepted_plan_path
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT value FROM config WHERE key='accepted_plan_path'"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "accepted_plan_path should be in config"
+    assert row["value"] == str(sample_plan_file), \
+        f"Expected path '{sample_plan_file}', got '{row['value']}'"
+
+
+def test_exec_snapshot_retrieves_plan_from_config(temp_workspace, sample_plan_file, monkeypatch):
+    """
+    Regression test: get_exec_snapshot retrieves plan info from config.
+
+    Verifies the full chain: accept_plan -> config -> get_exec_snapshot -> UI
+    """
+    from mesh_server import accept_plan, get_exec_snapshot
+
+    # Patch directories
+    monkeypatch.setattr('mesh_server.BASE_DIR', str(temp_workspace))
+    monkeypatch.setattr('mesh_server.DB_FILE', str(temp_workspace / "mesh.db"))
+    monkeypatch.setattr('mesh_server.DOCS_DIR', str(temp_workspace / "docs"))
+    monkeypatch.setattr('mesh_server.STATE_DIR', str(temp_workspace / "control" / "state"))
+    monkeypatch.setattr('mesh_server.get_context_readiness', lambda: '{"status": "EXECUTION"}')
+
+    # Create config table
+    conn = sqlite3.connect(str(temp_workspace / "mesh.db"))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    # Before accept: snapshot plan info should be null
+    snapshot_before = json.loads(get_exec_snapshot())
+    assert snapshot_before["plan"]["path"] is None, "Plan path should be null before accept"
+
+    # Accept plan
+    result = accept_plan(str(sample_plan_file))
+    assert json.loads(result)["status"] == "OK"
+
+    # After accept: snapshot should have plan info
+    snapshot_after = json.loads(get_exec_snapshot())
+    assert snapshot_after["plan"]["path"] == str(sample_plan_file), \
+        f"Expected path '{sample_plan_file}', got '{snapshot_after['plan']['path']}'"
+    assert snapshot_after["plan"]["name"] == "draft_test.md", \
+        f"Expected name 'draft_test.md', got '{snapshot_after['plan']['name']}'"
+    assert snapshot_after["plan"]["hash"] is not None, "Plan hash should not be null"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

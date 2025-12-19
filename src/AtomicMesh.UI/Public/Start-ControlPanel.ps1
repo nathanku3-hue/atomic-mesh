@@ -160,15 +160,27 @@ function Start-ControlPanel {
         [string]$DbPath = "",
         [int]$RenderIntervalMs = 50,
         [int]$DataIntervalMs = 500,
-        [ScriptBlock]$SnapshotLoader
+        [ScriptBlock]$SnapshotLoader,
+        [switch]$Dev  # Explicit flag to enable dev hints (F5/F6) - never auto-enabled
     )
 
     $state = [UiState]::new()
     $state.CurrentPage = "PLAN"
     $state.InputBuffer = ""
 
-    $repoRoot = Get-RepoRoot -HintPath $ProjectPath
-    $dbPathResolved = Get-DbPath -DbPath $DbPath -RepoRoot $repoRoot
+    # GOLDEN NUANCE FIX: Two distinct roots (never confuse them)
+    # - ProjectPath: Where user is operating (launch cwd). Used for header + DB/config
+    # - RepoRoot: Where UI code lives (module location). Used for imports/tools
+    $projectPath = if ($ProjectPath) { $ProjectPath } else { (Get-Location).Path }
+    $repoRoot = Get-RepoRoot -HintPath $projectPath
+
+    # DB lookup uses ProjectPath (where user is working), not RepoRoot
+    $dbPathResolved = Get-DbPath -DbPath $DbPath -ProjectPath $projectPath
+
+    # Store both paths separately in cache
+    $state.Cache.Metadata["ProjectPath"] = $projectPath  # For header display
+    $state.Cache.Metadata["RepoRoot"] = $repoRoot        # For module/tool paths
+
     if (-not $SnapshotLoader) {
         $SnapshotLoader = { param($root) Get-RealSnapshot -RepoRoot $root }
     }
@@ -196,7 +208,8 @@ function Start-ControlPanel {
         }
 
         # Data refresh (marks dirty only if data meaningfully changed)
-        $snapshot = Invoke-DataRefreshTick -State $state -DataIntervalMs $DataIntervalMs -NowUtc $now -SnapshotLoader $SnapshotLoader -RepoRoot $repoRoot
+        # Uses ProjectPath for DB/snapshot location (where user is working)
+        $snapshot = Invoke-DataRefreshTick -State $state -DataIntervalMs $DataIntervalMs -NowUtc $now -SnapshotLoader $SnapshotLoader -RepoRoot $projectPath
 
         # Check for resize
         $window = $Host.UI.RawUI.WindowSize
@@ -208,36 +221,69 @@ function Start-ControlPanel {
             $state.MarkDirty("resize")
         }
 
-        # Input handling
+        # Input handling with GOLDEN DROPDOWN CONTRACT
+        # Source: golden Read-StableInput (lines 8962-9600)
         $inputChanged = $false
+        $pickerState = Get-PickerState
         try {
             while ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
 
-                # F5 toggles auto-refresh
-                if ($key.Key -eq [ConsoleKey]::F5) {
-                    $state.AutoRefreshEnabled = -not $state.AutoRefreshEnabled
-                    $msg = if ($state.AutoRefreshEnabled) { "Auto-refresh ON" } else { "Auto-refresh OFF (F5 to resume)" }
-                    $state.Toast.Set($msg, 2000)
-                    $state.MarkDirty("toggle")
-                    continue
+                # DROPDOWN: Up/Down arrows navigate when dropdown is active
+                if ($pickerState.IsActive) {
+                    if ($key.Key -eq [ConsoleKey]::UpArrow) {
+                        Navigate-PickerUp
+                        $state.MarkDirty("picker")
+                        continue
+                    }
+                    if ($key.Key -eq [ConsoleKey]::DownArrow) {
+                        Navigate-PickerDown
+                        $state.MarkDirty("picker")
+                        continue
+                    }
+
+                    # DROPDOWN: Tab inserts selected command + trailing space, closes dropdown
+                    if ($key.Key -eq [ConsoleKey]::Tab) {
+                        $selected = Get-SelectedCommand
+                        if ($selected) {
+                            $state.InputBuffer = $selected + " "
+                            $inputChanged = $true
+                        }
+                        Reset-PickerState
+                        $state.MarkDirty("picker")
+                        continue
+                    }
+
+                    # DROPDOWN: Enter executes selected command, closes dropdown
+                    if ($key.Key -eq [ConsoleKey]::Enter) {
+                        $selected = Get-SelectedCommand
+                        if ($selected) {
+                            $state.InputBuffer = $selected
+                        }
+                        Reset-PickerState
+                        $result = Invoke-CommandRouter -Command $state.InputBuffer -State $state -Snapshot $snapshot
+                        $state.InputBuffer = ""
+                        $inputChanged = $true
+                        $state.MarkDirty("command")
+                        if ($result -eq "quit") {
+                            $stopRequested = $true
+                            break
+                        }
+                        continue
+                    }
+
+                    # DROPDOWN: ESC closes dropdown first (before clearing buffer)
+                    if ($key.Key -eq [ConsoleKey]::Escape) {
+                        Reset-PickerState
+                        $state.MarkDirty("picker")
+                        continue
+                    }
                 }
 
-                # F6 toggles render stats overlay
-                if ($key.Key -eq [ConsoleKey]::F6) {
-                    if ($state.OverlayMode -eq "RenderStats") {
-                        $state.OverlayMode = "None"
-                    }
-                    else {
-                        $state.OverlayMode = "RenderStats"
-                    }
-                    $state.MarkDirty("overlay")
-                    continue
-                }
-
-                if ($key.Key -in [ConsoleKey]::Tab, [ConsoleKey]::F2, [ConsoleKey]::F4, [ConsoleKey]::Escape) {
+                # Golden key handling: Tab, F2, Escape (when dropdown not active)
+                if ($key.Key -in [ConsoleKey]::Tab, [ConsoleKey]::F2, [ConsoleKey]::Escape) {
                     Invoke-KeyRouter -KeyInfo $key -State $state | Out-Null
-                    $state.MarkDirty("overlay")
+                    $state.MarkDirty("key")
                     continue
                 }
 
@@ -257,6 +303,12 @@ function Start-ControlPanel {
                     if ($state.InputBuffer.Length -gt 0) {
                         $state.InputBuffer = $state.InputBuffer.Substring(0, $state.InputBuffer.Length - 1)
                         $inputChanged = $true
+                        # Update dropdown filter when backspacing
+                        if ($state.InputBuffer.StartsWith("/")) {
+                            Update-PickerFilter -Filter $state.InputBuffer.Substring(1)
+                        } else {
+                            Reset-PickerState
+                        }
                     }
                     continue
                 }
@@ -264,7 +316,27 @@ function Start-ControlPanel {
                 if (-not [char]::IsControl($key.KeyChar)) {
                     $state.InputBuffer += $key.KeyChar
                     $inputChanged = $true
+
+                    # DROPDOWN: Open/update dropdown when input starts with /
+                    if ($state.InputBuffer.StartsWith("/")) {
+                        $filter = $state.InputBuffer.Substring(1)
+                        if (-not $pickerState.IsActive) {
+                            Open-CommandPicker -InitialFilter $filter
+                        } else {
+                            Update-PickerFilter -Filter $filter
+                        }
+                        $state.MarkDirty("picker")
+                    } else {
+                        # Close dropdown if input no longer starts with /
+                        if ($pickerState.IsActive) {
+                            Reset-PickerState
+                            $state.MarkDirty("picker")
+                        }
+                    }
                 }
+
+                # Refresh picker state for next iteration
+                $pickerState = Get-PickerState
             }
         }
         catch {
@@ -286,30 +358,49 @@ function Start-ControlPanel {
             }
             catch {}
 
+            # Golden render order:
+            # 1. Header (rows 0-3)
+            # 2. Screen content (rows 4+)
+            # 3. Footer/hint bar
+            # 4. Input line
+
+            # Render header at row 0
+            Render-Header -StartRow 0 -Width $width -Snapshot $snapshot -State $state
+
+            # Content starts after header (row 4)
+            $contentStartRow = 4
+
+            # Use centralized layout constants (GOLDEN TRANSPLANT: lines 4148-4166)
+            $layout = Get-PromptLayout -Width $width -Height $height
+            $rowInput = $layout.RowInput
+            $footerRow = $layout.RowFooter
+            $toastRow = $layout.RowToast
+
+            # Render content with frame-fill to footer row
             switch ($state.CurrentPage.ToUpper()) {
-                "PLAN" { Render-Plan -Snapshot $snapshot -State $state }
-                "GO" { Render-Go -Snapshot $snapshot -State $state }
-                "BOOTSTRAP" { Render-Bootstrap -Snapshot $snapshot -State $state }
-                default { Render-Plan -Snapshot $snapshot -State $state }
+                "PLAN" { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                "GO" { Render-Go -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                "BOOTSTRAP" { Render-Bootstrap -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                default { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
             }
 
+            # Golden overlays: only History (F2)
             if ($state.OverlayMode -eq "History") {
-                Render-HistoryOverlay -State $state
-            }
-            elseif ($state.OverlayMode -eq "StreamDetails") {
-                Render-StreamDetailsOverlay -State $state
-            }
-            elseif ($state.OverlayMode -eq "RenderStats") {
-                Render-StatsOverlay -State $state -Width $width
+                Render-HistoryOverlay -State $state -StartRow $contentStartRow
             }
 
-            $toastRow = [Math]::Max(0, $height - 2)
-            $inputRow = [Math]::Max(0, $height - 1)
-            $hintRow = [Math]::Max(0, $toastRow - 1)
-
-            Render-HintBar -Row $hintRow -Width $width
+            # Render footer bar at golden position
+            Render-HintBar -Row $footerRow -Width $width -State $state
             Render-ToastLine -Toast $state.Toast -Row $toastRow -Width $width
-            Render-InputLine -Buffer $state.InputBuffer -Row $inputRow -Width $width
+            # Render golden boxed input (3-row structure)
+            Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
+
+            # DROPDOWN: Render command picker below input box if active
+            $pickerState = Get-PickerState
+            if ($pickerState.IsActive) {
+                $dropdownRow = $rowInput + 2  # Below input box bottom border
+                Render-CommandDropdown -StartRow $dropdownRow -Width $width
+            }
 
             $frameOk = End-ConsoleFrame
             if ($frameOk) {
@@ -322,9 +413,9 @@ function Start-ControlPanel {
             $state.ClearDirty()
         }
         elseif ($inputChanged) {
-            # Partial redraw: only update input line when input changes but nothing else is dirty
-            $inputRow = [Math]::Max(0, $height - 1)
-            Render-InputLine -Buffer $state.InputBuffer -Row $inputRow -Width $width
+            # Partial redraw: only update input content when input changes but nothing else is dirty
+            $layout = Get-PromptLayout -Width $width -Height $height
+            Render-InputBox -Buffer $state.InputBuffer -RowInput $layout.RowInput -Width $width
         }
 
         Start-Sleep -Milliseconds $RenderIntervalMs

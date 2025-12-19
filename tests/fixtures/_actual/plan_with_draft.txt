@@ -1,0 +1,10 @@
+﻿+------------------------------------------------------------------------------+
+|  EXEC ● | 0 pending | 0 active                                               |
+|                                                                              |
++------------------------------------------------------------------------------+
+| PLAN                                 || PIPELINE                             |
+| Plan: draft exists (not accepted)    || Source: snapshot.py (live)           |
+|                                      ||                                      |
+|                                      || [Ctx]→[Pln]→[Wrk]→[Opt]→[Ver]→[Shp]  |
+|                                      ||                                      |
+|                                      || Next: /accept-plan                   |

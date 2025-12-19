@@ -105,10 +105,8 @@ foreach ($group in $Global:P0Commands.Keys) {
 }
 
 Assert-True -Condition $goFound -TestName "/commands contains /go"
+# v22.0: P0Commands now shows only essential alias (/g), other aliases are silent
 Assert-True -Condition ($goAliases -contains "g") -TestName "/go aliases include /g"
-Assert-True -Condition ($goAliases -contains "run") -TestName "/go aliases include /run"
-Assert-True -Condition ($goAliases -contains "c") -TestName "/go aliases include /c"
-Assert-True -Condition ($goAliases -contains "continue") -TestName "/go aliases include /continue"
 
 # Check /go appears exactly once (no duplicates)
 $goCount = 0
@@ -120,6 +118,23 @@ foreach ($group in $Global:P0Commands.Keys) {
     }
 }
 Assert-True -Condition ($goCount -eq 1) -TestName "/go appears exactly once in P0Commands"
+
+# v22.0: /exec should NOT appear as visible alias in P0Commands (hidden but still works)
+$execInP0Aliases = $false
+foreach ($group in $Global:P0Commands.Keys) {
+    foreach ($cmd in $Global:P0Commands[$group]) {
+        if ($cmd.Aliases -and $cmd.Aliases -contains "exec") {
+            $execInP0Aliases = $true
+            break
+        }
+    }
+    if ($execInP0Aliases) { break }
+}
+Assert-True -Condition (-not $execInP0Aliases) -TestName "/exec is NOT listed in /commands aliases"
+
+# v22.0: BUT /exec should still be a silent alias in the main Commands registry
+$execIsSilentAlias = ($Global:Commands["go"].Alias -contains "exec")
+Assert-True -Condition $execIsSilentAlias -TestName "/exec is still a silent alias for /go"
 
 # ============================================================================
 # TEST: /commands does NOT list long-tail commands
@@ -306,6 +321,33 @@ Assert-True -Condition ($qResolved.Canonical -eq "quit") -TestName "/help q cano
 # /help nonexistent should NOT resolve (returns $null)
 $nonexistentResolved = Resolve-CommandAlias -Name "nonexistent"
 Assert-True -Condition ($nonexistentResolved -eq $null) -TestName "/help nonexistent does not resolve"
+
+# ============================================================================
+# TEST: v22.0 /ops is NOT promoted as default footer suggestion
+# ============================================================================
+Write-Host ""
+Write-Host "Test Group: Footer /ops behavior (v22.0)" -ForegroundColor Yellow
+
+# Check the source code for Get-RecommendedAction default return
+# v22.0: Default should be "/plan", not "/ops"
+$getRecPattern = '# 5\. Default:.*\r?\n\s*return @\{ Text = "([^"]+)"'
+$defaultMatch = [regex]::Match($scriptContent, $getRecPattern)
+if ($defaultMatch.Success) {
+    $defaultText = $defaultMatch.Groups[1].Value
+    Assert-True -Condition ($defaultText -notlike "*ops*") -TestName "Get-RecommendedAction default is NOT /ops (is: $defaultText)"
+} else {
+    Assert-True -Condition $false -TestName "Get-RecommendedAction default is NOT /ops (could not find pattern)"
+}
+
+# Check that /ops is only returned on health failure
+$healthPattern = 'if \(\$Global:HealthStatus -eq "FAIL"\)[\s\S]*?return @\{ Text = "([^"]+)"'
+$healthMatch = [regex]::Match($scriptContent, $healthPattern)
+if ($healthMatch.Success) {
+    $healthText = $healthMatch.Groups[1].Value
+    Assert-True -Condition ($healthText -like "*ops*") -TestName "/ops is suggested on health FAIL (is: $healthText)"
+} else {
+    Assert-True -Condition $false -TestName "/ops is suggested on health FAIL (could not find pattern)"
+}
 
 # ============================================================================
 # SUMMARY
