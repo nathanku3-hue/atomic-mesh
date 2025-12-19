@@ -127,3 +127,17 @@ Extended fix to all model classes:
 | UiCache | LastSnapshot → `[object]` |
 
 **Tests:** 67/67 pass
+
+---
+
+## Bug Fix: Remove Function Parameter Type Constraints
+
+**Commit:** `8aaf99e`
+
+**Problem persisted** because function parameters like `[UiState]$State` reject objects created with old class definitions on module reload.
+
+**Fix:** Removed all `[UiState]$`, `[UiSnapshot]$`, `[PlanState]$`, `[LaneMetrics]$` type constraints from function parameters across 13 files.
+
+Now using duck typing - objects work as long as they have expected properties.
+
+**Note:** You must restart your PowerShell session to clear cached old class types.

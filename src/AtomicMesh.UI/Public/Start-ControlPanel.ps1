@@ -1,3 +1,43 @@
+# =============================================================================
+# Ctrl+C Protection: Requires double-press within timeout to exit
+# =============================================================================
+$script:CtrlCState = @{
+    LastPressUtc = [datetime]::MinValue
+    TimeoutMs = 2000
+}
+
+function Test-CtrlCExit {
+    <#
+    .SYNOPSIS
+        Returns $true if Ctrl+C should exit (second press within timeout).
+        Returns $false if this is first press (shows warning, resets timer).
+    #>
+    param($State)
+
+    $now = [datetime]::UtcNow
+    $elapsed = ($now - $script:CtrlCState.LastPressUtc).TotalMilliseconds
+
+    if ($elapsed -le $script:CtrlCState.TimeoutMs) {
+        # Second press within timeout - exit
+        return $true
+    }
+
+    # First press - show warning and start timer
+    $script:CtrlCState.LastPressUtc = $now
+    if ($State -and $State.Toast) {
+        $State.Toast.Set("Press Ctrl+C again within 2s to exit", "warning", 2)
+        $State.MarkDirty("toast")
+    }
+    return $false
+}
+
+function Reset-CtrlCState {
+    $script:CtrlCState.LastPressUtc = [datetime]::MinValue
+}
+
+# =============================================================================
+# Data Refresh Helpers
+# =============================================================================
 function Get-IsDataRefreshDue {
     param(
         [datetime]$LastRefresh,
@@ -187,8 +227,11 @@ function Start-ControlPanel {
 
     try {
         [Console]::Title = "Atomic Mesh :: $ProjectName"
+        [Console]::TreatControlCAsInput = $true  # Capture Ctrl+C as key input
     }
     catch {}
+
+    Reset-CtrlCState  # Initialize Ctrl+C protection
 
     $snapshot = [UiSnapshot]::new()
     $state.Cache.LastSnapshot = $snapshot
@@ -228,6 +271,15 @@ function Start-ControlPanel {
         try {
             while ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
+
+                # Ctrl+C protection: require double-press within 2s to exit
+                if ($key.Key -eq [ConsoleKey]::C -and $key.Modifiers -band [ConsoleModifiers]::Control) {
+                    if (Test-CtrlCExit -State $state) {
+                        $stopRequested = $true
+                        break
+                    }
+                    continue
+                }
 
                 # DROPDOWN: Up/Down arrows navigate when dropdown is active
                 if ($pickerState.IsActive) {
@@ -446,8 +498,10 @@ function Start-ControlPanel {
         Start-Sleep -Milliseconds $RenderIntervalMs
     }
 
+    # Cleanup: restore console state
     try {
         [Console]::CursorVisible = $true
+        [Console]::TreatControlCAsInput = $false  # Restore normal Ctrl+C behavior
     }
     catch {}
 }

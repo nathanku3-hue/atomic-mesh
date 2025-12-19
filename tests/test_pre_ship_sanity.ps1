@@ -31,7 +31,8 @@ $files = @(
     'Private/Render/RenderGo.ps1',
     'Private/Render/RenderBootstrap.ps1',
     'Private/Render/CommandPicker.ps1',
-    'Private/Render/Overlays/RenderHistory.ps1'
+    'Private/Render/Overlays/RenderHistory.ps1',
+    'Public/Start-ControlPanel.ps1'
 )
 foreach ($file in $files) {
     $fullPath = Join-Path $ModuleRoot $file
@@ -2049,6 +2050,46 @@ Test-Check "Content dirty triggers full redraw flag" {
 
     # But content IS enough to trigger full render in the loop
     # This is the design: needsFull = IsDirty("all") OR IsDirty("content")
+    return $true
+}
+
+# =============================================================================
+# CTRL+C PROTECTION (CHECK 68)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CHECK 68: Ctrl+C requires double-press within timeout
+# -----------------------------------------------------------------------------
+Test-Check "Ctrl+C requires double-press within 2s" {
+    $state = [UiState]::new()
+
+    # Reset state
+    Reset-CtrlCState
+
+    # First press should return false (don't exit)
+    $shouldExit1 = Test-CtrlCExit -State $state
+    if ($shouldExit1) {
+        return "First Ctrl+C should NOT exit"
+    }
+
+    # Toast should show warning
+    if ($state.Toast.Message -notmatch "Ctrl\+C") {
+        return "Toast should mention Ctrl+C: $($state.Toast.Message)"
+    }
+
+    # Second press within timeout should return true (exit)
+    $shouldExit2 = Test-CtrlCExit -State $state
+    if (-not $shouldExit2) {
+        return "Second Ctrl+C within timeout SHOULD exit"
+    }
+
+    # Reset and wait for timeout (simulate with direct state manipulation)
+    Reset-CtrlCState
+    $shouldExit3 = Test-CtrlCExit -State $state
+    if ($shouldExit3) {
+        return "After reset, first Ctrl+C should NOT exit"
+    }
+
     return $true
 }
 
