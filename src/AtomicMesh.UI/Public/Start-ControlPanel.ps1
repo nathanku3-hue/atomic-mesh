@@ -516,7 +516,7 @@ function Start-ControlPanel {
             if ($pickerState.IsActive) {
                 $dropdownRow = $rowInput + 2  # Below input box bottom border
                 Render-CommandDropdown -StartRow $dropdownRow -Width $width
-                $state.LastPickerHeight = (Get-PickerState).FilteredCommands.Count
+                $state.LastPickerHeight = (Get-PickerState).Commands.Count
             } else {
                 $state.LastPickerHeight = 0
             }
