@@ -162,12 +162,14 @@ function Render-CommandDropdown {
     )
 
     if (-not (Get-ConsoleFrameValid)) { return }
-    if (-not $script:PickerState.IsActive) { return }
 
-    $commands = $script:PickerState.Commands
-    $selectedIdx = $script:PickerState.SelectedIndex
-    $scrollOffset = $script:PickerState.ScrollOffset
-    $filter = $script:PickerState.Filter
+    $pickerState = Get-PickerState
+    if (-not $pickerState -or -not $pickerState.IsActive) { return }
+
+    $commands = $pickerState.Commands
+    $selectedIdx = $pickerState.SelectedIndex
+    $scrollOffset = $pickerState.ScrollOffset
+    $filter = $pickerState.Filter
 
     # Golden line 1392-1393: Two-column layout
     $colWidth = 38
