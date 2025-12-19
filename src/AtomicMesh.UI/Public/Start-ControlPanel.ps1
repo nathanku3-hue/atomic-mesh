@@ -68,8 +68,12 @@ function Render-CtrlCWarning {
     if (-not (Get-ConsoleFrameValid)) { return }
 
     # Skip if dropdown is active (it uses the same row)
-    $pickerState = Get-PickerState
-    if ($pickerState.IsActive) { return }
+    try {
+        $pickerState = Get-PickerState
+        if ($pickerState -and $pickerState.IsActive) { return }
+    } catch {
+        # Get-PickerState not available, continue rendering
+    }
 
     $warningRow = $RowInput + 2  # Below input box bottom border
     $left = 2  # Align with input box left edge (InputLeft)
