@@ -74,3 +74,27 @@ Design:
 if ($state.IsDirty("all")) { Clear + full }
 else { partial redraws per region }
 ```
+
+---
+
+## Region-Based Dirty Rendering - Implemented
+
+**Commit:** `ff8d410`
+
+**Regions:**
+| Region | Triggers | Behavior |
+|--------|----------|----------|
+| `all` | resize, init | Clear-Screen + full render |
+| `content` | data change, page switch, overlay, commands | Clear-Screen + full render |
+| `picker` | dropdown open/close/navigate | Partial: clear stale + render dropdown |
+| `input` | typing, backspace | Partial: render input box only |
+| `toast` | toast set/expire | Partial: render toast line only |
+| `footer` | mode change | Partial: render hint bar only |
+
+**Key files changed:**
+- `UiState.ps1`: `DirtyRegions` HashSet + `IsDirty(region)`, `HasDirty()`, `ClearDirty()`
+- `Start-ControlPanel.ps1`: Split render loop (full vs partial paths)
+- `Console.ps1`: `Clear-Screen` wrapper with counter for testing
+- `CommandPicker.ps1`: `Render-PickerArea` handles shrink/close
+
+**Tests:** 67/67 pre-ship + 10/10 golden (CHECK 65-67 added)
