@@ -58,11 +58,12 @@ function Render-CtrlCWarning {
     <#
     .SYNOPSIS
         Renders Ctrl+C warning below input box, aligned with left edge.
-        Skips when dropdown is active (shares same row).
+        Skips when dropdown or toast is active (shares same row).
     #>
     param(
         [int]$RowInput,
-        [int]$Width
+        [int]$Width,
+        $Toast = $null
     )
 
     if (-not (Get-ConsoleFrameValid)) { return }
@@ -75,6 +76,9 @@ function Render-CtrlCWarning {
         # Get-PickerState not available, continue rendering
     }
 
+    # Skip if toast is active (shares same row)
+    if ($Toast -and $Toast.Message) { return }
+
     $warningRow = $RowInput + 2  # Below input box bottom border
     $left = 2  # Align with input box left edge (InputLeft)
 
@@ -83,9 +87,38 @@ function Render-CtrlCWarning {
         $padded = $msg.PadRight($Width - $left)
         TryWriteAt -Row $warningRow -Col $left -Text $padded -Color "Yellow" | Out-Null
     } else {
-        # Clear the line
+        # Clear the line (only if no toast)
         $blank = " " * ($Width - $left)
         TryWriteAt -Row $warningRow -Col $left -Text $blank -Color "White" | Out-Null
+    }
+}
+
+function Invoke-HistoryHotkey {
+    param(
+        $State,
+        [char]$Char
+    )
+
+    if (-not $State -or -not $Char) { return $false }
+    if ($State.OverlayMode -ne "History") { return $false }
+    if (-not [string]::IsNullOrEmpty($State.InputBuffer)) { return $false }
+
+    $upper = $Char.ToString().ToUpperInvariant()
+    switch ($upper) {
+        "D" {
+            $State.HistoryDetailsVisible = -not $State.HistoryDetailsVisible
+            $State.MarkDirty("content")
+            return $true
+        }
+        "V" {
+            if ($State.Toast) {
+                $State.Toast.Set("Verify (stub): no history data", "info", 2)
+                $State.MarkDirty("toast")
+            }
+            $State.MarkDirty("content")
+            return $true
+        }
+        default { return $false }
     }
 }
 
@@ -180,6 +213,58 @@ function Get-SnapshotHash {
     return ($parts -join "##")
 }
 
+function Update-AutoPageFromPlanStatus {
+    <#
+    .SYNOPSIS
+        Auto-switch page based on initialization status.
+        - Uninitialized + on PLAN → switch to BOOTSTRAP
+        - Initialized + on BOOTSTRAP → switch to PLAN
+        Only switches when on PLAN or BOOTSTRAP to avoid yanking user from GO/HISTORY.
+
+        IMPORTANT: Uses actual initialization check (marker/docs), NOT plan status.
+        After /init, repo is initialized even if no draft exists yet.
+
+        Also stores IsInitialized flag in state for header rendering (single source of truth).
+    #>
+    param($State, $Snapshot)
+
+    # Get ProjectPath from state metadata
+    $projectPath = if ($State.Cache -and $State.Cache.Metadata) {
+        $State.Cache.Metadata["ProjectPath"]
+    } else {
+        (Get-Location).Path
+    }
+
+    # Check ACTUAL initialization status (marker or 2/3 docs)
+    # DERIVED VALUE: Compute IsInitialized from ground truth (4-tier detection) on EVERY tick.
+    # This is NOT a latch - it's recomputed each refresh so broken repos won't pass guards.
+    # Ground truth = marker file OR 2/3 golden docs, NOT the plan status which may be "BLOCKED"/"NO_DATA".
+    $initStatus = Test-RepoInitialized -Path $projectPath
+    $isInitialized = $initStatus.initialized
+
+    # Store in state metadata - single source of truth for guards and header rendering
+    # Refreshed every tick, so guards always see current initialization state
+    if ($State.Cache -and $State.Cache.Metadata) {
+        $State.Cache.Metadata["IsInitialized"] = $isInitialized
+    }
+
+    # Page auto-switching based on initialization status
+    # - Uninitialized + on PLAN → switch to BOOTSTRAP (guard against invalid state)
+    # - Initialized + on BOOTSTRAP → switch to PLAN (after /init succeeds)
+    $previousPage = $State.CurrentPage
+    if (-not $isInitialized -and $State.CurrentPage -eq "PLAN") {
+        $State.SetPage("BOOTSTRAP")
+    }
+    elseif ($isInitialized -and $State.CurrentPage -eq "BOOTSTRAP") {
+        $State.SetPage("PLAN")
+    }
+
+    # Debug: Log page transitions for drift diagnosis (only when logging enabled)
+    if ($State.CurrentPage -ne $previousPage -and $State.EnableSnapshotLogging) {
+        $State.LastDebug = "AutoPage: $previousPage→$($State.CurrentPage) init=$isInitialized reason=$($initStatus.reason)"
+    }
+}
+
 function Invoke-DataRefreshTick {
     param(
         $State,
@@ -198,7 +283,20 @@ function Invoke-DataRefreshTick {
         return $State.Cache.LastSnapshot
     }
 
-    if (-not (Get-IsDataRefreshDue -LastRefresh $State.LastDataRefreshUtc -IntervalMs $DataIntervalMs -NowUtc $NowUtc)) {
+    # Check if force refresh is requested (e.g., after /init)
+    $forceRefresh = $State.ForceDataRefresh
+    if ($forceRefresh) {
+        $State.ForceDataRefresh = $false  # Reset flag immediately
+    }
+
+    # Apply a minimum backoff when the last refresh failed to avoid hammering the backend
+    $errorBackoffMs = 500
+    $effectiveIntervalMs = $DataIntervalMs
+    if ($State.LastAdapterError) {
+        $effectiveIntervalMs = [Math]::Max($DataIntervalMs, $errorBackoffMs)
+    }
+
+    if (-not $forceRefresh -and -not (Get-IsDataRefreshDue -LastRefresh $State.LastDataRefreshUtc -IntervalMs $effectiveIntervalMs -NowUtc $NowUtc)) {
         return $State.Cache.LastSnapshot
     }
 
@@ -243,6 +341,8 @@ function Invoke-DataRefreshTick {
             $State.MarkDirty("content")  # Error display = content redraw
         }
 
+        # Update the last refresh timestamp even on failure so we respect the backoff
+        $State.LastDataRefreshUtc = $NowUtc
         return $State.Cache.LastSnapshot
     }
 }
@@ -262,18 +362,32 @@ function Start-ControlPanel {
     $state.CurrentPage = "PLAN"
     $state.InputBuffer = ""
 
-    # GOLDEN NUANCE FIX: Two distinct roots (never confuse them)
-    # - ProjectPath: Where user is operating (launch cwd). Used for header + DB/config
-    # - RepoRoot: Where UI code lives (module location). Used for imports/tools
+    # Snapshot logging flag: opt-in via -Dev or env:MESH_LOG_SNAPSHOTS
+    $envLog = $env:MESH_LOG_SNAPSHOTS
+    $loggingEnabled = $Dev -or ($envLog -and $envLog -ne "0")
+    $state.EnableSnapshotLogging = [bool]$loggingEnabled
+
+    # GOLDEN NUANCE FIX: Three distinct roots (never confuse them)
+    # - ProjectPath: Where user is operating (launch cwd). Used for header + DB + docs target
+    # - ModuleRoot: Where mesh module repo lives (for library/templates/). Derived from script location.
+    # - RepoRoot: Legacy alias for project discovery. May be same as ProjectPath.
     $projectPath = if ($ProjectPath) { $ProjectPath } else { (Get-Location).Path }
     $repoRoot = Get-RepoRoot -HintPath $projectPath
+
+    # ModuleRoot = mesh repo root where library/templates/ lives
+    # From Public/Start-ControlPanel.ps1 → go up 3 levels to repo root
+    $moduleRoot = Split-Path -Parent $PSScriptRoot           # Public/ → AtomicMesh.UI/
+    $moduleRoot = Split-Path -Parent $moduleRoot             # AtomicMesh.UI/ → src/
+    $moduleRoot = Split-Path -Parent $moduleRoot             # src/ → repo root
 
     # DB lookup uses ProjectPath (where user is working), not RepoRoot
     $dbPathResolved = Get-DbPath -DbPath $DbPath -ProjectPath $projectPath
 
-    # Store both paths separately in cache
-    $state.Cache.Metadata["ProjectPath"] = $projectPath  # For header display
-    $state.Cache.Metadata["RepoRoot"] = $repoRoot        # For module/tool paths
+    # Store all paths in cache
+    $state.Cache.Metadata["ProjectPath"] = $projectPath  # For header display + docs target
+    $state.Cache.Metadata["ModuleRoot"] = $moduleRoot    # For library/templates/ lookup
+    $state.Cache.Metadata["RepoRoot"] = $repoRoot        # Legacy: project discovery
+    $state.Cache.Metadata["DbPath"] = $dbPathResolved    # For backend calls that need DB path
 
     if (-not $SnapshotLoader) {
         $SnapshotLoader = { param($root) Get-RealSnapshot -RepoRoot $root }
@@ -286,6 +400,7 @@ function Start-ControlPanel {
     catch {}
 
     Reset-CtrlCState  # Initialize Ctrl+C protection
+    Reset-PickerState  # Initialize command picker state
 
     $snapshot = [UiSnapshot]::new()
     $state.Cache.LastSnapshot = $snapshot
@@ -310,6 +425,12 @@ function Start-ControlPanel {
         # Data refresh (marks dirty only if data meaningfully changed)
         # Uses ProjectPath for DB/snapshot location (where user is working)
         $snapshot = Invoke-DataRefreshTick -State $state -DataIntervalMs $DataIntervalMs -NowUtc $now -SnapshotLoader $SnapshotLoader -RepoRoot $projectPath
+
+        # Auto-switch page based on initialization status
+        Update-AutoPageFromPlanStatus -State $state -Snapshot $snapshot
+
+        # Optional: pipeline snapshot logging (opt-in)
+        Write-PipelineSnapshotIfEnabled -State $state -Snapshot $snapshot -ProjectPath $projectPath
 
         # Check for resize
         $window = $Host.UI.RawUI.WindowSize
@@ -363,6 +484,19 @@ function Start-ControlPanel {
                         continue
                     }
 
+                    # DROPDOWN: RightArrow autocompletes (no trailing space), keeps dropdown open
+                    if ($key.Key -eq [ConsoleKey]::RightArrow) {
+                        $selected = Get-SelectedCommand
+                        if ($selected) {
+                            $state.InputBuffer = $selected  # No trailing space
+                            $inputChanged = $true
+                            # Don't re-filter - keeps dropdown stable with current selection
+                            $state.MarkDirty("input")
+                            $state.MarkDirty("picker")
+                        }
+                        continue
+                    }
+
                     # DROPDOWN: Enter executes selected command, closes dropdown
                     if ($key.Key -eq [ConsoleKey]::Enter) {
                         $selected = Get-SelectedCommand
@@ -397,6 +531,36 @@ function Start-ControlPanel {
                     continue
                 }
 
+                # History navigation: Up/Down adjust selection when overlay active and input empty
+                if ($state.OverlayMode -eq "History" -and [string]::IsNullOrEmpty($state.InputBuffer)) {
+                    $rows = @()
+                    try {
+                        $snap = $state.Cache.LastSnapshot
+                        if ($snap) {
+                            switch ($state.HistorySubview) {
+                                "TASKS" { if ($snap.HistoryTasks) { $rows = @($snap.HistoryTasks) } }
+                                "DOCS"  { if ($snap.HistoryDocs)  { $rows = @($snap.HistoryDocs) } }
+                                "SHIP"  { if ($snap.HistoryShip)  { $rows = @($snap.HistoryShip) } }
+                            }
+                        }
+                    } catch {}
+                    $maxIdx = [Math]::Max(0, $rows.Count - 1)
+                    if ($key.Key -eq [ConsoleKey]::UpArrow) {
+                        if ($state.HistorySelectedRow -gt 0) {
+                            $state.HistorySelectedRow--
+                            $state.MarkDirty("content")
+                        }
+                        continue
+                    }
+                    if ($key.Key -eq [ConsoleKey]::DownArrow) {
+                        if ($state.HistorySelectedRow -lt $maxIdx) {
+                            $state.HistorySelectedRow++
+                            $state.MarkDirty("content")
+                        }
+                        continue
+                    }
+                }
+
                 if ($key.Key -eq [ConsoleKey]::Enter) {
                     $result = Invoke-CommandRouter -Command $state.InputBuffer -State $state -Snapshot $snapshot
                     $state.InputBuffer = ""
@@ -414,19 +578,48 @@ function Start-ControlPanel {
                     if ($state.InputBuffer.Length -gt 0) {
                         $state.InputBuffer = $state.InputBuffer.Substring(0, $state.InputBuffer.Length - 1)
                         $inputChanged = $true
+                        $state.MarkDirty("input")  # Mark input dirty immediately
                         # Update dropdown filter when backspacing
                         if ($state.InputBuffer.StartsWith("/")) {
                             Update-PickerFilter -Filter $state.InputBuffer.Substring(1)
+                            $state.MarkDirty("picker")
                         } else {
                             Reset-PickerState
+                            $state.MarkDirty("picker")
                         }
                     }
                     continue
                 }
 
                 if (-not [char]::IsControl($key.KeyChar)) {
+                    # History hotkeys (buffer must be empty)
+                    if ($state.OverlayMode -eq "History" -and [string]::IsNullOrEmpty($state.InputBuffer)) {
+                        if (Invoke-HistoryHotkey -State $state -Char $key.KeyChar) {
+                            $inputChanged = $true
+                            continue
+                        }
+                    }
+
+                    # D key: Toggle doc details (PLAN + pre-draft + empty input + no overlay)
+                    # Guard: only when buffer is empty and we're in pre-draft DOCS panel state
+                    if ($key.KeyChar -eq 'd' -or $key.KeyChar -eq 'D') {
+                        $inputEmpty = [string]::IsNullOrEmpty($state.InputBuffer)
+                        $isPreDraft = $false
+                        try {
+                            $planState = $snapshot.PlanState
+                            $hasDraft = $planState -and $planState.Status -and $planState.Status -ne "EMPTY"
+                            $isPreDraft = -not $hasDraft
+                        } catch { $isPreDraft = $true }
+
+                        if ($inputEmpty -and $state.CurrentPage -eq "PLAN" -and $isPreDraft -and $state.OverlayMode -eq "None") {
+                            $state.ToggleDocDetails()
+                            continue
+                        }
+                    }
+
                     $state.InputBuffer += $key.KeyChar
                     $inputChanged = $true
+                    $state.MarkDirty("input")  # Mark input dirty immediately
 
                     # DROPDOWN: Open/update dropdown when input starts with /
                     if ($state.InputBuffer.StartsWith("/")) {
@@ -470,6 +663,7 @@ function Start-ControlPanel {
 
         # Determine if full render needed
         $needsFull = $state.IsDirty("all") -or $state.IsDirty("content")
+        $state.RenderFrames++
 
         if ($needsFull -and $state.HasDirty()) {
             # FULL RENDER: Clear screen and render everything
@@ -490,26 +684,30 @@ function Start-ControlPanel {
             Render-Header -StartRow 0 -Width $width -Snapshot $snapshot -State $state
 
             # Render content with frame-fill to footer row
-            switch ($state.CurrentPage.ToUpper()) {
-                "PLAN" { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
-                "GO" { Render-Go -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
-                "BOOTSTRAP" { Render-Bootstrap -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
-                default { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
-            }
-
-            # Golden overlays: only History (F2)
+            # OVERLAY FIX: Skip main page render when overlay is active to prevent bleed-through
             if ($state.OverlayMode -eq "History") {
-                Render-HistoryOverlay -State $state -StartRow $contentStartRow
+                Render-HistoryOverlay -State $state -StartRow $contentStartRow -BottomRow $footerRow
+            }
+            else {
+                switch ($state.CurrentPage.ToUpper()) {
+                    "PLAN" { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                    "GO" { Render-Go -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                    "BOOTSTRAP" { Render-Bootstrap -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                    default { Render-Plan -Snapshot $snapshot -State $state -StartRow $contentStartRow -BottomRow $footerRow }
+                }
             }
 
             # Render footer bar at golden position
             Render-HintBar -Row $footerRow -Width $width -State $state
             Render-ToastLine -Toast $state.Toast -Row $toastRow -Width $width
             # Render golden boxed input (3-row structure)
-            Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
+            # x86 fix: capture to local var before passing (direct property access fails)
+            $buf = $state.InputBuffer
+            Render-InputBox -Buffer $buf -RowInput $rowInput -Width $width
 
             # Render Ctrl+C warning below input box (aligned with left edge)
-            Render-CtrlCWarning -RowInput $rowInput -Width $width
+            # Skip if toast is active (shares same row)
+            Render-CtrlCWarning -RowInput $rowInput -Width $width -Toast $state.Toast
 
             # DROPDOWN: Render command picker below input box if active
             $pickerState = Get-PickerState
@@ -542,7 +740,11 @@ function Start-ControlPanel {
             }
 
             if ($state.IsDirty("input")) {
-                Render-InputBox -Buffer $state.InputBuffer -RowInput $rowInput -Width $width
+                # Reset frame state - picker failures should not block input rendering
+                Begin-ConsoleFrame
+                # x86 fix: capture to local var before passing (direct property access fails)
+                $buf = $state.InputBuffer
+                Render-InputBox -Buffer $buf -RowInput $rowInput -Width $width
             }
 
             if ($state.IsDirty("toast")) {
@@ -554,9 +756,10 @@ function Start-ControlPanel {
             }
 
             if ($state.IsDirty("ctrlc")) {
-                Render-CtrlCWarning -RowInput $rowInput -Width $width
+                Render-CtrlCWarning -RowInput $rowInput -Width $width -Toast $state.Toast
             }
 
+            End-ConsoleFrame | Out-Null  # Flush partial render
             $state.ClearDirty()
         }
 
