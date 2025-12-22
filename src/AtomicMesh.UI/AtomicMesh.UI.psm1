@@ -22,12 +22,21 @@ $files = @(
     'Private/Adapters/DbAdapter.ps1',
     'Private/Adapters/SnapshotAdapter.ps1',
     'Private/Adapters/RealAdapter.ps1',
+    'Private/Adapters/MeshServerAdapter.ps1',
 
     # Reducers
     'Private/Reducers/ComputePlanState.ps1',
     'Private/Reducers/ComputeLaneMetrics.ps1',
     'Private/Reducers/ComputeNextHint.ps1',
     'Private/Reducers/ComputePipelineStatus.ps1',
+
+    # Guards
+    'Private/Guards/CommandGuards.ps1',
+
+    # Helpers
+    'Private/Helpers/InitHelpers.ps1',
+    'Private/Helpers/LoggingHelpers.ps1',
+    'Private/Helpers/Reset-OrphanedTasks.ps1',
 
     # Layout (GOLDEN TRANSPLANT: lines 4114-4166)
     'Private/Layout/LayoutConstants.ps1',

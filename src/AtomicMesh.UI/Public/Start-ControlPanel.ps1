@@ -389,6 +389,16 @@ function Start-ControlPanel {
     $state.Cache.Metadata["RepoRoot"] = $repoRoot        # Legacy: project discovery
     $state.Cache.Metadata["DbPath"] = $dbPathResolved    # For backend calls that need DB path
 
+    # DRIFT PREVENTION: Reset orphaned tasks on startup (10-minute timeout)
+    # This prevents "zombie tasks" from blocking lanes after worker crashes/exits
+    if ($dbPathResolved -and (Test-Path $dbPathResolved)) {
+        $orphansReset = Reset-OrphanedTasks -DbPath $dbPathResolved -TimeoutSeconds 600
+        if ($orphansReset -gt 0) {
+            Write-Host "  [Startup] Reset $orphansReset orphaned task(s) to pending" -ForegroundColor Yellow
+            Start-Sleep -Milliseconds 1500  # Brief pause so user sees the message
+        }
+    }
+
     if (-not $SnapshotLoader) {
         $SnapshotLoader = { param($root) Get-RealSnapshot -RepoRoot $root }
     }
