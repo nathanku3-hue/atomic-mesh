@@ -1,17 +1,34 @@
-# C:\Tools\atomic-mesh\worker.ps1
+# ---------------------------------------------------------
+# COMPONENT: EXECUTOR (sys:worker)
+# FILE: worker.ps1
+# MAPPING: Process Management, Task Claiming, AI Invocation
+# EXPORTS: Main Loop, Get-BlockedLanes
+# CONSUMES: sys:scheduler, sys:ai_client
+# VERSION: v22.0
+# ---------------------------------------------------------
 # FEATURES: Python MCP Client, COT Logging, Audio + Toast Alerts
 # ISOLATION: Uses LOCAL project folder for logs
 param (
     [string]$Type,
-    [string]$Tool
+    [string]$Tool,
+    [string]$DefaultModel = "sonnet-4.5",  # Fallback if task has no model_tier
+    [string]$ProjectPath = "",              # Target project directory (for DB/logs isolation)
+    [switch]$SingleShot                     # v23.1: Execute one task then exit (for /go launcher)
 )
 
 $ID = "${Type}_$(Get-Date -Format 'HHmm')"
 $MeshRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $MeshRoot) { $MeshRoot = (Get-Location).Path }
-# --- MULTI-PROJECT ISOLATION: Use current directory for logs ---
-$CurrentDir = (Get-Location).Path
+# --- MULTI-PROJECT ISOLATION: Use ProjectPath or current directory for logs ---
+$CurrentDir = if ($ProjectPath -and (Test-Path $ProjectPath)) { $ProjectPath } else { (Get-Location).Path }
 $LogDir = "$CurrentDir\logs"
+
+# v23.1: SingleShot mode banner
+if ($SingleShot) {
+    Write-Host "`n======================================" -ForegroundColor Cyan
+    Write-Host "  SINGLE-SHOT MODE: Will exit after one task" -ForegroundColor Cyan
+    Write-Host "======================================`n" -ForegroundColor Cyan
+}
 
 # v21.0: Ensure worker uses same DB as control panel
 $DB_FILE = Join-Path $MeshRoot "mesh.db"
@@ -31,11 +48,11 @@ function Get-BlockedLanes {
     $effective = if ($null -eq $WorkerType) { "" } else { [string]$WorkerType }
     $t = $effective.ToLower()
     switch ($t) {
-        # Codex/generalist: owns backend/qa/ops by default (leave docs/frontend to Claude worker)
+        # Codex/generalist (gpt-5.1-codex-max): backend/qa/ops
         "backend" { return @("frontend", "docs") }
-        # Claude/creative: owns frontend/docs by default (leave backend/qa/ops to Codex worker)
-        "frontend" { return @("backend", "qa", "ops") }
-        # Explicit QA worker (if launched): restrict to qa lane only
+        # Claude/creative (sonnet-4.5): frontend/docs/qa - v22.0: added qa for duo play
+        "frontend" { return @("backend", "ops") }
+        # Explicit QA worker: restrict to qa lane only
         "qa" { return @("backend", "frontend", "ops", "docs") }
         default { return @() }
     }
@@ -132,6 +149,13 @@ while ($true) {
 
     # Check for NO_WORK or empty result
     if ([string]::IsNullOrWhiteSpace($JsonResult) -or $JsonResult -match "NO_WORK") {
+        # v23.1: SingleShot mode exits immediately on empty queue
+        if ($SingleShot) {
+            Write-Host "`n📭 No tasks available. Queue empty or blocked." -ForegroundColor Yellow
+            Write-Host "   Window will close in 3 seconds..." -ForegroundColor DarkGray
+            Start-Sleep -Seconds 3
+            exit 0
+        }
         $NoWorkStreak = [Math]::Min($NoWorkStreak + 1, 6)
         $sleepSeconds = [int]([Math]::Min($MaxNoWorkSeconds, [Math]::Pow(2, $NoWorkStreak - 1)))
         $jitterMs = Get-Random -Minimum 0 -Maximum 750
@@ -166,6 +190,14 @@ while ($true) {
     $LeaseId = $null
     try { $LeaseId = [string]$TaskData.lease_id } catch { $LeaseId = $null }
 
+    # v22.0: Extract model tier from scheduler response
+    $ModelTier = $DefaultModel
+    try {
+        if ($TaskData.model_tier) {
+            $ModelTier = [string]$TaskData.model_tier
+        }
+    } catch { $ModelTier = $DefaultModel }
+
     $NoWorkStreak = 0
 
     # v21.0: Update heartbeat with current task ID
@@ -183,7 +215,7 @@ while ($true) {
         $LastHeartbeatAt = Get-Date
     } catch {}
 
-    $Header = "⚡ [$Type/$Lane] Task $TaskID"
+    $Header = "⚡ [$Type/$Lane] Task $TaskID [$ModelTier]"
     Write-Host "`n$Header" -ForegroundColor $Color
     
     # Log Header to both files
@@ -204,6 +236,14 @@ while ($true) {
     TASK_ID: $TaskID
     INSTRUCTION: $Desc
     
+    [MANDATORY TOOL USE: PROGRESS REPORTING]
+    You have access to a tool named update_task_progress(percent).
+    You MUST use this tool to maintain the 'Closed Loop' observability with the human operator.
+      1) STARTUP: Call update_task_progress(5) immediately upon starting your thought process to signal 'I am working.'
+      2) MILESTONES: Call it at ~25%, 50%, and 75% completion.
+      3) STALLED/THINKING: If you are performing a long/invisible operation, call it with the CURRENT percentage every 60 seconds as a heartbeat.
+      4) FINISH: Do NOT call it for 100%. Just return your final answer/tool output.
+
     CONTEXT PROTOCOL:
     1. ANALYZE: If the instruction mentions specific files, READ THEM first.
     2. EXECUTE: Perform the task.
@@ -250,10 +290,20 @@ while ($true) {
         }
 
         if ($Tool -eq "claude") {
-            $Output = claude --print "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
+            # v22.0: Map model tier to Claude model ID
+            $ModelId = switch ($ModelTier) {
+                "opus-4.5"   { "claude-opus-4-5-20251101" }
+                "sonnet-4.5" { "claude-sonnet-4-5-20251101" }
+                "haiku"      { "claude-haiku-3-5-20250620" }
+                default      { "claude-sonnet-4-5-20251101" }
+            }
+            Write-Host "   🤖 Model: $ModelId" -ForegroundColor DarkGray
+            $Output = claude --model $ModelId --print "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
         }
         elseif ($Tool -eq "codex") {
-            $Output = codex exec "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
+            # v22.0: Codex uses GPT-5.1 Codex Max
+            Write-Host "   🤖 Codex: gpt-5.1-codex-max" -ForegroundColor DarkGray
+            $Output = codex -m gpt-5.1-codex-max exec "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
         }
     }
     catch {
