@@ -79,7 +79,7 @@ def load_counts(db_path: Path):
 def load_history_data(db_path: Path) -> dict:
     """
     Fast history sampler for UI overlay.
-    Returns active task (1), pending tasks (<=5), audit log (<=10), scheduler decision.
+    Returns active task (1), pending tasks (<=10), audit log (<=10), scheduler decision.
     """
     result = {
         "active_task": None,
@@ -114,7 +114,7 @@ def load_history_data(db_path: Path) -> dict:
                    FROM tasks
                    WHERE status='pending'
                    ORDER BY priority ASC, created_at ASC, id ASC
-                   LIMIT 5"""
+                   LIMIT 10"""
             )
             pending = [
                 _dict_from_row(
@@ -159,27 +159,25 @@ def load_history_data(db_path: Path) -> dict:
 
 def load_distinct_lane_counts(db_path: Path) -> dict:
     """
-    GOLDEN TRANSPLANT: lines 904-911
-    Returns distinct lane counts for pending and active statuses.
-    Uses DISTINCT on LOWER(COALESCE(NULLIF(lane,''), type)) for unique lanes.
+    v23.1: Returns TOTAL task counts for pending and active statuses.
+    Fixed: Previously returned distinct LANE count, causing header/lane drift.
+    Now returns actual TASK count for consistency with lane metrics.
     """
     pending_statuses = ("pending", "next", "planned")
     active_statuses = ("in_progress", "running")
 
     conn = sqlite3.connect(f"file:{db_path}", uri=True)
     try:
-        # Pending: distinct lanes with pending/next/planned status
+        # Pending: total tasks with pending/next/planned status
         cur = conn.execute(
-            """SELECT COUNT(DISTINCT LOWER(COALESCE(NULLIF(lane,''), 'default')))
-               FROM tasks WHERE LOWER(status) IN (?, ?, ?)""",
+            """SELECT COUNT(*) FROM tasks WHERE LOWER(status) IN (?, ?, ?)""",
             pending_statuses
         )
         pending = cur.fetchone()[0] or 0
 
-        # Active: distinct lanes with in_progress/running status
+        # Active: total tasks with in_progress/running status
         cur = conn.execute(
-            """SELECT COUNT(DISTINCT LOWER(COALESCE(NULLIF(lane,''), 'default')))
-               FROM tasks WHERE LOWER(status) IN (?, ?)""",
+            """SELECT COUNT(*) FROM tasks WHERE LOWER(status) IN (?, ?)""",
             active_statuses
         )
         active = cur.fetchone()[0] or 0

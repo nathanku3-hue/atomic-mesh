@@ -16,6 +16,49 @@ import json
 from pathlib import Path
 from difflib import SequenceMatcher
 
+# Single source of truth for doc readiness thresholds
+# Importable by snapshot.py for fail-open fallback
+# NOTE: Changing thresholds requires updating tests/test_threshold_fallback.py
+# SPEC maxes out at 80 with current scoring; threshold set to 60 to be permissive.
+THRESHOLDS = {"PRD": 90, "SPEC": 60, "DECISION_LOG": 60}
+
+
+def strip_llm_blocks(content: str) -> str:
+    """
+    Remove LLM-only guidance blocks so they do not affect readiness scoring.
+    Supports:
+    - HTML comment blocks marked with LLM (e.g., LLM_PROMPT_START ... LLM_PROMPT_END)
+    - Any HTML comment containing "LLM"
+    - Sections headed "LLM Prompt" (any markdown header level) up to the next header
+    """
+    stripped = content
+
+    # Remove explicit start/end markers
+    stripped = re.sub(
+        r'<!--\s*LLM_PROMPT_START[\s\S]*?LLM_PROMPT_END\s*-->',
+        '',
+        stripped,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove any other HTML comments that mention LLM
+    stripped = re.sub(
+        r'<!--[\s\S]*?LLM[\s\S]*?-->',
+        '',
+        stripped,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove markdown sections titled "LLM Prompt"
+    stripped = re.sub(
+        r'^(#{1,6}\s*LLM\s+Prompt[^\n]*\n)(?:.*?)(?=^#{1,6}\s|\Z)',
+        '',
+        stripped,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+
+    return stripped
+
 
 def is_meaningful_line(line):
     """
@@ -246,22 +289,29 @@ def get_context_readiness(base_dir=None):
 
     docs_dir = base_dir / "docs"
 
-    # File definitions
+    # File definitions - thresholds from THRESHOLDS constant (single source of truth)
     files_to_check = {
         "PRD": {
             "path": docs_dir / "PRD.md",
-            "threshold": 80,
-            "required_headers": ["## Goals", "## User Stories", "## Success Metrics"]
+            "threshold": THRESHOLDS["PRD"],
+            # Expanded to match actual PRD sections so header credit can reach max
+            "required_headers": [
+                "## Goals",
+                "## User Stories",
+                "## Success Metrics",
+                "## Users & Context",
+                "## Constraints"
+            ]
         },
         "SPEC": {
             "path": docs_dir / "SPEC.md",
             "alt_path": docs_dir / "ACTIVE_SPEC.md",
-            "threshold": 80,
+            "threshold": THRESHOLDS["SPEC"],
             "required_headers": ["## Data Model", "## API", "## Security"]
         },
         "DECISION_LOG": {
             "path": docs_dir / "DECISION_LOG.md",
-            "threshold": 30,
+            "threshold": THRESHOLDS["DECISION_LOG"],
             "required_headers": ["## Records"]
         }
     }
@@ -289,19 +339,27 @@ def get_context_readiness(base_dir=None):
                 "length": 0,
                 "headers": 0,
                 "bullets": 0,
-                "missing": config["required_headers"]
+                "missing": config["required_headers"],
+                "hint": "create file"
             }
             continue
 
         # File exists: +10%
         score += 10
 
+        # Initialize for hint generation (may be updated in try block)
+        is_stub = False
+        content = ""
+
         # Read and analyze content
         try:
-            content = file_path.read_text(encoding='utf-8')
+            raw_content = file_path.read_text(encoding='utf-8')
 
-            # Check if this is a template stub
-            is_stub = 'ATOMIC_MESH_TEMPLATE_STUB' in content
+            # Check if this is a template stub (use raw content to preserve marker)
+            is_stub = 'ATOMIC_MESH_TEMPLATE_STUB' in raw_content
+
+            # Strip LLM-only blocks from scoring
+            content = strip_llm_blocks(raw_content)
 
             # Word count (rough estimate: split by whitespace)
             words = len(content.split())
@@ -399,13 +457,48 @@ def get_context_readiness(base_dir=None):
             print(f"Warning: Error reading {file_path}: {e}", file=sys.stderr)
             score = 10  # Still gets "exists" credit
 
+        # Generate deterministic hint (priority order for stability)
+        # 1. ready (score >= threshold)
+        # 2. needs content (stub with <6 meaningful lines)
+        # 3. missing: <top 2 headers>
+        # 4. add decisions (DECISION_LOG special-case)
+        # 5. fallback: improve clarity
+        final_score = min(score, 100)
+        threshold = config["threshold"]
+
+        if final_score >= threshold:
+            hint = "ready"
+        elif is_stub and doc_name != "DECISION_LOG":
+            # Check meaningful lines for PRD/SPEC stubs
+            meaningful_lines = [
+                line for line in content.split('\n')
+                if is_meaningful_line(line)
+            ]
+            if len(meaningful_lines) < 6:
+                hint = "needs content"
+            elif missing_headers:
+                # Show top 2 missing headers, abbreviated
+                abbrev = [h.replace("## ", "").split()[0] for h in missing_headers[:2]]
+                hint = "missing: " + "+".join(abbrev)
+            else:
+                hint = "improve clarity"
+        elif doc_name == "DECISION_LOG" and not has_real_decisions(content):
+            hint = "add decisions"
+        elif missing_headers:
+            # Show top 2 missing headers, abbreviated
+            abbrev = [h.replace("## ", "").split()[0] for h in missing_headers[:2]]
+            hint = "missing: " + "+".join(abbrev)
+        else:
+            hint = "improve clarity"
+
         results[doc_name] = {
-            "score": min(score, 100),  # Cap at 100%
+            "score": final_score,
             "exists": True,
             "length": length,
             "headers": headers_found,
             "bullets": bullets_found,
-            "missing": missing_headers
+            "missing": missing_headers,
+            "hint": hint
         }
 
     # Determine overall status

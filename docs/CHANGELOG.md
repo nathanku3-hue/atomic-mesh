@@ -1,5 +1,10 @@
 # Atomic Mesh Changelog
 
+## Unreleased
+
+- History overlay uses soft trimming to avoid mid-word cutoffs and now leverages the 10-item pending sampler for fuller lists.
+- Readiness thresholds eased: SPEC now passes at 60 (matching achievable scoring) so doc-complete repos are not blocked; history sampler bumped to 10 pending tasks.
+
 ## v13.3.5 "Editor-Style Footer" (Production Ready)
 **Date:** 2025-12-11
 
