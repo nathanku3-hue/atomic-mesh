@@ -1,3 +1,11 @@
+# ---------------------------------------------------------
+# COMPONENT: SCHEDULER (sys:scheduler)
+# FILE: mesh_server.py
+# MAPPING: Task Selection, Priority Logic, Model Tier Routing
+# EXPORTS: pick_task_braided, add_task, _resolve_model_tier
+# CONSUMES: SQLite (mesh.db)
+# VERSION: v22.0
+# ---------------------------------------------------------
 import sqlite3
 import json
 import time
@@ -69,10 +77,10 @@ LANE_ORDER = ["backend", "frontend", "qa", "ops", "docs"]
 # NOTE: This is not a security boundary (MCP has no auth here). It is a correctness
 # boundary that protects against misconfigured workers and accidental callers.
 DEFAULT_WORKER_ALLOWED_LANES: dict[str, set[str]] = {
-    # Codex/generalist worker
+    # Codex/generalist worker (gpt-5.1-codex-max)
     "backend": {"backend", "qa", "ops"},
-    # Claude/creative worker
-    "frontend": {"frontend", "docs"},
+    # Claude/creative worker (sonnet-4.5) - v22.0: added qa for duo play
+    "frontend": {"frontend", "docs", "qa"},
     # Optional dedicated workers
     "qa": {"qa"},
     "ops": {"ops"},
@@ -88,6 +96,59 @@ ADMIN_WORKER_IDS = {
     "planner",
     "admin",
 }
+
+# =============================================================================
+# v22.0: MODEL TIER ROUTING (Role-to-Model Matrix)
+# =============================================================================
+# Maps lanes/archetypes to Claude model tiers for optimal resource allocation.
+# Model identifiers: opus-4.5, sonnet-4.5, haiku (for quick validation tasks)
+#
+# Design rationale:
+# - LIBRARIAN/docs: Complex reasoning, architecture → opus-4.5
+# - BACKEND/FRONTEND: Implementation work → sonnet-4.5
+# - QA: Duo play - Claude(sonnet-4.5) + Codex(gpt-5.1-codex-max) → sonnet-4.5
+# - OPS: Automation/infra → sonnet-4.5
+#
+# QA DUO PLAY STRATEGY (v22.0):
+#   Current: "First to Claim" - both workers compete, winner executes (load balancing)
+#   Future (v23.0): "Task Forking" - QA task spawns two sub-tasks, one per worker
+MODEL_TIER_BY_LANE: dict[str, str] = {
+    "backend": "sonnet-4.5",
+    "frontend": "sonnet-4.5",
+    "qa": "sonnet-4.5",  # v22.0: Duo play with gpt-5.1-codex-max
+    "ops": "sonnet-4.5",
+    "docs": "opus-4.5",
+    "librarian": "opus-4.5",
+}
+
+# Archetype overrides (takes precedence over lane mapping)
+MODEL_TIER_BY_ARCHETYPE: dict[str, str] = {
+    "ARCHITECT": "opus-4.5",
+    "IMPLEMENTER": "sonnet-4.5",
+    "AUDITOR": "sonnet-4.5",  # v22.0: Duo play with gpt-5.1-codex-max
+    "LIBRARIAN": "opus-4.5",
+}
+
+MODEL_TIER_DEFAULT = "sonnet-4.5"
+
+
+def _resolve_model_tier(lane: str, archetype: str = None) -> str:
+    """
+    Resolve model tier for a task based on lane and archetype.
+    Archetype takes precedence over lane mapping.
+
+    Returns: Model identifier (e.g., 'opus-4.5', 'sonnet-4.5', 'haiku')
+    """
+    # Check archetype first (takes precedence)
+    if archetype:
+        arch_upper = archetype.upper().strip()
+        if arch_upper in MODEL_TIER_BY_ARCHETYPE:
+            return MODEL_TIER_BY_ARCHETYPE[arch_upper]
+
+    # Fall back to lane mapping
+    lane_lower = (lane or "").lower().strip()
+    return MODEL_TIER_BY_LANE.get(lane_lower, MODEL_TIER_DEFAULT)
+
 
 _WORKER_ROLE_PREFIX_RE = re.compile(r"^(backend|frontend|qa|ops|docs)(?:$|[_-])", re.IGNORECASE)
 
@@ -361,6 +422,7 @@ TOOL_PERMISSIONS = {
             # Context
             "list_directory",
             "update_task_status",
+            "update_task_progress",
             "record_decision",
         ],
         "denied": ["delete_file", "add_task"]  # Workers don't delete or create tasks
@@ -756,6 +818,7 @@ def init_db():
                 desc TEXT NOT NULL,
                 deps TEXT DEFAULT '[]',
                 status TEXT DEFAULT 'pending',
+                progress INTEGER DEFAULT 0,
                 output TEXT,
                 worker_id TEXT,
                 lease_id TEXT DEFAULT '',
@@ -806,6 +869,12 @@ def init_db():
                 ("source_plan_hash", "TEXT DEFAULT ''", "v18.0"),
                 ("plan_key", "TEXT DEFAULT ''", "v19.10"),
                 ("lease_id", "TEXT DEFAULT ''", "v21.1"),
+                # v22.0: Model-tier routing (opus/sonnet/haiku)
+                ("model_tier", "TEXT DEFAULT 'sonnet'", "v22.0"),
+                # v23.0: Worker-reported progress for UI fractional bars
+                ("progress", "INTEGER DEFAULT 0", "v23.0"),
+                # v23.1: Heartbeat for lease TTL system (drift prevention)
+                ("heartbeat_at", "INTEGER DEFAULT 0", "v23.1"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -3815,6 +3884,18 @@ def accept_plan(path: str) -> str:
     except Exception:
         pass  # Fail open if readiness check fails
 
+    # v21.2: Ensure DB schema exists before any queries.
+    # If DB file doesn't exist, create it first then initialize schema.
+    # This prevents "no such table: tasks" errors on first accept-plan.
+    try:
+        if not os.path.exists(DB_PATH):
+            # Touch the DB file so init_db() will run
+            open(DB_PATH, "a").close()
+        init_db()
+    except (OSError, sqlite3.Error) as e:
+        # Fail open but log for diagnostics (permission errors, corruption, etc.)
+        server_logger.warning(f"accept_plan: schema init failed ({type(e).__name__}: {e})")
+
     try:
         # Resolve path (allow relative paths from docs/PLANS)
         if not os.path.isabs(path):
@@ -4665,20 +4746,38 @@ def renew_task_lease(task_id: int, worker_id: str, lease_id: str) -> str:
             except Exception:
                 cols = set()
 
+            # v23.1: Also update heartbeat_at for drift prevention
+            has_heartbeat = "heartbeat_at" in cols
             if "lease_id" in cols:
-                cursor = conn.execute(
-                    """UPDATE tasks
-                       SET updated_at=?
-                       WHERE id=? AND status='in_progress' AND worker_id=? AND lease_id=?""",
-                    (now, int(task_id), str(worker_id), str(lease_id)),
-                )
+                if has_heartbeat:
+                    cursor = conn.execute(
+                        """UPDATE tasks
+                           SET updated_at=?, heartbeat_at=?
+                           WHERE id=? AND status='in_progress' AND worker_id=? AND lease_id=?""",
+                        (now, now, int(task_id), str(worker_id), str(lease_id)),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """UPDATE tasks
+                           SET updated_at=?
+                           WHERE id=? AND status='in_progress' AND worker_id=? AND lease_id=?""",
+                        (now, int(task_id), str(worker_id), str(lease_id)),
+                    )
             else:
-                cursor = conn.execute(
-                    """UPDATE tasks
-                       SET updated_at=?
-                       WHERE id=? AND status='in_progress' AND worker_id=?""",
-                    (now, int(task_id), str(worker_id)),
-                )
+                if has_heartbeat:
+                    cursor = conn.execute(
+                        """UPDATE tasks
+                           SET updated_at=?, heartbeat_at=?
+                           WHERE id=? AND status='in_progress' AND worker_id=?""",
+                        (now, now, int(task_id), str(worker_id)),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """UPDATE tasks
+                           SET updated_at=?
+                           WHERE id=? AND status='in_progress' AND worker_id=?""",
+                        (now, int(task_id), str(worker_id)),
+                    )
 
             if cursor.rowcount == 0:
                 return json.dumps({
@@ -4690,6 +4789,124 @@ def renew_task_lease(task_id: int, worker_id: str, lease_id: str) -> str:
             return json.dumps({
                 "status": "OK",
                 "task_id": int(task_id),
+                "updated_at": now,
+            })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "ERROR",
+            "message": f"{e}"[:200],
+        })
+
+
+def _ensure_progress_column(conn) -> None:
+    """Add progress column if missing (idempotent, tolerant)."""
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "progress" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN progress INTEGER DEFAULT 0")
+            server_logger.info("v23.0: Added progress column to tasks table (self-heal)")
+    except Exception:
+        # Fail-quietly; caller will behave as if progress is unavailable.
+        pass
+
+
+@mcp.tool()
+def update_task_progress(task_id: int, progress: int, worker_id: str | None = None, lease_id: str | None = None) -> str:
+    """
+    Worker self-report knob: update progress (0-100) for an in_progress task.
+
+    - Clamps progress to 0-100.
+    - Requires task to be in_progress.
+    - If task has a lease_id, enforces worker_id+lease_id match (same policy as renew_task_lease).
+    """
+    if not task_id:
+        return json.dumps({"status": "ERROR", "message": "task_id required"})
+
+    try:
+        pct = int(progress)
+    except Exception:
+        return json.dumps({"status": "ERROR", "message": "progress must be an integer"})
+
+    pct = max(0, min(100, pct))
+    now = int(time.time())
+
+    try:
+        with get_db() as conn:
+            _ensure_progress_column(conn)
+
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            has_lease = "lease_id" in cols
+            has_worker = "worker_id" in cols
+
+            select_cols = ["status"]
+            if has_worker:
+                select_cols.append("worker_id")
+            if has_lease:
+                select_cols.append("lease_id")
+
+            task = conn.execute(
+                f"SELECT {', '.join(select_cols)} FROM tasks WHERE id=?",
+                (int(task_id),),
+            ).fetchone()
+
+            if not task:
+                return json.dumps({"status": "ERROR", "message": f"Task {task_id} not found"})
+
+            status = str(task["status"] or "").lower()
+            if status != "in_progress":
+                return json.dumps({
+                    "status": "ERROR",
+                    "reason": "NOT_IN_PROGRESS",
+                    "message": "Task must be in_progress to update progress",
+                    "task_id": int(task_id),
+                    "current_status": task["status"],
+                })
+
+            db_lease = str(task["lease_id"] or "") if has_lease else ""
+            db_worker = str(task["worker_id"] or "") if has_worker else ""
+
+            if db_lease:
+                if not lease_id or str(lease_id) != db_lease:
+                    return json.dumps({
+                        "status": "ERROR",
+                        "reason": "LEASE_MISMATCH",
+                        "message": "lease_id mismatch; claim may have been reaped/reassigned",
+                        "task_id": int(task_id),
+                    })
+            if db_worker:
+                if not worker_id:
+                    return json.dumps({
+                        "status": "ERROR",
+                        "reason": "WORKER_REQUIRED",
+                        "message": "worker_id required to update progress for claimed task",
+                        "task_id": int(task_id),
+                    })
+                if str(worker_id) != db_worker:
+                    return json.dumps({
+                        "status": "ERROR",
+                        "reason": "WORKER_MISMATCH",
+                        "message": "Task is not claimed by this worker",
+                        "task_id": int(task_id),
+                        "expected_worker_id": db_worker,
+                        "provided_worker_id": str(worker_id),
+                    })
+
+            where_tail = "WHERE id=? AND status='in_progress'"
+            params: list[object] = [pct, now, int(task_id)]
+            if db_lease:
+                where_tail = "WHERE id=? AND status='in_progress' AND lease_id=?"
+                params = [pct, now, int(task_id), db_lease]
+
+            conn.execute(
+                f"UPDATE tasks SET progress=?, updated_at=? {where_tail}",
+                tuple(params),
+            )
+
+            return json.dumps({
+                "status": "OK",
+                "task_id": int(task_id),
+                "progress": pct,
                 "updated_at": now,
             })
 
@@ -4856,7 +5073,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
             if eligible_lanes:
                 placeholders = ",".join("?" * len(eligible_lanes))
                 preempt_task = conn.execute(
-                    f"""SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                    f"""SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps, strictness, archetype
                         FROM tasks
                         WHERE status = 'pending' AND priority IN (0, 5)
                           AND lane IN ({placeholders})
@@ -4903,6 +5120,9 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         f"reason={decision_reason} preempted=1 pointer={decision.get('pointer_index')}"
                     )
 
+                    # v22.0: Resolve model tier based on lane + archetype
+                    model_tier = _resolve_model_tier(task["lane"], task.get("archetype"))
+
                     return json.dumps({
                         "status": "OK",
                         "id": task["id"],
@@ -4912,10 +5132,12 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         "priority": task["priority"],
                         "lane_rank": task["lane_rank"],
                         "exec_class": task["exec_class"],
+                        "strictness": task["strictness"],
                         "lease_id": lease_id,
                         "preempted": True,
                         "decision_reason": decision_reason,
                         "pointer_index": decision.get("pointer_index", 0),
+                        "model_tier": model_tier,
                     })
 
             # =========================================================
@@ -4937,7 +5159,7 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
 
                 # Find best pending task in this lane
                 task = conn.execute(
-                    """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps
+                    """SELECT id, type, desc, lane, priority, lane_rank, created_at, exec_class, deps, strictness, archetype
                        FROM tasks
                        WHERE status = 'pending' AND lane = ?
                        ORDER BY priority ASC, lane_rank ASC, created_at ASC, id ASC
@@ -4985,6 +5207,9 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                             f"reason=rotation preempted=0 pointer={next_index}"
                         )
 
+                        # v22.0: Resolve model tier based on lane + archetype
+                        model_tier = _resolve_model_tier(candidate["lane"], candidate.get("archetype"))
+
                         return json.dumps({
                             "status": "OK",
                             "id": candidate["id"],
@@ -4994,10 +5219,12 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                             "priority": candidate["priority"],
                             "lane_rank": candidate["lane_rank"],
                             "exec_class": candidate["exec_class"],
+                            "strictness": candidate["strictness"],
                             "lease_id": lease_id,
                             "preempted": False,
                             "decision_reason": "rotation",
                             "pointer_index": next_index,
+                            "model_tier": model_tier,
                         })
                     # Record first blocked reason per lane for diagnostics
                     if lane not in lane_debug:
