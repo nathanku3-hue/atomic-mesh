@@ -1,0 +1,20 @@
+{
+  "Projects": [
+    {
+      "Name": "atomic-mesh-ui-sandbox",
+      "Path": "E:\\Code\\atomic-mesh-ui-sandbox",
+      "ClaudeCount": 1,
+      "CodexCount": 1,
+      "GeminiCount": 0,
+      "AutoLaunch": false,
+      "GeminiRemember": true
+    }
+  ],
+  "StartWithWindows": false,
+  "WindowOffset": 670,
+  "ScheduleEnabled": false,
+  "ScheduleTime": "09:00",
+  "CodexMaxGlobal": true,
+  "CodexResumeGlobal": true,
+  "ClaudeModelOpus": true
+}
