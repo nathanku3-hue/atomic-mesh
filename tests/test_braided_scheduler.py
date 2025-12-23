@@ -57,7 +57,8 @@ def scheduler_workspace(tmp_path):
             lane TEXT DEFAULT '',
             created_at INTEGER DEFAULT 0,
             exec_class TEXT DEFAULT 'exclusive',
-            lane_rank INTEGER DEFAULT 0
+            lane_rank INTEGER DEFAULT 0,
+            strictness TEXT DEFAULT 'normal'
         )
     """)
     conn.execute("""

@@ -563,7 +563,7 @@ def get_plan_status(repo_root: Path) -> dict:
         if drafts:
             result["has_draft"] = True
             result["id"] = drafts[0].name
-            result["status"] = "DRAFT"
+            result["status"] = "DRAFT"  # SAFETY-ALLOW: status-write (plan status, not task)
 
     return result
 
@@ -726,7 +726,7 @@ def main():
             total_tasks = sum(lc.get("Count", 0) for lc in payload["LaneCounts"])
             if total_tasks > 0:
                 plan_status["accepted"] = True
-                plan_status["status"] = "ACCEPTED"
+                plan_status["status"] = "ACCEPTED"  # SAFETY-ALLOW: status-write (plan status, not task)
         payload["plan"] = plan_status
     except Exception:
         pass  # Keep defaults

@@ -41,7 +41,8 @@ def _init_minimal_db(db_path: str):
             created_at INTEGER DEFAULT 0,
             exec_class TEXT DEFAULT 'exclusive',
             lane_rank INTEGER DEFAULT 0,
-            plan_key TEXT DEFAULT ''
+            plan_key TEXT DEFAULT '',
+            strictness TEXT DEFAULT 'normal'
         )
     """)
     conn.execute("""
