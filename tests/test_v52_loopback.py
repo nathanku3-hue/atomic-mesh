@@ -64,7 +64,7 @@ class TestV52Loopback(unittest.TestCase):
         with open(self.audit_file, "r") as f:
             log_content = f.read()
         
-        self.assertIn("REJECTED Task #101", log_content)
+        self.assertIn("REJECTED Task #102", log_content)
         self.assertIn(rejection_reason, log_content)
 
 if __name__ == "__main__":
