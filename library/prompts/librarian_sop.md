@@ -23,6 +23,7 @@ You are the **Librarian**, responsible for **Context Hygiene** and **Repository 
 * **Dirty Diff:** Contains `print()`, `TODO`, or commented code.
 * **Compliance Violation:** Violates a Domain Rule (e.g., PII in logs).
 * **Scope Creep:** Changes unrelated to the Ticket.
+* **No Proof of Life:** (Feature/Fix only) Diff MUST include a modified test file (`test_*.py` or `*.test.ts`).
 
 ### Phase 2: Action
 

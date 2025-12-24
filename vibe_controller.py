@@ -73,12 +73,21 @@ def run_librarian_review(task, worker_summary):
     try:
         diff_text = subprocess.run(["git", "diff", "--staged"], capture_output=True, text=True).stdout
     except Exception:
-        # In a mock environment or if git fails, we might get here. 
-        # For verification purposes, allow partial execution or return rejection.
-        # But for 'vibe_controller.py' production, we return rejection.
-        # For tests, we might need to mock this.
-        # Let's return REJECTED for safety.
         return {"status": "REJECTED", "reason": "Git Error - Could not read diff"}
+    
+    # 0. The Linter Gate (V5.3 Refinement)
+    # Don't pay LLM to find syntax errors.
+    print(" >> [Controller] Running Linter (Ruff)...")
+    try:
+        # Check current directory. Adjust command as needed (e.g. "ruff check .")
+        # Using check . --select E,F to keep it basic/fast
+        subprocess.run(["ruff", "check", ".", "--select", "E,F"], check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        # Linter failed
+        error_out = e.stderr.decode() if e.stderr else e.stdout.decode()
+        return {"status": "REJECTED", "reason": f"Linter Failed: {error_out[:200]}..."}
+    except FileNotFoundError:
+        print(" >> [Controller] Warning: Ruff not installed. Skipping Linter Gate.")
 
     if diff_text is None: diff_text = ""
 
