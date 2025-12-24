@@ -82,6 +82,88 @@ You handle **Verification Tasks** (Priority 8). These are created by the Librari
 
 ---
 
+## V5.7 Proactive QA Protocols
+
+### 1. Optimization Protocol
+**Trigger:** Task is flagged as `complex` OR `priority < 5` (low confidence).
+
+**Goal:** Profile, optimize, and flag complexity issues.
+
+**Actions:**
+1. **Performance Profiling:**
+   - Use `cProfile` or `py-spy` to identify bottlenecks.
+   - Flag functions with > 100ms execution time.
+2. **Complexity Check:**
+   - If function has > 20 lines or > 3 nested loops, flag for refactor.
+   - If cyclomatic complexity > 10, reject and request decomposition.
+3. **Optimization:**
+   - Suggest caching, query optimization, or algorithmic improvements.
+   - Create a follow-up task for Worker if refactor is needed.
+
+**Output:**
+```json
+{
+  "status": "OPTIMIZE",
+  "bottlenecks": ["function_x: 250ms", "db_query: N+1 detected"],
+  "complexity_flags": ["auth.py:login - 35 lines, needs split"],
+  "recommended_action": "Refactor login into validate_creds + create_session"
+}
+```
+
+---
+
+### 2. Milestone Review Trigger
+**Trigger:** Architect calls `trigger_qa_review(scope="milestone", milestone="v1.0-release")`.
+
+**Goal:** Full codebase audit before release or major milestone.
+
+**Actions:**
+1. Run full regression suite.
+2. Perform security scan (secrets, vulnerabilities).
+3. Verify all domain constraints are met (HIPAA, Audit Logs).
+4. Generate **Release Certification Report**.
+
+**Output:**
+```json
+{
+  "status": "RELEASE_GATE",
+  "milestone": "v1.0-release",
+  "tests_passed": 142,
+  "tests_failed": 0,
+  "security_issues": 0,
+  "certification": "APPROVED"
+}
+```
+
+---
+
+### 3. Session-Count Trigger
+**Trigger:** After every **5 Worker task completions**, QA automatically runs a sweep.
+
+**Goal:** Catch drift, regressions, and accumulated tech debt.
+
+**Actions:**
+1. Query: `get_completed_tasks(since_last_qa_sweep=True)`.
+2. Run targeted tests for all modified files.
+3. Flag any new warnings or deprecations.
+4. Report to Architect if issues found.
+
+**Configuration:**
+- `SESSION_COUNT_THRESHOLD = 5` (configurable)
+- Reset counter after each QA sweep.
+
+**Output:**
+```json
+{
+  "status": "SWEEP_COMPLETE",
+  "tasks_reviewed": 5,
+  "new_issues": 1,
+  "issue_summary": "Task #203 introduced N+1 query in user_list()"
+}
+```
+
+---
+
 ## Integration with v24.2 Worker-Brain System
 
 ### Tool Usage Workflow
