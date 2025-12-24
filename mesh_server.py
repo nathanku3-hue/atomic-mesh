@@ -5121,7 +5121,9 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                     )
 
                     # v22.0: Resolve model tier based on lane + archetype
-                    model_tier = _resolve_model_tier(task["lane"], task.get("archetype"))
+                    # Note: task is sqlite3.Row, use ["key"] not .get()
+                    archetype_val = task["archetype"] if "archetype" in task.keys() else None
+                    model_tier = _resolve_model_tier(task["lane"], archetype_val)
 
                     return json.dumps({
                         "status": "OK",
@@ -5208,7 +5210,9 @@ def pick_task_braided(worker_id: str = None, blocked_lanes: list[str] = None, wo
                         )
 
                         # v22.0: Resolve model tier based on lane + archetype
-                        model_tier = _resolve_model_tier(candidate["lane"], candidate.get("archetype"))
+                        # Note: candidate is sqlite3.Row, use ["key"] not .get()
+                        archetype_val = candidate["archetype"] if "archetype" in candidate.keys() else None
+                        model_tier = _resolve_model_tier(candidate["lane"], archetype_val)
 
                         return json.dumps({
                             "status": "OK",
