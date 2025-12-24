@@ -136,7 +136,11 @@ VALUES
     ('@frontend-1', 'frontend', 'standard', 3, 'online', 60),
     ('@frontend-2', 'frontend', 'standard', 3, 'online', 50),
     ('@qa-1', 'qa', 'standard', 3, 'online', 50),
-    ('@librarian', 'docs', 'standard', 3, 'online', 50);
+    ('@librarian', 'docs', 'standard', 3, 'online', 50),
+    -- V3.4: Specialist Workers
+    ('@security-1', 'security', 'senior', 3, 'online', 70),
+    ('@ux-designer', 'ux', 'senior', 3, 'online', 70),
+    ('@data-analyst', 'data', 'senior', 3, 'online', 70);
 
 -- ============================================================
 -- 7. V2.1: Deduplication Index for Guardians

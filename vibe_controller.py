@@ -1,20 +1,24 @@
 """
-Vibe Controller V3.3 Titanium Master
+Vibe Controller V3.4 Final Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
 Architecture: HYBRID DELEGATION + INTELLIGENT ROUTING
 - Architect can assign specific workers OR use "auto" for load balancing
 - Worker tiers (senior/standard) match task complexity
-- Smart backoff distinguishes network vs crash failures
+- Specialist workers (security/ux/data) for domain expertise
+
+Features V3.4:
+- Specialist Workers: @security-1, @ux-designer, @data-analyst
+- DLQ Escalation: Auto-escalate dead letters after 24h
+- ChatOps Ready: Flask endpoint for Slack/Discord commands
+- Dashboard Ready: Streamlit metrics and Kanban view
 
 Features V3.3:
 - In-Memory Worker Cache: 10s TTL, invalidation on writes
 - Weighted Scoring Router: Multi-factor task-worker matching
 - Task History Archival: 7-day cleanup, archive table
-- status_updated_at: Precise status change tracking
-- Monitoring: Cache hits/misses, saturation events
-- Auto-Scaler Hook: Virtual worker provisioning (optional)
+- Auto-Scaler Hook: Virtual worker provisioning
 
 Features V3.2:
 - Worker Tiers: senior workers get effort >= 4 tasks
@@ -637,6 +641,58 @@ def archive_old_history(conn: sqlite3.Connection, days: int = None) -> int:
         return 0
 
 
+# --- V3.4: DLQ Escalation ---
+DLQ_ESCALATION_HOURS = int(os.getenv("DLQ_ESCALATION_HOURS", "24"))
+
+def escalate_dead_letters(conn: sqlite3.Connection) -> int:
+    """
+    V3.4: Automated DLQ Escalation.
+    If a task rots in DLQ for > 24 hours, escalate with higher urgency.
+    Prevents ignored dead letters from being forgotten.
+    
+    Returns: count of escalated tasks
+    """
+    try:
+        now = int(time.time())
+        threshold = now - (DLQ_ESCALATION_HOURS * 3600)
+        
+        # Find ignored dead letters (not yet escalated)
+        ignored = conn.execute("""
+            SELECT id, goal, lane, last_error_type FROM tasks 
+            WHERE status = 'dead_letter' 
+            AND updated_at < ? 
+            AND (metadata IS NULL OR metadata NOT LIKE '%"escalated"%')
+        """, (threshold,)).fetchall()
+        
+        escalated = 0
+        for task in ignored:
+            msg = f"🔥 [ESCALATION] Task #{task['id']} ({task['lane']}) dead for {DLQ_ESCALATION_HOURS}h! Goal: {task['goal'][:50]}"
+            print(msg)
+            notify_human(task['id'], msg, "critical")
+            
+            # Mark as escalated to prevent spam
+            conn.execute("""
+                UPDATE tasks 
+                SET metadata = CASE 
+                    WHEN metadata IS NULL THEN '{"escalated": true}'
+                    ELSE json_patch(metadata, '{"escalated": true}')
+                END,
+                updated_at = ?
+                WHERE id = ?
+            """, (now, task['id']))
+            
+            escalated += 1
+        
+        if escalated > 0:
+            conn.commit()
+            print(f"🔥 [DLQ] Escalated {escalated} dead letter tasks (>{DLQ_ESCALATION_HOURS}h)")
+        
+        return escalated
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [DLQ Escalation] DB Error: {e}")
+        return 0
+
 # --- V3.3: Auto-Scaler Hook ---
 _auto_scale_counter = 0  # Unique ID counter
 
@@ -1155,13 +1211,13 @@ def write_health_status():
 
 # --- Main Loop ---
 def run_controller():
-    """Main controller loop (V3.3 - Titanium Master)."""
-    print(f"🧠 [System] Vibe Controller V3.3 Active (Titanium: Optimized Routing)")
-    print(f"   Architecture: HYBRID (Direct + Auto-Routing + Worker Tiers + Cache)")
+    """Main controller loop (V3.4 - Final Master)."""
+    print(f"🧠 [System] Vibe Controller V3.4 Active (Final: Complete Orchestration)")
+    print(f"   Architecture: HYBRID (Direct + Routing + Tiers + Cache + Specialists)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE}")
-    print(f"   Cache TTL: {CACHE_TTL}s | Archive Days: {HISTORY_ARCHIVE_DAYS}")
-    print(f"   Features: Weighted Scoring, In-Memory Cache, History Archival")
-    print(f"   Auto-Scaler: MAX {MAX_AUTO_SCALE_WORKERS} workers | Saturation Guard: Active")
+    print(f"   Specialists: @security-1, @ux-designer, @data-analyst")
+    print(f"   DLQ Escalation: {DLQ_ESCALATION_HOURS}h | Auto-Scaler: MAX {MAX_AUTO_SCALE_WORKERS}")
+    print(f"   ChatOps: Ready | Dashboard: Ready")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
     conn = get_db()
@@ -1200,6 +1256,8 @@ def run_controller():
             # V3.3: Periodic history archival
             if loop_count % archive_interval == 0:
                 archive_old_history(conn)
+                # V3.4: Check for dead letters needing escalation
+                escalate_dead_letters(conn)
             
             # Write health status
             write_health_status()
