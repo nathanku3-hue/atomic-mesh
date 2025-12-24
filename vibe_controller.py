@@ -167,19 +167,19 @@ def log_parser_event(message: str, level: str = "INFO"):
 
 def run_librarian_parser(blueprint_task: dict) -> list:
     """
-    Librarian Mode: SPEC WRITER & VALIDATOR (V5.5).
-    Multi-Lane Decomposition with Traceability & Domain Checks.
+    Librarian Mode: SPEC WRITER & VALIDATOR (V5.5.1).
+    Multi-Lane Decomposition with Traceability, Domain Inheritance & Rejection Logging.
     """
     bp_id = blueprint_task['id']
     bp_domain = blueprint_task.get('domain', 'general')
     print(f" >> [Librarian] Parsing Blueprint #{bp_id} ({bp_domain})...")
-    log_parser_event(f"Started parsing Blueprint #{bp_id} (Domain: {bp_domain})")
+    log_parser_event(f"[START] Parsing Blueprint #{bp_id} (Domain: {bp_domain})")
 
     generated_tasks = []
     try:
         raw_text = blueprint_task.get('goal') or blueprint_task.get('description', '')
         if not raw_text:
-            raise ValueError("Empty Blueprint")
+            raise ValueError("Empty Blueprint - no content to parse")
 
         # 1. Multi-Lane Decomposition (V5.5)
         # In production: call LLM with "Split this into Backend/Frontend/Security tasks."
@@ -188,6 +188,9 @@ def run_librarian_parser(blueprint_task: dict) -> list:
             {"goal": "Implement Frontend UI", "lane": "frontend", "priority": 10, "type": "implementation"},
             {"goal": "Write Unit Tests", "lane": "backend", "priority": 10, "type": "implementation"},
         ]
+
+        if not generated_tasks:
+            raise ValueError("LLM returned 0 tasks. Blueprint may be vague.")
 
         # 2. Domain Constraint Injection (The V-Model)
         if bp_domain == 'medicine':
@@ -212,10 +215,17 @@ def run_librarian_parser(blueprint_task: dict) -> list:
                 })
                 log_parser_event(f"[DOMAIN] Auto-Injected Audit Task for Blueprint #{bp_id}")
 
-        # 3. Traceability & Explicit Child Logging (V5.5 Refinement #2)
+        # 3. Traceability, Domain Inheritance & Cross-Lane Sanitization (V5.5.1)
         for t in generated_tasks:
             t['parent_id'] = bp_id
-            t['domain'] = bp_domain  # Critical: Domain Inheritance
+            t['domain'] = bp_domain  # Strict Inheritance (Rank #3)
+            
+            # Reject Cross-Lane Hallucinations
+            if "/" in t.get('lane', ''):
+                original_lane = t['lane']
+                t['lane'] = "general"
+                log_parser_event(f"[WARNING] Task '{t['goal']}' had mixed lane '{original_lane}'. Defaulting to 'general'.")
+            
             t['traceability'] = {
                 "parent_task": bp_id,
                 "origin": "librarian_parser",
@@ -223,14 +233,15 @@ def run_librarian_parser(blueprint_task: dict) -> list:
             }
             # save_task_to_db(t)  # In production
             print(f"    -> Created Task: {t['goal']} (Lane: {t['lane']}, Prio: {t['priority']})")
-            log_parser_event(f"[CHILD] Created: '{t['goal']}' | Lane: {t['lane']} | Domain: {t['domain']} | Parent: #{bp_id}")
+            log_parser_event(f"[CREATED] '{t['goal']}' | Lane: {t['lane']} | Domain: {t['domain']} | Parent: #{bp_id}")
 
-        log_parser_event(f"Blueprint #{bp_id} decomposed into {len(generated_tasks)} atomic tasks.")
+        log_parser_event(f"[SUCCESS] Blueprint #{bp_id} -> {len(generated_tasks)} Atomic Tasks.")
         print(f" >> [Librarian] Blueprint parsed. {len(generated_tasks)} tasks created.")
 
     except Exception as e:
+        # Rank #1: Explicit Rejection Logging
         print(f" >> [Librarian] Parsing FAILED: {e}")
-        log_parser_event(f"Parsing FAILED for #{bp_id}: {e}", level="ERROR")
+        log_parser_event(f"[REJECTED] Blueprint #{bp_id} failed parsing. Reason: {str(e)}", level="ERROR")
 
     return generated_tasks
 
