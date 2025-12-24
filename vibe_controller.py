@@ -152,8 +152,97 @@ def prioritize_tasks(tasks):
     """
     return sorted(tasks, key=lambda x: (-x.get('priority', 5), x['id']))
 
+# --- V5.4: BLUEPRINT PARSING (The Scribe) ---
+PARSER_LOG = "PARSER_AUDIT.log"
+
+def log_parser_event(message: str, level: str = "INFO"):
+    """Logs Blueprint Parsing decisions to PARSER_AUDIT.log."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] [{level}] {message}\n"
+    try:
+        with open(PARSER_LOG, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"❌ [ParserLog] Failed: {e}")
+
+def run_librarian_parser(blueprint_task: dict) -> list:
+    """
+    Librarian Mode: SPEC WRITER & VALIDATOR (V5.4).
+    Converts Raw Solution into Atomic Tasks with Traceability & Domain Checks.
+    """
+    bp_id = blueprint_task['id']
+    bp_domain = blueprint_task.get('domain', 'general')
+    print(f" >> [Librarian] Parsing Blueprint #{bp_id} ({bp_domain})...")
+    log_parser_event(f"Started parsing Blueprint #{bp_id}")
+
+    generated_tasks = []
+    try:
+        raw_text = blueprint_task.get('goal')
+        if not raw_text:
+            raise ValueError("Empty Blueprint")
+
+        # 1. LLM Decomposition (Stub)
+        # In production: call LLM with "Split this into atomic tasks."
+        generated_tasks = [
+            {"goal": "Implement Feature", "lane": "backend", "priority": 10, "type": "implementation"},
+            {"goal": "Write Unit Tests", "lane": "backend", "priority": 10, "type": "implementation"},
+        ]
+
+        # 2. Domain Constraint Injection (The V-Model)
+        if bp_domain == 'medicine':
+            has_compliance = any("hipaa" in t['goal'].lower() or "compliance" in t['goal'].lower() for t in generated_tasks)
+            if not has_compliance:
+                generated_tasks.append({
+                    "goal": "Verify HIPAA Compliance (MED-01)",
+                    "lane": "security",
+                    "priority": 8,
+                    "type": "verification"
+                })
+                log_parser_event(f"Auto-Injected HIPAA Audit for Blueprint #{bp_id}")
+        
+        if bp_domain == 'law':
+            has_audit = any("audit" in t['goal'].lower() for t in generated_tasks)
+            if not has_audit:
+                generated_tasks.append({
+                    "goal": "Verify Audit Logs (LAW-02)",
+                    "lane": "security",
+                    "priority": 8,
+                    "type": "verification"
+                })
+                log_parser_event(f"Auto-Injected Audit Task for Blueprint #{bp_id}")
+
+        # 3. Traceability & Save
+        for t in generated_tasks:
+            t['parent_id'] = bp_id
+            t['domain'] = bp_domain
+            # save_task_to_db(t)  # In production
+            print(f"    -> Created Task: {t['goal']} (Prio: {t['priority']})")
+
+        log_parser_event(f"Blueprint #{bp_id} parsed. {len(generated_tasks)} tasks created.")
+        print(f" >> [Librarian] Blueprint parsed. {len(generated_tasks)} tasks created.")
+
+    except Exception as e:
+        print(f" >> [Librarian] Parsing FAILED: {e}")
+        log_parser_event(f"Parsing FAILED for #{bp_id}: {e}", level="ERROR")
+
+    return generated_tasks
+
+
 def main_loop():
-    # Mock Task Queue
+    # --- V5.4: BLUEPRINT PARSING PHASE ---
+    # Poll for Blueprints (status="PENDING_PARSING")
+    mock_blueprints = [
+        {"id": 200, "status": "PENDING_PARSING", "domain": "medicine", "goal": "Implement Auth Module with HIPAA constraints."}
+    ]
+    
+    for bp in mock_blueprints:
+        if bp.get("status") == "PENDING_PARSING":
+            child_tasks = run_librarian_parser(bp)
+            # In production: mark_task_complete(bp['id'])
+            # Child tasks are added to the queue dynamically
+    
+    # --- STANDARD EXECUTION PHASE ---
+    # Mock Task Queue (V5.3)
     raw_tasks = [
         {"id": 101, "priority": 3, "domain": "medicine", "lane": "backend", "goal": "Fix logs"},
         {"id": 102, "priority": 9, "domain": "medicine", "lane": "backend", "goal": "Critical Security Patch"},
