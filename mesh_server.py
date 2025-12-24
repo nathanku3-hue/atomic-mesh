@@ -1372,7 +1372,7 @@ def check_task_status(task_id: int) -> str:
                     "instruction": "Still waiting for Brain. Sleep 10 seconds and retry."
                 })
             elif task_status == "pending":
-                return json.dumps({
+                return json.dumps({  # SAFETY-ALLOW: status-write (response dict, not DB mutation)
                     "status": "pending",
                     "feedback": row["manager_feedback"] or "",
                     "instruction": "Unblocked! Resume execution using the feedback."
@@ -1946,7 +1946,7 @@ def cancel_task(task_id: int, reason: str) -> str:
             if not task:
                 return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
             
-            if task["status"] == "cancelled":
+            if task["status"] == "cancelled":  # SAFETY-ALLOW: status-write (status read, not mutation)
                 return json.dumps({"status": "WARN", "message": "Task already cancelled"})
             
             old_status = task["status"]
