@@ -17,6 +17,8 @@ os.environ["MAX_TASKS_PER_WORKER"] = "2"  # Low limit for testing
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import vibe_controller
+vibe_controller.DB_PATH = DB_PATH
+vibe_controller.MAX_TASKS_PER_WORKER = 2
 
 
 def setup_test_db():
@@ -30,11 +32,11 @@ def setup_test_db():
     conn.execute("DROP TABLE IF EXISTS task_history")
     conn.execute("DROP TABLE IF EXISTS worker_health")
     
-    # Create schema
+    # Create schema (V3.2 compatible)
     conn.execute("""
         CREATE TABLE tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            worker_id TEXT NOT NULL,
+            worker_id TEXT,
             lane TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
             goal TEXT NOT NULL,
@@ -43,6 +45,7 @@ def setup_test_db():
             lease_id TEXT,
             lease_expires_at INTEGER DEFAULT 0,
             attempt_count INTEGER DEFAULT 0,
+            priority TEXT DEFAULT 'normal',
             metadata TEXT,
             created_at INTEGER DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER DEFAULT (strftime('%s', 'now'))
