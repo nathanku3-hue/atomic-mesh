@@ -44,6 +44,18 @@ def validate_commit_message(message, task_id):
     return True, "Valid"
 
 # --- CORE LOGIC ---
+def append_lesson_learned(content: str, category: str = "General"):
+    """
+    Appends a new lesson to LESSONS_LEARNED.md.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d")
+    entry = f"\n- **[{timestamp}] {category}:** {content}"
+    
+    try:
+        with open(LESSONS_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"❌ [Lessons] Failed to append: {e}")
 
 def inject_domain_and_lane_rules(task, domain=None, lane=None):
     """Injects rules with Supremacy Clause."""
@@ -63,8 +75,16 @@ def inject_domain_and_lane_rules(task, domain=None, lane=None):
         if os.path.exists(l_path):
             with open(l_path, 'r') as f:
                  context_str += f"\n\n--- LANE RULES (Supplementary) ---\n{f.read()}"
-    
-    return context_str, None
+        else:
+            # Fallback Protocol (V4.1)
+            default_path = os.path.join(SKILLS_DIR, "_default.md")
+            if os.path.exists(default_path):
+                 print(f" >> [Controller] ⚠️  Lane '{lane}' missing. Using Fallback.")
+                 append_lesson_learned(f"Missing skill pack for lane '{lane}'. Fallback applied.", "System")
+                 with open(default_path, 'r') as f:
+                     context_str += f"\n\n--- LANE RULES (Fallback) ---\n{f.read()}"
+            else:
+                 print(f" >> [Controller] ⚠️  Lane '{lane}' missing and No Default found.")
 
 def run_librarian_review(task, worker_summary):
     print(f" >> [Controller] Librarian reviewing Task #{task['id']}...")
