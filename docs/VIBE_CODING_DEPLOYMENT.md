@@ -2,10 +2,10 @@
 
 ## 🚀 System Status: PRODUCTION READY
 
-**Version:** v1.0 (Reference Grade)  
+**Version:** v1.1 (Gold Master)  
 **Last Updated:** 2024-12-24  
-**Test Coverage:** 49/49 passing ✅  
-**Commits:** 4 (v24.2 implementation + Vibe Coding artifacts)
+**Test Coverage:** 23/23 passing ✅  
+**New in V1.1:** Rejection Handling, Guardian Chaining, Circuit Breaker
 
 ---
 
@@ -13,13 +13,13 @@
 
 | Artifact | Location | Status | Purpose |
 |----------|----------|--------|---------|
-| **Architect SOP** | `library/prompts/architect_sop.md` | ✅ Reference | Brain system prompt with supervision gate |
+| **Vibe Controller** | `vibe_controller.py` | ✅ V1.1 | Autonomous orchestrator with rejection handling |
+| **Infrastructure SQL** | `migrations/v24_infrastructure.sql` | ✅ Complete | Consolidated schema + indexes |
+| **Architect SOP** | `library/prompts/architect_sop.md` | ✅ V1.1 | Brain with Lane Discipline rule |
 | **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Code quality guardian with veto power |
 | **Frontend Worker SOP** | `library/prompts/frontend_worker_sop.md` | ✅ Reference | UX guardian with performance targets |
-| **Brain SOP** | `library/prompts/brain_sop.md` | ✅ Complete | Orchestrator monitoring guide (v24.2) |
-| **Worker SOP** | `library/prompts/worker.md` | ✅ Complete | Worker execution guide (v24.1) |
-| **Schema Migration** | `migrations/v24_1_schema_migration.sql` | ✅ Idempotent | Database setup with verification |
-| **Implementation Guide** | `docs/VIBE_CODING_GUIDE.md` | ✅ Complete | Full reference documentation |
+| **QA Worker SOP** | `library/prompts/qa_worker_sop.md` | ✅ Reference | Adversarial testing guardian |
+| **Librarian SOP** | `library/prompts/librarian_worker_sop.md` | ✅ Reference | Documentation guardian |
 
 ---
 
@@ -125,53 +125,74 @@ decisions (8 columns)
 
 ---
 
-## 🔄 Operational Workflows
 
-### Workflow 1: Simple Task (Auto-Dispatch)
+## 🔄 Operational Workflows (V1.1)
+
+### Workflow 1: Happy Path (Auto-Dispatch + Guardian Chain)
 ```
 User: "Fix typo in login button"
-Architect: [Low complexity, Low risk] → create_task(@frontend)
-Worker: claim → fix → submit_for_review
-Brain: approve_work
-Status: ✅ Completed
+Architect: [Low complexity, Low risk] → create_task(Task #1, @frontend)
+Frontend: claim → fix → submit_for_review
+Controller: approve_task(#1) → spawn QA #2 (depends on #1)
+QA: verify → passes → submit_for_review
+Controller: approve_task(#2) → spawn Docs #3 (depends on #2, not #1!)
+Docs: document → submit_for_review
+Controller: approve_task(#3)
+Status: ✅ Completed (3 tasks total)
 ```
 
-### Workflow 2: Complex Task (Planning)
+### Workflow 2: QA Rejection (Retry with Feedback)
 ```
-User: "Add OAuth login"
-Architect: [High complexity, High risk] → JSON plan
-User: "Go"
-Architect: create_task(@backend, @qa)
-Worker: claim → ask_clarification("Which provider?")
-Brain: respond_to_blocker("Use Auth0")
-Worker: implement → submit_for_review_with_evidence
-Brain: approve_work
-Status: ✅ Completed
-```
-
-### Workflow 3: Quality Veto
-```
-Worker: [Reads: "Add auth check in every controller"]
-Worker: [Quality Gate: Violates DRY]
-Worker: ask_clarification("Forces duplication, propose middleware")
-Brain: respond_to_blocker("Approved, add middleware.ts to context")
-Worker: implement clean solution → submit
-Brain: approve_work
-Status: ✅ Completed (with architecture improvement)
+User: "Fix login bug"
+Architect: create_task(Task #1, @backend)
+Backend: claim → fix → submit_for_review
+Controller: approve_task(#1) → spawn QA #2 (depends on #1)
+QA: test → finds bug → submit_for_review(metadata={status: 'REJECT', reason: 'Missing null check'})
+Controller: handle_rejection()
+  - Complete QA #2 (QA did their job)
+  - Reopen Task #1 (attempt_count=1)
+  - Log feedback to task_messages
+Backend: claim #1 → read feedback → fix → submit_for_review
+Controller: approve_task(#1) → spawn QA #3 (depends on #1)
+QA: test → passes → submit_for_review
+Controller: approve_task(#3) → spawn Docs #4 (depends on #3)
+Status: ✅ Completed (after 1 retry)
 ```
 
-### Workflow 4: Rejection & Escalation
+### Workflow 3: Circuit Breaker (Max Retries Exceeded)
 ```
-Worker: submit_for_review
-Brain: reject_work("Missing error handling") → attempt_count=1
-Worker: fix → resubmit
-Brain: reject_work("Still missing edge cases") → attempt_count=2
-Worker: fix → resubmit
-Brain: reject_work("Needs refactor") → attempt_count=3
-System: AUTO-ESCALATE to decisions table
-Human: Review → Provide guidance
-Status: 🔴 Escalated (awaiting human decision)
+User: "Implement complex feature"
+Architect: create_task(Task #1, @backend)
+Backend: claim → implement → submit_for_review
+Controller: approve → spawn QA #2
+QA: reject (attempt_count=1)
+Backend: retry → submit
+Controller: approve → spawn QA #3
+QA: reject (attempt_count=2)
+Backend: retry → submit
+Controller: approve → spawn QA #4
+QA: reject (attempt_count=3)
+Controller: FAIL Task #1 (status='failed')
+  - Send critical alert
+  - No more retries
+Status: 🔴 FAILED (requires human intervention)
 ```
+
+### Workflow 4: Timeout Circuit Breaker
+```
+Backend: claim Task #1 → starts work → crashes (no heartbeat)
+Controller: sweep_stale_leases() detects expired lease
+  - Requeue #1 (attempt_count=1)
+Backend: claim #1 → crashes again
+Controller: sweep_stale_leases()
+  - Requeue #1 (attempt_count=2)
+Backend: claim #1 → crashes third time
+Controller: sweep_stale_leases()
+  - FAIL #1 (attempt_count=3, status='failed')
+  - Send critical alert
+Status: 🔴 FAILED (worker issue detected)
+```
+
 
 ---
 
