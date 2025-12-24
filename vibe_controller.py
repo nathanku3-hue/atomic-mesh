@@ -167,24 +167,25 @@ def log_parser_event(message: str, level: str = "INFO"):
 
 def run_librarian_parser(blueprint_task: dict) -> list:
     """
-    Librarian Mode: SPEC WRITER & VALIDATOR (V5.4).
-    Converts Raw Solution into Atomic Tasks with Traceability & Domain Checks.
+    Librarian Mode: SPEC WRITER & VALIDATOR (V5.5).
+    Multi-Lane Decomposition with Traceability & Domain Checks.
     """
     bp_id = blueprint_task['id']
     bp_domain = blueprint_task.get('domain', 'general')
     print(f" >> [Librarian] Parsing Blueprint #{bp_id} ({bp_domain})...")
-    log_parser_event(f"Started parsing Blueprint #{bp_id}")
+    log_parser_event(f"Started parsing Blueprint #{bp_id} (Domain: {bp_domain})")
 
     generated_tasks = []
     try:
-        raw_text = blueprint_task.get('goal')
+        raw_text = blueprint_task.get('goal') or blueprint_task.get('description', '')
         if not raw_text:
             raise ValueError("Empty Blueprint")
 
-        # 1. LLM Decomposition (Stub)
-        # In production: call LLM with "Split this into atomic tasks."
+        # 1. Multi-Lane Decomposition (V5.5)
+        # In production: call LLM with "Split this into Backend/Frontend/Security tasks."
         generated_tasks = [
-            {"goal": "Implement Feature", "lane": "backend", "priority": 10, "type": "implementation"},
+            {"goal": "Implement Backend API", "lane": "backend", "priority": 10, "type": "implementation"},
+            {"goal": "Implement Frontend UI", "lane": "frontend", "priority": 10, "type": "implementation"},
             {"goal": "Write Unit Tests", "lane": "backend", "priority": 10, "type": "implementation"},
         ]
 
@@ -198,7 +199,7 @@ def run_librarian_parser(blueprint_task: dict) -> list:
                     "priority": 8,
                     "type": "verification"
                 })
-                log_parser_event(f"Auto-Injected HIPAA Audit for Blueprint #{bp_id}")
+                log_parser_event(f"[DOMAIN] Auto-Injected HIPAA Audit for Blueprint #{bp_id}")
         
         if bp_domain == 'law':
             has_audit = any("audit" in t['goal'].lower() for t in generated_tasks)
@@ -209,16 +210,22 @@ def run_librarian_parser(blueprint_task: dict) -> list:
                     "priority": 8,
                     "type": "verification"
                 })
-                log_parser_event(f"Auto-Injected Audit Task for Blueprint #{bp_id}")
+                log_parser_event(f"[DOMAIN] Auto-Injected Audit Task for Blueprint #{bp_id}")
 
-        # 3. Traceability & Save
+        # 3. Traceability & Explicit Child Logging (V5.5 Refinement #2)
         for t in generated_tasks:
             t['parent_id'] = bp_id
-            t['domain'] = bp_domain
+            t['domain'] = bp_domain  # Critical: Domain Inheritance
+            t['traceability'] = {
+                "parent_task": bp_id,
+                "origin": "librarian_parser",
+                "inherited_constraints": [bp_domain]
+            }
             # save_task_to_db(t)  # In production
-            print(f"    -> Created Task: {t['goal']} (Prio: {t['priority']})")
+            print(f"    -> Created Task: {t['goal']} (Lane: {t['lane']}, Prio: {t['priority']})")
+            log_parser_event(f"[CHILD] Created: '{t['goal']}' | Lane: {t['lane']} | Domain: {t['domain']} | Parent: #{bp_id}")
 
-        log_parser_event(f"Blueprint #{bp_id} parsed. {len(generated_tasks)} tasks created.")
+        log_parser_event(f"Blueprint #{bp_id} decomposed into {len(generated_tasks)} atomic tasks.")
         print(f" >> [Librarian] Blueprint parsed. {len(generated_tasks)} tasks created.")
 
     except Exception as e:

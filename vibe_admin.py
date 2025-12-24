@@ -127,6 +127,53 @@ def retry_task(task_id):
     finally:
         conn.close()
 
+# --- V5.5: Blind Handoff (Blueprint Submission) ---
+
+def submit_blueprint(content: str, domain: str = "general"):
+    """
+    V5.5 Blind Handoff: Ingests raw text directly to DB as Blueprint.
+    The Architect bypasses processing; Librarian parses.
+    """
+    # Refinement #1: Validation (Warning, not blocking)
+    if len(content) < 50:
+        print(f" >> [WARNING] Blueprint content is very short ({len(content)} chars).")
+        print(f"    Ensure this is a complete solution paste.")
+    
+    conn = get_db()
+    try:
+        conn.execute("BEGIN")
+        
+        cursor = conn.execute("""
+            INSERT INTO tasks (goal, lane, status, domain, priority, created_at, updated_at)
+            VALUES (?, 'blueprint', 'pending_parsing', ?, 'high', ?, ?)
+        """, (
+            f"[BLUEPRINT] {content[:100]}...",
+            domain,
+            int(time.time()),
+            int(time.time())
+        ))
+        
+        task_id = cursor.lastrowid
+        
+        # Store full content in metadata
+        conn.execute("""
+            UPDATE tasks SET metadata = ? WHERE id = ?
+        """, (json.dumps({"raw_content": content, "type": "blueprint"}), task_id))
+        
+        log_admin_action(conn, task_id, "BLUEPRINT_SUBMIT", f"Created Blueprint (Domain: {domain})")
+        
+        conn.commit()
+        print(f" >> [Admin] Blueprint saved as Task #{task_id}.")
+        print(f"    Domain: {domain} | Status: pending_parsing")
+        return task_id
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"💥 Failed to submit blueprint: {e}")
+        return None
+    finally:
+        conn.close()
+
 # --- V3.2: Dead Letter Queue Commands ---
 
 def dlq_list():
@@ -222,7 +269,7 @@ def dlq_purge():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python vibe_admin.py [list|approve <id>|retry <id>|dlq <list|retry|purge>]")
+        print("Usage: python vibe_admin.py [list|approve <id>|retry <id>|dlq <list|retry|purge>|blueprint <content> [domain]]")
         sys.exit(1)
     
     cmd = sys.argv[1]
@@ -235,6 +282,11 @@ if __name__ == "__main__":
     elif cmd == "retry": 
         if len(sys.argv) < 3: print("Error: Missing Task ID"); sys.exit(1)
         retry_task(sys.argv[2])
+    elif cmd == "blueprint":
+        if len(sys.argv) < 3: print("Error: Missing content"); sys.exit(1)
+        content = sys.argv[2]
+        domain = sys.argv[3] if len(sys.argv) > 3 else "general"
+        submit_blueprint(content, domain)
     elif cmd == "dlq":
         if len(sys.argv) < 3:
             print("Usage: python vibe_admin.py dlq [list|retry|purge]")
@@ -250,3 +302,4 @@ if __name__ == "__main__":
             print(f"Unknown DLQ command: {subcmd}")
     else:
         print(f"Unknown command: {cmd}")
+
