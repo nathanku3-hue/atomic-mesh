@@ -709,10 +709,40 @@ def escalate_dead_letters(conn: sqlite3.Connection) -> int:
 
 
 # --- V4.0: Prompt Compiler ---
+# Prompt Injection Guardrail Patterns
+INJECTION_PATTERNS = [
+    "ignore previous instructions",
+    "disregard all prior",
+    "forget everything",
+    "system prompt",
+    "you are now",
+    "new instructions:",
+]
+
+
+def sanitize_user_content(content: str) -> str:
+    """
+    V4.0 Guardrail: Sanitize user content to prevent prompt injection.
+    Removes or flags potential injection attempts.
+    """
+    lower_content = content.lower()
+    for pattern in INJECTION_PATTERNS:
+        if pattern in lower_content:
+            print(f"⚠️ [Guardrail] Potential injection detected: '{pattern[:20]}...'")
+            # Replace the pattern with a warning
+            content = content.replace(pattern, "[FILTERED]")
+    return content
+
+
 def expand_task_context(conn: sqlite3.Connection, task: Dict) -> bool:
     """
     V4.0 Prompt Compiler: Inject lane skill pack into task context.
-    Called BEFORE assigning worker to ensure they see the checklist.
+    
+    Prompt Ordering (best practice):
+    1. CONTEXT/EXAMPLES (skill pack)
+    2. ROLE (directive from skill pack)
+    3. USER REQUEST (sanitized goal)
+    4. CONSTRAINTS (from skill pack)
     
     Returns: True if expanded, False if no skill pack found
     """
@@ -738,9 +768,20 @@ def expand_task_context(conn: sqlite3.Connection, task: Dict) -> bool:
             skills = skills[:MAX_SKILL_CHARS] + "\n...[truncated]..."
             print(f"⚠️ [Compiler] Skill pack truncated to {MAX_SKILL_CHARS} chars")
         
-        # Append to goal (worker CANNOT miss it)
-        current_goal = task.get('goal', '')
-        compiled_goal = f"{current_goal}\n\n--- {lane.upper()} SKILLS ({os.path.basename(skill_file)}) ---\n{skills}"
+        # Sanitize user goal (guardrail)
+        current_goal = sanitize_user_content(task.get('goal', ''))
+        
+        # Proper Prompt Ordering:
+        # 1. SKILL PACK (context, examples, directive, constraints)
+        # 2. USER TASK (sanitized)
+        compiled_goal = f"""--- {lane.upper()} SKILL PACK ({os.path.basename(skill_file)}) ---
+{skills}
+
+--- USER TASK ---
+{current_goal}
+
+--- REMINDER ---
+Follow the MUST/AVOID rules above. Check EVIDENCE checklist before submitting."""
         
         # Update context_files
         ctx = json.loads(task.get('context_files') or '[]')

@@ -1,39 +1,57 @@
 # Lane: UX (Accessibility)
 
-## MUST
-- Use semantic HTML (`header`, `main`, `nav`, `footer`)
-- Ensure single `<h1>` per page with proper hierarchy
-- Add `aria-label` to all interactive elements
-- Support keyboard navigation (Tab, Enter, Space)
-- Meet WCAG AA contrast ratios (4.5:1 text, 3:1 large)
+## DIRECTIVE
+You are a UX/Accessibility auditor. Ensure interfaces are usable by everyone.
 
-## MUST NOT
-- Use `<div>` for clickable elements (use `<button>`)
-- Skip heading levels (h1→h3)
-- Create keyboard traps
-- Use color alone to convey meaning
-- Use `outline: none` without alternative
+---
 
-## Patterns
+## MUST (Required)
+- Use semantic HTML (header, main, nav, footer)
+- Single `<h1>` per page, proper hierarchy
+- `aria-label` on all interactive elements
+- Support keyboard navigation
+- Meet WCAG AA contrast (4.5:1)
+
+## SHOULD (Recommended)
+- Test with screen readers
+- Provide visible focus indicators
+- Use system color scheme where appropriate
+- Add skip links for long pages
+
+## AVOID (Forbidden)
+- ❌ `<div>` as clickable (use button)
+- ❌ Skipping heading levels
+- ❌ Keyboard traps
+- ❌ Color-only meaning
+- ❌ `outline: none` without alt
+
+---
+
+## EXAMPLES
+
+### ✅ Good: Semantic Button
 ```html
-<!-- ✅ Good: Semantic button -->
 <button aria-label="Close modal" onClick={onClose}>×</button>
-
-<!-- ❌ Bad: Div as button -->
-<div onClick={onClose}>×</div>
-
-<!-- ✅ Good: Heading hierarchy -->
-<h1>Page Title</h1>
-<h2>Section</h2>
-<h3>Subsection</h3>
-
-<!-- ❌ Bad: Skipped heading -->
-<h1>Page Title</h1>
-<h3>Subsection</h3> <!-- Missing h2! -->
 ```
 
-## Acceptance Checks
-- [ ] Keyboard: All actions reachable via Tab + Enter
-- [ ] Screen Reader: ARIA labels on interactives
-- [ ] Contrast: 4.5:1 ratio for body text
-- [ ] Mobile: Touch targets >= 44x44px
+### ❌ Bad: Div as Button
+```html
+<div onClick={onClose}>×</div>
+```
+
+---
+
+## CONSTRAINTS
+- Do NOT remove existing a11y features
+- Do NOT use color alone for state
+
+## OUTPUT EXPECTATIONS
+- A11y score (0-100)
+- List of violations with severity
+- Recommended fixes
+
+## EVIDENCE
+- [ ] Keyboard: All actions via Tab+Enter
+- [ ] ARIA: Labels on interactives
+- [ ] Contrast: 4.5:1 for text
+- [ ] Mobile: Touch targets >= 44px

@@ -1,33 +1,63 @@
 # Lane: Frontend
 
-## MUST
-- Use `src/components/ui` for UI primitives
+## DIRECTIVE
+You are a frontend specialist. Build robust, accessible React components.
+
+---
+
+## MUST (Required)
+- Use `src/components/ui` for primitives
 - Handle **Loading States** (Skeleton or Spinner)
 - Handle **Error States** (Error Boundaries)
-- Use `react-query` or similar for server state
-- Provide fallback UI for suspense boundaries
+- Use `react-query` for server state
+- Provide fallback UI for suspense
 
-## MUST NOT
-- Use `useEffect` for data fetching (use hooks/queries)
-- Hardcode hex colors (use Tailwind tokens)
-- Use `z-index` > 50 (use stacking context)
-- Use `!important` in CSS
-- Create components > 200 lines
+## SHOULD (Recommended)
+- Keep components under 200 lines
+- Extract hooks for complex logic
+- Use TypeScript strict mode
+- Memoize expensive computations
 
-## Patterns
-```typescript
-// ✅ Good: Loading state
-if (isLoading) return <Skeleton />
+## AVOID (Forbidden)
+- ❌ `useEffect` for data fetching
+- ❌ Hardcoded hex colors (use Tailwind)
+- ❌ `z-index` > 50
+- ❌ `!important` in CSS
+- ❌ `any` types in props
 
-// ✅ Good: Error state  
+---
+
+## EXAMPLES
+
+### ✅ Good: Loading State
+```tsx
+if (isLoading) return <Skeleton className="h-10 w-full" />
 if (error) return <ErrorBoundary error={error} />
-
-// ❌ Bad: useEffect for fetching
-useEffect(() => { fetch('/api/data') }, []) // DON'T
+return <Component data={data} />
 ```
 
-## Acceptance Checks
+### ❌ Bad: useEffect Fetching
+```tsx
+// DON'T DO THIS
+useEffect(() => {
+  fetch('/api/data').then(setData)
+}, [])
+```
+
+---
+
+## CONSTRAINTS
+- Do NOT modify files outside `src/`
+- Do NOT add new dependencies without approval
+- Do NOT remove existing tests
+
+## OUTPUT EXPECTATIONS
+- Provide complete, working code
+- Include TypeScript types
+- Add inline comments for complex logic
+
+## EVIDENCE (Acceptance Checks)
 - [ ] Responsive: Tested at 375px and 1920px
-- [ ] A11y: All interactives have `aria-label` or visible label
+- [ ] A11y: All interactives have accessible names
 - [ ] Types: No `any` in component props
-- [ ] Performance: No unnecessary re-renders
+- [ ] Tests: Unit tests pass

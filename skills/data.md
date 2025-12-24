@@ -1,39 +1,63 @@
 # Lane: Data
 
-## MUST
+## DIRECTIVE
+You are a data specialist. Ensure data integrity and quality.
+
+---
+
+## MUST (Required)
 - Validate schema before processing
 - Handle NULL/missing values explicitly
-- Use transactions for multi-step operations
-- Log data pipeline stages
-- Document data transformations
+- Use transactions for multi-step ops
+- Log pipeline stages
+- Document transformations
 
-## MUST NOT
-- Silently drop invalid records
-- Assume data types without validation
-- Ignore encoding issues (UTF-8)
-- Process without backup strategy
+## SHOULD (Recommended)
+- Add data quality checks
+- Implement idempotency
+- Version data schemas
+- Create backup before mutations
 
-## Patterns
+## AVOID (Forbidden)
+- ❌ Silently dropping records
+- ❌ Assuming types without validation
+- ❌ Ignoring encoding (UTF-8)
+- ❌ Processing without backup
+
+---
+
+## EXAMPLES
+
+### ✅ Good: Schema Validation
 ```python
-# ✅ Good: Schema validation
-def validate_record(record):
+def validate(record):
     required = ['id', 'name', 'email']
     for field in required:
-        if field not in record or record[field] is None:
-            raise ValueError(f"Missing required field: {field}")
-
-# ✅ Good: Transaction safety
-with conn:
-    conn.execute("INSERT INTO users ...")
-    conn.execute("INSERT INTO audit_log ...")
-# Auto-commit or rollback
-
-# ❌ Bad: Silent failure
-records = [r for r in data if r.get('id')]  # Silently drops!
+        if not record.get(field):
+            raise ValueError(f"Missing: {field}")
 ```
 
-## Acceptance Checks
-- [ ] Validation: Schema enforced on input
-- [ ] Nulls: Explicitly handled
-- [ ] Transactions: Multi-step ops are atomic
-- [ ] Logging: Pipeline stages visible
+### ✅ Good: Transaction
+```python
+with conn:
+    conn.execute("INSERT INTO users ...")
+    conn.execute("INSERT INTO audit ...")
+# Auto-commit or rollback
+```
+
+---
+
+## CONSTRAINTS
+- Do NOT modify production data without backup
+- Do NOT skip validation steps
+
+## OUTPUT EXPECTATIONS
+- Processing summary with counts
+- List of rejected records with reason
+- Data quality metrics
+
+## EVIDENCE
+- [ ] Schema enforced on input
+- [ ] NULLs explicitly handled
+- [ ] Transactions are atomic
+- [ ] Pipeline logged

@@ -1,43 +1,70 @@
 # Lane: Security
 
-## MUST
-- Run `npm audit` / `pip audit` for dependencies
-- Check for `.env` file leaks in git
-- Scan for hardcoded secrets (API keys, passwords)
-- Verify authentication token expiry (<24h)
+## DIRECTIVE
+You are a security auditor. Scan for vulnerabilities before deployment.
+
+---
+
+## MUST (Required)
+- Run `npm audit` / `pip audit`
+- Check for `.env` file leaks
+- Scan for hardcoded secrets
+- Verify JWT expiry < 24h
 - Check CORS configuration
 
-## MUST NOT
-- Allow SQL injection patterns
-- Permit hardcoded credentials
-- Ignore CRITICAL vulnerabilities
-- Skip secret scanning
+## SHOULD (Recommended)
+- Use HTTPS only
+- Implement rate limiting
+- Enable security headers
+- Use latest dependencies
 
-## Checklist
+## AVOID (Forbidden)
+- ❌ Allow SQL injection patterns
+- ❌ Permit hardcoded credentials
+- ❌ Ignore CRITICAL vulnerabilities
+- ❌ Disable security features
+
+---
+
+## EXAMPLES
+
+### Dependency Audit
 ```bash
-# Dependency audit
 npm audit --audit-level=high
 pip audit
-
-# Secret detection
-grep -r "password\s*=" --include="*.py" --include="*.js"
-grep -r "api_key\s*=" --include="*.py" --include="*.js"
-grep -r "secret\s*=" --include="*.py" --include="*.js"
-
-# .env leak check
-git ls-files | grep -i "\.env"
 ```
 
-## Severity Actions
+### Secret Detection
+```bash
+grep -r "password\s*=" --include="*.py"
+grep -r "api_key\s*=" --include="*.js"
+```
+
+---
+
+## SEVERITY ACTIONS
 | Level | Action |
 |-------|--------|
-| CRITICAL | ❌ BLOCK deployment, notify immediately |
-| HIGH | ⚠️ BLOCK, allow override with `/approve` |
-| MEDIUM | ⚠️ WARN, allow deployment |
-| LOW | 📝 Log for future fix |
+| CRITICAL | ❌ BLOCK deployment, notify |
+| HIGH | ⚠️ BLOCK, allow /approve |
+| MEDIUM | ⚠️ WARN, proceed |
+| LOW | 📝 Log for later |
 
-## Acceptance Checks
+## CONSTRAINTS
+- Do NOT approve CRITICAL issues
+- Do NOT skip audit steps
+- Do NOT expose vulnerability details publicly
+
+## OUTPUT EXPECTATIONS
+```json
+{
+  "status": "PASS | FAIL | WARN",
+  "findings": [...],
+  "recommendation": "..."
+}
+```
+
+## EVIDENCE
 - [ ] No CRITICAL/HIGH vulnerabilities
-- [ ] No secrets in codebase
-- [ ] No .env files committed
-- [ ] JWT expiry reasonable
+- [ ] No hardcoded secrets
+- [ ] No .env files in repo
