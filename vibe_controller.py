@@ -121,9 +121,26 @@ def run_librarian_review(task, worker_summary):
     
     return {"status": "REJECTED", "reason": llm_response.get("reason", "Unknown")}
 
+    return {"status": "REJECTED", "reason": llm_response.get("reason", "Unknown")}
+
+def prioritize_tasks(tasks):
+    """
+    Sorts tasks by Priority (Descending) then ID (Ascending).
+    Default priority is 5.
+    """
+    return sorted(tasks, key=lambda x: (-x.get('priority', 5), x['id']))
+
 def main_loop():
-    # Mock Task
-    task = {"id": 101, "domain": "medicine", "lane": "backend", "goal": "Fix logs"}
+    # Mock Task Queue
+    raw_tasks = [
+        {"id": 101, "priority": 3, "domain": "medicine", "lane": "backend", "goal": "Fix logs"},
+        {"id": 102, "priority": 9, "domain": "medicine", "lane": "backend", "goal": "Critical Security Patch"},
+    ]
+    
+    # Priority Sort
+    queue = prioritize_tasks(raw_tasks)
+    task = queue[0]
+    print(f" >> [Controller] Picked Top Task #{task['id']} (Priority: {task.get('priority')})")
     
     # 1. Inject
     rules, error = inject_domain_and_lane_rules(task, task["domain"], task["lane"])
