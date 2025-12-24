@@ -152,6 +152,49 @@ def prioritize_tasks(tasks):
     """
     return sorted(tasks, key=lambda x: (-x.get('priority', 5), x['id']))
 
+# --- V5.6: SCHEDULER TOOLS (The Architect's Phase 4) ---
+
+def cancel_task(task_id: int) -> str:
+    """
+    V5.6 Tool: Zombie Killer.
+    Cancels an obsolete task to prevent it from running.
+    """
+    try:
+        # In production: db.update_task_status(task_id, "cancelled")
+        print(f" >> [CANCEL] Task #{task_id} marked as CANCELLED.")
+        
+        # Audit Log
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open("AUDIT.log", "a") as f:
+            f.write(f"[{timestamp}] [CANCELLED] Task #{task_id} killed by Architect.\n")
+        
+        return f"Success: Task #{task_id} cancelled."
+    except Exception as e:
+        return f"Error cancelling task: {str(e)}"
+
+def reorder_tasks(task_id_list: list) -> str:
+    """
+    V5.6 Tool: Priority Shuffle.
+    Accepts a list of IDs in desired order of execution.
+    Assigns Priority 10 to the first, 9 to the second, etc.
+    """
+    try:
+        priority_score = 10
+        for tid in task_id_list:
+            # In production: db.update_task_priority(tid, priority=priority_score)
+            print(f" >> [REORDER] Task #{tid} promoted to Priority {priority_score}")
+            priority_score = max(1, priority_score - 1)
+        
+        # Audit Log
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"Reordered {len(task_id_list)} tasks per Architect instruction."
+        with open("AUDIT.log", "a") as f:
+            f.write(f"[{timestamp}] [REORDER] {log_message}\n")
+        
+        return "Success: Queue reordered."
+    except Exception as e:
+        return f"Error reordering tasks: {str(e)}"
+
 # --- V5.4: BLUEPRINT PARSING (The Scribe) ---
 PARSER_LOG = "PARSER_AUDIT.log"
 
