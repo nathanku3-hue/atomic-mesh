@@ -154,46 +154,68 @@ def prioritize_tasks(tasks):
 
 # --- V5.6: SCHEDULER TOOLS (The Architect's Phase 4) ---
 
-def cancel_task(task_id: int) -> str:
+def cancel_task(task_id: int, reason: str = "Obsolete") -> dict:
     """
-    V5.6 Tool: Zombie Killer.
+    V5.6.1 Tool: Zombie Killer.
     Cancels an obsolete task to prevent it from running.
+    Returns structured result for user feedback.
     """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         # In production: db.update_task_status(task_id, "cancelled")
-        print(f" >> [CANCEL] Task #{task_id} marked as CANCELLED.")
         
-        # Audit Log
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Structured Feedback (#2)
+        result = {
+            "action": "CANCEL",
+            "task_id": task_id,
+            "status": "SUCCESS",
+            "reason": reason,
+            "timestamp": timestamp
+        }
+        print(f" >> [CANCEL] Task #{task_id} marked as CANCELLED. Reason: {reason}")
+        
+        # Enhanced Audit Log (#1)
         with open("AUDIT.log", "a") as f:
-            f.write(f"[{timestamp}] [CANCELLED] Task #{task_id} killed by Architect.\n")
+            f.write(f"[{timestamp}] [CANCELLED] Task #{task_id} | Reason: {reason} | By: Architect\n")
         
-        return f"Success: Task #{task_id} cancelled."
+        return result
     except Exception as e:
-        return f"Error cancelling task: {str(e)}"
+        return {"action": "CANCEL", "task_id": task_id, "status": "FAILED", "error": str(e)}
 
-def reorder_tasks(task_id_list: list) -> str:
+def reorder_tasks(task_id_list: list, interference_reason: str = "User Interference") -> dict:
     """
-    V5.6 Tool: Priority Shuffle.
+    V5.6.1 Tool: Priority Shuffle.
     Accepts a list of IDs in desired order of execution.
-    Assigns Priority 10 to the first, 9 to the second, etc.
+    Returns structured result for user feedback.
     """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
+        priority_map = {}
         priority_score = 10
         for tid in task_id_list:
             # In production: db.update_task_priority(tid, priority=priority_score)
-            print(f" >> [REORDER] Task #{tid} promoted to Priority {priority_score}")
+            priority_map[tid] = priority_score
+            print(f" >> [REORDER] Task #{tid} -> Priority {priority_score}")
             priority_score = max(1, priority_score - 1)
         
-        # Audit Log
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message = f"Reordered {len(task_id_list)} tasks per Architect instruction."
-        with open("AUDIT.log", "a") as f:
-            f.write(f"[{timestamp}] [REORDER] {log_message}\n")
+        # Structured Feedback (#2)
+        result = {
+            "action": "REORDER",
+            "status": "SUCCESS",
+            "task_count": len(task_id_list),
+            "priority_map": priority_map,
+            "reason": interference_reason,
+            "timestamp": timestamp
+        }
         
-        return "Success: Queue reordered."
+        # Enhanced Audit Log (#1)
+        with open("AUDIT.log", "a") as f:
+            f.write(f"[{timestamp}] [REORDER] {len(task_id_list)} tasks | Reason: {interference_reason} | Order: {task_id_list}\n")
+        
+        return result
     except Exception as e:
-        return f"Error reordering tasks: {str(e)}"
+        return {"action": "REORDER", "status": "FAILED", "error": str(e)}
+
 
 # --- V5.4: BLUEPRINT PARSING (The Scribe) ---
 PARSER_LOG = "PARSER_AUDIT.log"
