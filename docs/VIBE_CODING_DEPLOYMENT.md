@@ -14,7 +14,8 @@
 | Artifact | Location | Status | Purpose |
 |----------|----------|--------|---------|
 | **Architect SOP** | `library/prompts/architect_sop.md` | ✅ Reference | Brain system prompt with supervision gate |
-| **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Worker prompt with quality veto + examples |
+| **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Code quality guardian with veto power |
+| **Frontend Worker SOP** | `library/prompts/frontend_worker_sop.md` | ✅ Reference | UX guardian with performance targets |
 | **Brain SOP** | `library/prompts/brain_sop.md` | ✅ Complete | Orchestrator monitoring guide (v24.2) |
 | **Worker SOP** | `library/prompts/worker.md` | ✅ Complete | Worker execution guide (v24.1) |
 | **Schema Migration** | `migrations/v24_1_schema_migration.sql` | ✅ Idempotent | Database setup with verification |
