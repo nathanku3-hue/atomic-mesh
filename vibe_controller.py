@@ -1,23 +1,27 @@
 """
-Vibe Controller V3.4 Final Master
+Vibe Controller V4.0 Uranium Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
-Architecture: HYBRID DELEGATION + INTELLIGENT ROUTING
+Architecture: HYBRID DELEGATION + PROMPT COMPILER
 - Architect can assign specific workers OR use "auto" for load balancing
 - Worker tiers (senior/standard) match task complexity
-- Specialist workers (security/ux/data) for domain expertise
+- Skill packs (skills/*.md) auto-injected into task context
+
+Features V4.0:
+- Prompt Compiler: expand_task_context() injects lane skill packs
+- AGENTS.md: Global constitution for all workers
+- LESSONS_LEARNED.md: Auto-appended anti-regression lessons
+- Skill Packs: frontend, backend, security, ux, data, qa, _default
+- MAX_SKILL_CHARS: Truncation for large skill packs
 
 Features V3.4:
 - Specialist Workers: @security-1, @ux-designer, @data-analyst
 - DLQ Escalation: Auto-escalate dead letters after 24h
-- ChatOps Ready: Flask endpoint for Slack/Discord commands
-- Dashboard Ready: Streamlit metrics and Kanban view
 
 Features V3.3:
 - In-Memory Worker Cache: 10s TTL, invalidation on writes
 - Weighted Scoring Router: Multi-factor task-worker matching
-- Task History Archival: 7-day cleanup, archive table
 - Auto-Scaler Hook: Virtual worker provisioning
 
 Features V3.2:
@@ -68,6 +72,11 @@ METRICS_INTERVAL = 60  # Collect metrics every minute
 CACHE_TTL = int(os.getenv("CACHE_TTL", "10"))  # seconds
 HISTORY_ARCHIVE_DAYS = int(os.getenv("HISTORY_ARCHIVE_DAYS", "7"))
 MAX_AUTO_SCALE_WORKERS = int(os.getenv("MAX_AUTO_SCALE_WORKERS", "5"))
+
+# V4.0: Prompt Compiler Config
+SKILLS_DIR = os.getenv("SKILLS_DIR", "skills")
+MAX_SKILL_CHARS = int(os.getenv("MAX_SKILL_CHARS", "2000"))  # Truncate large skills
+LESSONS_FILE = os.getenv("LESSONS_FILE", "LESSONS_LEARNED.md")
 
 # --- State Management ---
 running = True
@@ -505,6 +514,11 @@ def route_pending_tasks(conn: sqlite3.Connection) -> int:
             task_id = task['id']
             lane = task['lane']
             
+            # V4.0: Compile task context (inject skill pack) BEFORE routing
+            full_task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if full_task:
+                expand_task_context(conn, dict(full_task))
+            
             worker = get_best_worker_for_lane(conn, lane)
             if worker:
                 print(f"🔀 [Auto-Router] Assigning Task #{task_id} ({lane}) -> {worker}")
@@ -692,6 +706,84 @@ def escalate_dead_letters(conn: sqlite3.Connection) -> int:
     except sqlite3.Error as e:
         print(f"⚠️ [DLQ Escalation] DB Error: {e}")
         return 0
+
+
+# --- V4.0: Prompt Compiler ---
+def expand_task_context(conn: sqlite3.Connection, task: Dict) -> bool:
+    """
+    V4.0 Prompt Compiler: Inject lane skill pack into task context.
+    Called BEFORE assigning worker to ensure they see the checklist.
+    
+    Returns: True if expanded, False if no skill pack found
+    """
+    lane = task.get('lane', '')
+    task_id = task.get('id')
+    
+    # Determine skill file path
+    skill_file = os.path.join(SKILLS_DIR, f"{lane}.md")
+    if not os.path.exists(skill_file):
+        # Try fallback
+        skill_file = os.path.join(SKILLS_DIR, "_default.md")
+        if not os.path.exists(skill_file):
+            print(f"⚠️ [Compiler] No skill pack for lane '{lane}', proceeding without")
+            return False
+    
+    try:
+        # Read skill pack
+        with open(skill_file, 'r', encoding='utf-8') as f:
+            skills = f.read()
+        
+        # Truncate if too large
+        if len(skills) > MAX_SKILL_CHARS:
+            skills = skills[:MAX_SKILL_CHARS] + "\n...[truncated]..."
+            print(f"⚠️ [Compiler] Skill pack truncated to {MAX_SKILL_CHARS} chars")
+        
+        # Append to goal (worker CANNOT miss it)
+        current_goal = task.get('goal', '')
+        compiled_goal = f"{current_goal}\n\n--- {lane.upper()} SKILLS ({os.path.basename(skill_file)}) ---\n{skills}"
+        
+        # Update context_files
+        ctx = json.loads(task.get('context_files') or '[]')
+        if skill_file not in ctx:
+            ctx.append(skill_file)
+        
+        # Update task
+        conn.execute("""
+            UPDATE tasks SET goal = ?, context_files = ?, updated_at = ?
+            WHERE id = ?
+        """, (compiled_goal, json.dumps(ctx), int(time.time()), task_id))
+        conn.commit()
+        
+        print(f"📚 [Compiler] Injected skill pack for task #{task_id} (lane: {lane})")
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ [Compiler] Error reading skill pack: {e}")
+        return False
+
+
+def append_lesson_learned(lesson: str, category: str = "General") -> bool:
+    """
+    V4.0: Auto-append to LESSONS_LEARNED.md on task rejection.
+    Called by QA workers when they find systematic issues.
+    """
+    try:
+        if not os.path.exists(LESSONS_FILE):
+            print(f"⚠️ [Lessons] File not found: {LESSONS_FILE}")
+            return False
+        
+        timestamp = time.strftime("%Y-%m-%d")
+        entry = f"- **[{timestamp}] {category}:** {lesson}\n"
+        
+        with open(LESSONS_FILE, 'a', encoding='utf-8') as f:
+            f.write(entry)
+        
+        print(f"📝 [Lessons] Added: {lesson[:50]}...")
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ [Lessons] Error appending: {e}")
+        return False
 
 # --- V3.3: Auto-Scaler Hook ---
 _auto_scale_counter = 0  # Unique ID counter
