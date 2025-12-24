@@ -49,7 +49,27 @@ The system now proactively blocks:
 
 ---
 
+## 🧹 The "Clean Hands" Protocol (Librarian V5.2)
+**Why?** Workers are "dirty" (context pollution). Librarians are "clean" (fresh context).
+**The Rule:**
+1.  **Worker:** You DO NOT commit. You only `git add` and request review.
+2.  **Librarian:** You review `git diff --staged`.
+    *   **Traceability:** Commit messages MUST end with `(Ref: #123)`.
+    *   **Security:** If you see secrets, REJECT immediately.
+    *   **Rejection:** If rejected, QUOTE the code.
+
+---
+
+## 🔄 Self-Healing Systems (Controller V5.2)
+**The Loop:**
+1.  If Librarian rejects a task, the **Reason** is fed back to the Worker.
+2.  **Worker Job:** Read the rejection, fix the specific quoted error, and resubmit.
+3.  **Audit:** All decisions are logged in `AUDIT.log`.
+
+---
+
 ## Summary for Success
-1.  **Architects:** Check lessons first. Flag security risks.
-2.  **Workers:** Pre-flight check every single time.
-3.  **Everyone:** Trust the guardrails, but verify the output.
+1.  **Architects:** Check lessons first. Flag security risks. Gatekeeper of Domains.
+2.  **Workers:** Pre-flight check. Trust the Feedback Loop.
+3.  **Librarians:** Trust only the Diff. Enforce Traceability.
+4.  **Everyone:** Trust the guardrails, but verify the output.

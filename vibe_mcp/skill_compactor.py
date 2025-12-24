@@ -69,6 +69,33 @@ def get_lane_rules(lane: str, max_bullets: int = 12) -> dict:
     return result
 
 
+def get_domain_rules(domain: str) -> dict:
+    """
+    MCP Tool: Get V5.0 Domain Rules (Law/Medicine).
+    
+    Args:
+        domain: The domain (e.g., 'law', 'medicine')
+        
+    Returns:
+        {"domain": str, "rules": [], "content": str}
+    """
+    domain_file = os.path.join("skills/domains", f"{domain}.md")
+    if not os.path.exists(domain_file):
+        return {"domain": domain, "error": "Domain file not found"}
+        
+    with open(domain_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+        
+    # Parse Rules
+    rules = re.findall(r'\[([A-Z]+-\d+)\]', content)
+    
+    return {
+        "domain": domain, 
+        "rules": rules,
+        "content": content[:500] + "..." if len(content) > 500 else content
+    }
+
+
 def get_relevant_lessons(keywords: list, limit: int = 5) -> dict:
     """
     MCP Tool: Get lessons matching keywords.

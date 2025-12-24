@@ -24,6 +24,9 @@
 
 ## System Initialization
 
+[2025-12-24] #V5.2 - Deployed Traceability & Self-Healing (Files: vibe_controller.py, librarian_sop.md, tests/test_v52_traceability.py)
+[2025-12-24] #V5.1 - Deployed Gatekeeper Protocols (Files: vibe_controller.py, architect_sop.md, AGENTS.md)
+[2025-12-24] #V5.0 - Deployed Wittgenstein Dispatcher (Files: vibe_controller.py, skills/domains/law.md, skills/domains/medicine.md)
 [2024-12-24] #0 - Initialized Vibe Coding System V2.0 (Files: vibe_controller.py, v25_schema.sql)
 
 ---

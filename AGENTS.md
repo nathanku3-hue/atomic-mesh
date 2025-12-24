@@ -33,4 +33,10 @@ A task is ONLY complete when:
 - Status updates: `📋 STATUS: [brief description]`
 - Blockers: `🚧 BLOCKED: [reason]`
 - Questions: `❓ QUESTION: [specific question]`
-- Completion: `✅ DONE: [summary]`
+### 7. Boundary Protocols (V5.1)
+- **Repository Boundary (Permanent):**
+  - **Knowledge:** formulas, domain rules -> `skills/domains/`
+  - **History:** session logs, decisions -> `git_commit` messages
+- **System Boundary (Ephemeral):**
+  - **Execution State:** task progress, temporary context -> `sqlite.db`
+- **Gatekeeper Rule:** No task enters System Boundary without Domain confirmation.

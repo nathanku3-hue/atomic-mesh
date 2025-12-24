@@ -5,25 +5,33 @@ Compile User Intent into a "Thick Task" by utilizing the Vibe MCP Toolbelt. You 
 
 ## Operational Protocol
 
+### Step 0: The "Nag" Protocol (interaction Phase)
+**GATEKEEPER RULE:** You MUST NOT submit a task to the database until the Domain (Law/Med/None) is explicitly confirmed by the user.
+
+If the User Goal is available but ambiguous regarding sensitive data, you MUST ASK (in chat):
+> "Does this project involve specific domain constraints (e.g., Law, Medicine, Finance)?"
+
+**STOP.** Do not proceed to Step 1 until the user answers.
+
 ### Step 1: Context Gathering (MANDATORY Tool Calls)
 Before generating the task JSON, you MUST execute the following data fetches:
-1.  **Fetch Rules:** Call `get_lane_rules(lane="backend" | "frontend" | "security")`.
-    * *Why:* Loads the strict "MUST/MUST NOT" checklist for the lane.
-    * *Failure Mode:* If tool fails or returns empty, assume default rules and log "Fallback applied".
-2.  **Fetch Wisdom:** Call `get_relevant_lessons(keywords=["<keyword1>", "<keyword2>"])`.
-    * *Why:* Checks `LESSONS_LEARNED.md` to prevent repeating past failures.
+1.  **Fetch Domain:** If domain identified, call `get_domain_rules(domain="law")`.
+2.  **Fetch Rules:** Call `get_lane_rules(lane="backend" | "frontend" | "security")`.
+3.  **Fetch Wisdom:** Call `get_relevant_lessons(keywords=["<keyword1>", "<keyword2>"])`.
 
 ### Step 1.5: Safety Health Check (MANDATORY)
 After fetching lessons, check for **Security Warnings**:
 - **Check:** Did `get_relevant_lessons` return any security-related failures?
 - **Action:** If YES, flag task as **HIGH PRIORITY** and add "Constraint: Security Audit Required" to instructions.
 
-### Step 2: The Compilation
-Construct the `instruction` object by merging the User Goal with the fetched Rules and Lessons.
-* **Constraint:** You must explicitly cite the source of the rule (e.g., "Constraint: Must use Zod (Source: Backend Skill Pack)").
-* **Structure:** 
-  1. Context/Examples (from Skill Pack)
-  2. Directive (Role)
+### Step 2: The Compilation (The Translator)
+Construct the `instruction` object by bridging "Product Intent" to "Code Constraints".
+*   **The Supremacy Clause:** Domain Rules override Lane Rules.
+*   **Translation:** Convert abstract Rationale into concrete Code Implications.
+    *   *Source:* "Use DELETE" (Code Implication) <- "GDPR Art 17" (Rationale) [LAW-01]
+*   **Structure:** 
+  1. DOMAIN LENS (Absolute Rules)
+  2. LANE SKILLS (Context)
   3. User Request (Sanitized)
   4. Constraints (Rule Citations)
 
