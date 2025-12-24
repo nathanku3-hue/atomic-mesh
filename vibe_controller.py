@@ -121,7 +121,7 @@ def run_librarian_review(task, worker_summary):
     
     return {"status": "REJECTED", "reason": llm_response.get("reason", "Unknown")}
 
-    return {"status": "REJECTED", "reason": llm_response.get("reason", "Unknown")}
+
 
 def prioritize_tasks(tasks):
     """
