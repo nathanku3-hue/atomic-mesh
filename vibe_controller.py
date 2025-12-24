@@ -709,8 +709,9 @@ def escalate_dead_letters(conn: sqlite3.Connection) -> int:
 
 
 # --- V4.0: Prompt Compiler ---
-# Prompt Injection Guardrail Patterns
+# V4.1: Enhanced Guardrail Patterns
 INJECTION_PATTERNS = [
+    # Prompt injection
     "ignore previous instructions",
     "disregard all prior",
     "forget everything",
@@ -719,18 +720,55 @@ INJECTION_PATTERNS = [
     "new instructions:",
 ]
 
+# V4.1: Sensitive Data Patterns (credentials, secrets)
+SENSITIVE_DATA_PATTERNS = [
+    (r"api[_-]?key\s*[=:]\s*['\"][a-zA-Z0-9]{16,}['\"]", "[API_KEY_REDACTED]"),
+    (r"password\s*[=:]\s*['\"][^'\"]+['\"]", "[PASSWORD_REDACTED]"),
+    (r"secret\s*[=:]\s*['\"][^'\"]+['\"]", "[SECRET_REDACTED]"),
+    (r"token\s*[=:]\s*['\"][a-zA-Z0-9_\-\.]+['\"]", "[TOKEN_REDACTED]"),
+    (r"sk-[a-zA-Z0-9]{32,}", "[OPENAI_KEY_REDACTED]"),
+    (r"ghp_[a-zA-Z0-9]{36}", "[GITHUB_TOKEN_REDACTED]"),
+    (r"xox[baprs]-[a-zA-Z0-9\-]+", "[SLACK_TOKEN_REDACTED]"),
+]
+
+# V4.1: Code Injection Patterns (SQL, XSS)
+CODE_INJECTION_PATTERNS = [
+    (r";\s*DROP\s+TABLE", "[SQL_INJECTION_BLOCKED]"),
+    (r";\s*DELETE\s+FROM", "[SQL_INJECTION_BLOCKED]"),
+    (r"<script[^>]*>", "[XSS_BLOCKED]"),
+    (r"javascript:", "[XSS_BLOCKED]"),
+    (r"on\w+\s*=\s*['\"]", "[XSS_BLOCKED]"),
+]
+
+import re  # For regex patterns
+
 
 def sanitize_user_content(content: str) -> str:
     """
-    V4.0 Guardrail: Sanitize user content to prevent prompt injection.
-    Removes or flags potential injection attempts.
+    V4.1 Guardrail: Sanitize user content to prevent:
+    1. Prompt injection attacks
+    2. Sensitive data leaks (API keys, passwords)
+    3. Code injection (SQL, XSS)
     """
+    # 1. Prompt injection (case-insensitive string match)
     lower_content = content.lower()
     for pattern in INJECTION_PATTERNS:
         if pattern in lower_content:
-            print(f"⚠️ [Guardrail] Potential injection detected: '{pattern[:20]}...'")
-            # Replace the pattern with a warning
-            content = content.replace(pattern, "[FILTERED]")
+            print(f"⚠️ [Guardrail] Prompt injection blocked: '{pattern[:20]}...'")
+            content = re.sub(re.escape(pattern), "[FILTERED]", content, flags=re.IGNORECASE)
+    
+    # 2. Sensitive data redaction (regex)
+    for pattern, replacement in SENSITIVE_DATA_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            print(f"⚠️ [Guardrail] Sensitive data redacted: {replacement}")
+            content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+    
+    # 3. Code injection blocking (regex)
+    for pattern, replacement in CODE_INJECTION_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            print(f"⚠️ [Guardrail] Code injection blocked: {replacement}")
+            content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+    
     return content
 
 
