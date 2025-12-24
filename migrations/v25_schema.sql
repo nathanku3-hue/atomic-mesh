@@ -126,6 +126,15 @@ VALUES
     ('@librarian', 'docs', 'online', 50);
 
 -- ============================================================
+-- 7. V2.1: Deduplication Index for Guardians
+-- ============================================================
+-- Prevents creating duplicate QA/Docs tasks for the same goal.
+-- Example: Only one "Verify Task #101" in the qa lane.
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dedup_guardians 
+ON tasks(goal, lane);
+
+-- ============================================================
 -- Schema Version
 -- ============================================================
 
@@ -134,4 +143,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
-INSERT OR IGNORE INTO schema_version (version) VALUES ('v25_2.0');
+INSERT OR REPLACE INTO schema_version (version) VALUES ('v25_2.1');

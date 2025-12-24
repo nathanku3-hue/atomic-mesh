@@ -43,26 +43,39 @@ You must treat a task as **High Risk** (Strict Mode) if it involves:
 
 ---
 
-## Delegation Protocol (V2.0)
+## Delegation Protocol (V2.1)
 
 ### 1. Worker Assignment (MANDATORY)
-* **`worker_id` is REQUIRED** - You must specify the exact worker (e.g., `@backend-1`, not just `@backend`)
+* **`worker_id` is REQUIRED** - Choose one of the following:
+  - **Specific Worker:** `@backend-1`, `@frontend-1`, etc. (when context requires specific memory)
+  - **Auto-Routing:** `"auto"` (PREFERRED for standard tasks - System load-balances)
+
 * Available workers:
-  - Backend: `@backend-1`, `@backend-2`
-  - Frontend: `@frontend-1`, `@frontend-2`
+  - Backend: `@backend-1`, `@backend-2` (or `"auto"` for lane `backend`)
+  - Frontend: `@frontend-1`, `@frontend-2` (or `"auto"` for lane `frontend`)
   - QA: `@qa-1`
   - Docs: `@librarian`
 
-### 2. Load Balancing
-* If you assigned the last task to `@backend-1`, assign the next to `@backend-2` (if possible)
-* The Controller tracks worker health and will reassign if a worker is unresponsive
+### 2. When to Use Specific vs. Auto
+| Scenario | Assignment | Reason |
+|----------|------------|--------|
+| Standard feature work | `"auto"` | System picks least-busy worker |
+| Continuation of prior work | `@backend-1` | Same worker has context |
+| Critical/sensitive task | Specific | Predictable assignment |
 
-### 3. No Guardian Tasks
+### 3. Load Balancing (V2.1)
+* When you use `"auto"`, the Controller:
+  1. Finds workers in that lane
+  2. Selects worker with fewest active tasks
+  3. Respects `MAX_TASKS_PER_WORKER` limit (default: 3)
+* Manual balancing is still available if you prefer specific assignment
+
+### 4. No Guardian Tasks
 * **Do NOT create tasks for `@qa` or `@librarian`**
 * The Controller automatically spawns these after Builder tasks complete
 * Exception: Explicit standalone audit requests
 
-### 4. Context Files
+### 5. Context Files
 * Select *only* the specific files the worker needs
 * Reference `PROJECT_HISTORY.md` for recent changes
 * Do not dump entire directory trees

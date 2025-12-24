@@ -1,14 +1,19 @@
 """
-Vibe Controller V2.0 Platinum Master
+Vibe Controller V2.1 Platinum Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
-Architecture: PUSH (Direct Delegation)
-- Architect assigns tasks directly to specific workers (@backend-1, etc.)
-- Controller tracks assignments and enforces deadlines
-- Fallback system reassigns unresponsive workers
+Architecture: HYBRID DELEGATION
+- Architect can assign specific workers (@backend-1) OR use "auto" for load balancing
+- Controller acts as Auto-Router for "auto" assignments
+- Health-based routing prevents overloading workers
 
-Features:
+Features V2.1:
+- Auto-Routing: worker_id="auto" → Controller assigns least-busy worker
+- Deduplication Guard: Prevents duplicate guardian tasks (QA/Docs)
+- Health-Based Routing: MAX_TASKS_PER_WORKER limit, route to free workers
+
+Features V2.0:
 - Direct delegation with assignment watchdog (5 min timeout)
 - Dynamic load balancing with worker priority scores
 - Worker health tracking (active_tasks, last_seen, status)
@@ -40,6 +45,7 @@ LEASE_TIMEOUT_SEC = int(os.getenv("LEASE_TIMEOUT_SEC", "600"))
 BLOCKED_TIMEOUT_SEC = int(os.getenv("BLOCKED_TIMEOUT_SEC", "86400"))  # 24 hours
 ASSIGNMENT_TIMEOUT_SEC = int(os.getenv("ASSIGNMENT_TIMEOUT_SEC", "300"))  # 5 minutes
 IDLE_TIMEOUT_SEC = int(os.getenv("IDLE_TIMEOUT_SEC", "600"))  # 10 minutes
+MAX_TASKS_PER_WORKER = int(os.getenv("MAX_TASKS_PER_WORKER", "3"))  # V2.1: Load limit
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES = 3
@@ -337,6 +343,136 @@ def enforce_assignments(conn: sqlite3.Connection) -> int:
         traceback.print_exc()
     
     return reassigned
+
+
+# --- V2.1: Auto-Router (Hybrid Delegation) ---
+def get_best_worker_for_lane(conn: sqlite3.Connection, lane: str) -> Optional[str]:
+    """
+    V2.1 Auto-Router: Find least-loaded worker in the lane.
+    Used when Architect sets worker_id='auto'.
+    
+    Selection criteria:
+    1. status='online' (not offline)
+    2. active_tasks < MAX_TASKS_PER_WORKER
+    3. Order by: active_tasks ASC, last_seen DESC
+    """
+    try:
+        # Bootstrap default workers if missing (first run)
+        defaults = {
+            'backend': ['@backend-1', '@backend-2'],
+            'frontend': ['@frontend-1', '@frontend-2'],
+            'qa': ['@qa-1'],
+            'docs': ['@librarian']
+        }
+        for w in defaults.get(lane, []):
+            conn.execute("""
+                INSERT OR IGNORE INTO worker_health (worker_id, lane, last_seen, status)
+                VALUES (?, ?, ?, 'online')
+            """, (w, lane, int(time.time())))
+        
+        # Query for best candidate
+        row = conn.execute("""
+            SELECT worker_id FROM worker_health 
+            WHERE lane = ? AND status = 'online' AND active_tasks < ?
+            ORDER BY active_tasks ASC, last_seen DESC
+            LIMIT 1
+        """, (lane, MAX_TASKS_PER_WORKER)).fetchone()
+        
+        if row:
+            return row['worker_id']
+        
+        # All workers at capacity - log warning
+        print(f"⚠️ [Auto-Router] All {lane} workers at capacity ({MAX_TASKS_PER_WORKER} tasks). Waiting...")
+        return None
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Auto-Router] DB Error: {e}")
+        return None
+
+
+def route_pending_tasks(conn: sqlite3.Connection) -> int:
+    """
+    V2.1 Auto-Router: Assign workers to tasks with worker_id='auto'.
+    Scans pending tasks and assigns using get_best_worker_for_lane().
+    """
+    routed = 0
+    try:
+        # Find tasks needing routing
+        pending = conn.execute("""
+            SELECT id, lane FROM tasks 
+            WHERE worker_id = 'auto' AND status = 'pending'
+            LIMIT 20
+        """).fetchall()
+        
+        for task in pending:
+            task_id = task['id']
+            lane = task['lane']
+            
+            worker = get_best_worker_for_lane(conn, lane)
+            if worker:
+                print(f"🔀 [Auto-Router] Assigning Task #{task_id} ({lane}) -> {worker}")
+                
+                # Update task assignment
+                conn.execute("""
+                    UPDATE tasks SET worker_id = ?, updated_at = ? WHERE id = ?
+                """, (worker, int(time.time()), task_id))
+                
+                # Increment worker's active tasks
+                conn.execute("""
+                    UPDATE worker_health SET active_tasks = active_tasks + 1 WHERE worker_id = ?
+                """, (worker,))
+                
+                log_status(conn, task_id, "auto_routed", worker, f"Auto-assigned from 'auto'")
+                routed += 1
+        
+        if routed > 0:
+            conn.commit()
+            
+    except sqlite3.Error as e:
+        print(f"⚠️ [Auto-Router] DB Error: {e}")
+        traceback.print_exc()
+    
+    return routed
+
+
+# --- V2.1: Deduplication Guard ---
+def spawn_guardian(conn: sqlite3.Connection, worker_id: str, lane: str, goal: str, 
+                   context_files: str, dependencies: List[int]) -> Optional[int]:
+    """
+    V2.1 Deduplication Guard: Spawn guardian task with idempotency check.
+    Prevents duplicate QA/Docs tasks for the same goal.
+    
+    Returns: task_id if created, None if duplicate skipped
+    """
+    try:
+        # Check if guardian already exists (deduplication)
+        existing = conn.execute("""
+            SELECT id FROM tasks WHERE goal = ? AND lane = ?
+        """, (goal, lane)).fetchone()
+        
+        if existing:
+            print(f"🛑 [Deduplication] Guardian task '{goal}' ({lane}) already exists (#{existing['id']}). Skipping.")
+            return None
+        
+        # Insert new guardian task
+        cursor = conn.execute("""
+            INSERT INTO tasks (worker_id, lane, goal, context_files, dependencies, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (worker_id, lane, goal, context_files, json.dumps(dependencies)))
+        
+        task_id = cursor.lastrowid
+        print(f"🚀 [Guardian] Spawned {lane} task #{task_id}: {goal}")
+        log_status(conn, task_id, "spawned", worker_id, f"Guardian for deps: {dependencies}")
+        
+        return task_id
+        
+    except sqlite3.IntegrityError:
+        # Unique constraint violation (race condition)
+        print(f"🛑 [Deduplication] Guardian task '{goal}' ({lane}) blocked by unique constraint.")
+        return None
+    except sqlite3.Error as e:
+        print(f"⚠️ [Guardian] DB Error: {e}")
+        return None
 
 
 # --- Core Logic ---
@@ -707,13 +843,14 @@ def write_health_status():
 
 # --- Main Loop ---
 def run_controller():
-    """Main controller loop (V2.0 - Push Architecture)."""
-    print(f"🧠 [System] Vibe Controller V2.0 Active (Platinum: Push Delegation)")
-    print(f"   Architecture: PUSH (Direct Assignment to Workers)")
+    """Main controller loop (V2.1 - Hybrid Delegation)."""
+    print(f"🧠 [System] Vibe Controller V2.1 Active (Platinum: Hybrid Delegation)")
+    print(f"   Architecture: HYBRID (Direct + Auto-Routing)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE}")
     print(f"   Assignment Timeout: {ASSIGNMENT_TIMEOUT_SEC}s | Idle Timeout: {IDLE_TIMEOUT_SEC}s")
-    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s | Max Retries: {MAX_RETRIES}")
-    print(f"   Notification: Console-only (Slack disabled)")
+    print(f"   Max Tasks/Worker: {MAX_TASKS_PER_WORKER} | Max Retries: {MAX_RETRIES}")
+    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s")
+    print(f"   Features: Auto-Router, Deduplication Guard, Health-Based Routing")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
     conn = get_db()
@@ -727,6 +864,9 @@ def run_controller():
     try:
         while running:
             start_time = time.time()
+            
+            # V2.1: Auto-Router (assign workers to 'auto' tasks)
+            route_pending_tasks(conn)
             
             # V2.0: Assignment Watchdog (detect ignored tasks, reassign)
             enforce_assignments(conn)
