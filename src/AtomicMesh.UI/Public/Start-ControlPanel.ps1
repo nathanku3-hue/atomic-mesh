@@ -286,10 +286,10 @@ function Invoke-DataRefreshTick {
     # Check if force refresh is requested (e.g., after /init)
     $forceRefresh = $State.ForceDataRefresh
     if ($forceRefresh) {
-        $State.ForceDataRefresh = $false  # Reset flag immediately
+        $State.ForceDataRefresh = $false
     }
 
-    # Apply a minimum backoff when the last refresh failed to avoid hammering the backend
+    # Apply backoff on errors
     $errorBackoffMs = 500
     $effectiveIntervalMs = $DataIntervalMs
     if ($State.LastAdapterError) {
@@ -300,11 +300,11 @@ function Invoke-DataRefreshTick {
         return $State.Cache.LastSnapshot
     }
 
+    # v23.1: Simple synchronous refresh (reliable, longer interval for responsiveness)
     try {
         $raw = & $SnapshotLoader $RepoRoot
         $signature = Get-SnapshotSignature -RawSnapshot $raw
 
-        # If nothing meaningful changed, skip replacing the snapshot but clear any stale errors.
         if ($signature -and $State.Cache.LastRawSignature -eq $signature) {
             $State.Cache.LastSnapshot.AdapterError = ""
             $State.LastAdapterError = ""
@@ -316,10 +316,9 @@ function Invoke-DataRefreshTick {
         $snapshot = Convert-RawSnapshotToUi -Raw $raw
         $snapshot.AdapterError = ""
 
-        # Check if snapshot meaningfully changed
         $newHash = Get-SnapshotHash -Snapshot $snapshot
         if ($newHash -ne $State.LastSnapshotHash) {
-            $State.MarkDirty("content")  # Data change = content redraw
+            $State.MarkDirty("content")
             $State.LastSnapshotHash = $newHash
         }
 
@@ -334,14 +333,16 @@ function Invoke-DataRefreshTick {
         $message = Normalize-AdapterError -Message $_.Exception.Message
         $newError = "Snapshot error: $message"
 
-        # Only mark dirty if error message changed
+        # Debug: log adapter errors to file
+        $adapterLog = Join-Path $State.Cache.Metadata["ProjectPath"] "logs\adapter_error.log"
+        "$(Get-Date -Format o) ADAPTER ERROR: $newError`n$($_ | Out-String)" | Out-File $adapterLog -Append -ErrorAction SilentlyContinue
+
         if ($newError -ne $State.LastAdapterError) {
             $State.Cache.LastSnapshot.AdapterError = $newError
             $State.LastAdapterError = $newError
-            $State.MarkDirty("content")  # Error display = content redraw
+            $State.MarkDirty("content")
         }
 
-        # Update the last refresh timestamp even on failure so we respect the backoff
         $State.LastDataRefreshUtc = $NowUtc
         return $State.Cache.LastSnapshot
     }
@@ -353,7 +354,7 @@ function Start-ControlPanel {
         [string]$ProjectPath = "",
         [string]$DbPath = "",
         [int]$RenderIntervalMs = 50,
-        [int]$DataIntervalMs = 500,
+        [int]$DataIntervalMs = 3000,  # v23.1: 3s interval keeps input responsive (sync refresh)
         [ScriptBlock]$SnapshotLoader,
         [switch]$Dev  # Explicit flag to enable dev hints (F5/F6) - never auto-enabled
     )
@@ -412,7 +413,20 @@ function Start-ControlPanel {
     Reset-CtrlCState  # Initialize Ctrl+C protection
     Reset-PickerState  # Initialize command picker state
 
+    # v23.1: Synchronous initial snapshot load to avoid "docs unavailable" flash
     $snapshot = [UiSnapshot]::new()
+    try {
+        $initialRaw = & $SnapshotLoader $projectPath
+        if ($initialRaw) {
+            $snapshot = Convert-RawSnapshotToUi -Raw $initialRaw
+            $state.LastDataRefreshUtc = [datetime]::UtcNow
+            # Set signature/hash to prevent duplicate refresh on first loop
+            $state.Cache.LastRawSignature = Get-SnapshotSignature -RawSnapshot $initialRaw
+            $state.LastSnapshotHash = Get-SnapshotHash -Snapshot $snapshot
+        }
+    } catch {
+        # Initial load failed - use empty snapshot, loop will retry
+    }
     $state.Cache.LastSnapshot = $snapshot
 
     $stopRequested = $false
@@ -514,6 +528,7 @@ function Start-ControlPanel {
                             $state.InputBuffer = $selected
                         }
                         Reset-PickerState
+                        $state.MarkDirty("picker")  # clear dropdown immediately after execution
                         $result = Invoke-CommandRouter -Command $state.InputBuffer -State $state -Snapshot $snapshot
                         $state.InputBuffer = ""
                         $inputChanged = $true
@@ -545,27 +560,34 @@ function Start-ControlPanel {
                 if ($state.OverlayMode -eq "History" -and [string]::IsNullOrEmpty($state.InputBuffer)) {
                     $rows = @()
                     try {
-                        $snap = $state.Cache.LastSnapshot
-                        if ($snap) {
-                            switch ($state.HistorySubview) {
-                                "TASKS" { if ($snap.HistoryTasks) { $rows = @($snap.HistoryTasks) } }
-                                "DOCS"  { if ($snap.HistoryDocs)  { $rows = @($snap.HistoryDocs) } }
-                                "SHIP"  { if ($snap.HistoryShip)  { $rows = @($snap.HistoryShip) } }
-                            }
-                        }
+                        $rows = Get-HistoryRows -State $state -Subview $state.HistorySubview
                     } catch {}
                     $maxIdx = [Math]::Max(0, $rows.Count - 1)
+                    $pageSize = 5
+                    try {
+                        $layoutNav = Get-PromptLayout -Width $state.LastWidth -Height $state.LastHeight
+                        $pageSize = [Math]::Max(1, [Math]::Min(10, $layoutNav.RowFooter - ($layoutNav.ContentStart + 4)))
+                    } catch {}
+                    if ($state.HistoryScrollOffset -gt $maxIdx) {
+                        $state.HistoryScrollOffset = [Math]::Max(0, $maxIdx - $pageSize + 1)
+                    }
                     if ($key.Key -eq [ConsoleKey]::UpArrow) {
                         if ($state.HistorySelectedRow -gt 0) {
                             $state.HistorySelectedRow--
-                            $state.MarkDirty("content")
+                            if ($state.HistorySelectedRow -lt $state.HistoryScrollOffset) {
+                                $state.HistoryScrollOffset = $state.HistorySelectedRow
+                            }
+                            $state.MarkDirty("history")
                         }
                         continue
                     }
                     if ($key.Key -eq [ConsoleKey]::DownArrow) {
                         if ($state.HistorySelectedRow -lt $maxIdx) {
                             $state.HistorySelectedRow++
-                            $state.MarkDirty("content")
+                            if ($state.HistorySelectedRow -ge ($state.HistoryScrollOffset + $pageSize)) {
+                                $state.HistoryScrollOffset = $state.HistorySelectedRow - $pageSize + 1
+                            }
+                            $state.MarkDirty("history")
                         }
                         continue
                     }
@@ -589,11 +611,11 @@ function Start-ControlPanel {
                         $state.InputBuffer = $state.InputBuffer.Substring(0, $state.InputBuffer.Length - 1)
                         $inputChanged = $true
                         $state.MarkDirty("input")  # Mark input dirty immediately
-                        # Update dropdown filter when backspacing
+                        # v23.1: Only mark picker dirty if command list actually changes (faster backspace)
                         if ($state.InputBuffer.StartsWith("/")) {
-                            Update-PickerFilter -Filter $state.InputBuffer.Substring(1)
-                            $state.MarkDirty("picker")
-                        } else {
+                            $pickerChanged = Update-PickerFilter -Filter $state.InputBuffer.Substring(1)
+                            if ($pickerChanged) { $state.MarkDirty("picker") }
+                        } elseif ($pickerState.IsActive) {
                             Reset-PickerState
                             $state.MarkDirty("picker")
                         }
@@ -767,6 +789,12 @@ function Start-ControlPanel {
 
             if ($state.IsDirty("ctrlc")) {
                 Render-CtrlCWarning -RowInput $rowInput -Width $width -Toast $state.Toast
+            }
+
+            if ($state.IsDirty("history")) {
+                if ($state.OverlayMode -eq "History") {
+                    Render-HistoryOverlay -State $state -StartRow $contentStartRow -BottomRow $footerRow
+                }
             }
 
             End-ConsoleFrame | Out-Null  # Flush partial render

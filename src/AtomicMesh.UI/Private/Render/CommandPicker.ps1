@@ -2,9 +2,15 @@
 # GOLDEN TRANSPLANT: Command Picker (lines 9639-9920)
 # Source: golden_control_panel_reference.ps1 commit 6990922
 # =============================================================================
+#
+# FRAME OWNERSHIP: Start-ControlPanel owns frame validity (Begin/End).
+# Picker functions assume a valid frame and must not call console APIs
+# outside a frame context. This keeps invariant ownership in one place.
+# =============================================================================
 
 # Command registry with descriptions (from golden Global:Commands)
 $script:CommandRegistry = @{
+    "init"        = @{ Desc = "Initialize new project [--force to re-scaffold]" }
     "help"        = @{ Desc = "Show available commands" }
     "plan"        = @{ Desc = "Switch to PLAN page" }
     "go"          = @{ Desc = "Start execution (switch to GO page)" }
@@ -25,8 +31,8 @@ function Get-PickerCommands {
     [OutputType([array])]
     param([string]$Filter = "")
 
-    # Priority order (from golden lines 1060-1071 + P7 simplify)
-    $priorityOrder = @("help", "draft-plan", "accept-plan", "plan", "go", "simplify", "ship", "status", "clear", "quit")
+    # Priority order (from golden lines 1060-1071 + P7 simplify + init)
+    $priorityOrder = @("help", "init", "draft-plan", "accept-plan", "plan", "go", "simplify", "ship", "status", "clear", "quit")
 
     $filter = $Filter.TrimStart("/").ToLower()
     [array]$results = @()
@@ -115,10 +121,19 @@ function Open-CommandPicker {
 function Update-PickerFilter {
     param([string]$Filter)
 
+    $oldCount = $script:PickerState.Commands.Count
     $script:PickerState.Filter = $Filter
-    $script:PickerState.SelectedIndex = 0
-    $script:PickerState.ScrollOffset = 0
-    $script:PickerState.Commands = Get-PickerCommands -Filter $Filter
+    $newCommands = Get-PickerCommands -Filter $Filter
+    $newCount = $newCommands.Count
+
+    # v23.1: Only update if command list changed (reduces picker redraws on backspace)
+    if ($newCount -ne $oldCount) {
+        $script:PickerState.SelectedIndex = 0
+        $script:PickerState.ScrollOffset = 0
+        $script:PickerState.Commands = $newCommands
+        return $true  # Changed
+    }
+    return $false  # No change
 }
 
 function Navigate-PickerUp {
@@ -243,26 +258,33 @@ function Render-PickerArea {
         [int]$Width
     )
 
-    $dropdownRow = $RowInput + 2  # Below input box bottom border
-    $pickerState = Get-PickerState
-    $newHeight = 0
+    # Picker failures are non-fatal - catch and mark for retry without affecting other regions
+    try {
+        $dropdownRow = $RowInput + 2  # Below input box bottom border
+        $pickerState = Get-PickerState
+        $newHeight = 0
 
-    if ($pickerState.IsActive) {
-        $newHeight = [Math]::Min($pickerState.Commands.Count, 5)  # MaxVisible = 5
-        if ($pickerState.Commands.Count -gt 5) { $newHeight++ }   # +1 for scroll hint
+        if ($pickerState.IsActive) {
+            $newHeight = [Math]::Min($pickerState.Commands.Count, 5)  # MaxVisible = 5
+            if ($pickerState.Commands.Count -gt 5) { $newHeight++ }   # +1 for scroll hint
+        }
+
+        # Clear the maximum of old and new heights to remove stale entries
+        $clearHeight = [Math]::Max($State.LastPickerHeight, $newHeight)
+        if ($clearHeight -gt 0) {
+            Clear-CommandDropdown -StartRow $dropdownRow -Width $Width -Lines ($clearHeight + 1)
+        }
+
+        # Render dropdown if active
+        if ($pickerState.IsActive) {
+            Render-CommandDropdown -StartRow $dropdownRow -Width $Width
+        }
+
+        # Update state for next partial render
+        $State.LastPickerHeight = $newHeight
     }
-
-    # Clear the maximum of old and new heights to remove stale entries
-    $clearHeight = [Math]::Max($State.LastPickerHeight, $newHeight)
-    if ($clearHeight -gt 0) {
-        Clear-CommandDropdown -StartRow $dropdownRow -Width $Width -Lines ($clearHeight + 1)
+    catch {
+        # Picker render failed - mark for retry on next frame, don't affect other regions
+        if ($State) { $State.MarkDirty("picker") }
     }
-
-    # Render dropdown if active
-    if ($pickerState.IsActive) {
-        Render-CommandDropdown -StartRow $dropdownRow -Width $Width
-    }
-
-    # Update state for next partial render
-    $State.LastPickerHeight = $newHeight
 }

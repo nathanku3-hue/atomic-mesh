@@ -875,6 +875,13 @@ def init_db():
                 ("progress", "INTEGER DEFAULT 0", "v23.0"),
                 # v23.1: Heartbeat for lease TTL system (drift prevention)
                 ("heartbeat_at", "INTEGER DEFAULT 0", "v23.1"),
+                # v24.0: Worker-Brain async communication (Closed Loop)
+                ("blocker_msg", "TEXT DEFAULT ''", "v24.0"),
+                ("manager_feedback", "TEXT DEFAULT ''", "v24.0"),
+                ("worker_output", "TEXT DEFAULT ''", "v24.0"),
+                # v24.1: Ownership + Leases (prevents task stealing / zombie workers)
+                ("lease_expires_at", "INTEGER DEFAULT 0", "v24.1"),
+                ("attempt_count", "INTEGER DEFAULT 0", "v24.1"),
             ]
 
             for col_name, col_type, version in migrations:
@@ -1018,6 +1025,22 @@ def init_db():
                     created_at INTEGER
                 )
             """)
+            # v24.1: Task message log for multi-turn conversations
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    msg_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_task_messages_task_id 
+                ON task_messages(task_id, created_at)
+            """)
             # Initialize config if not exists
             conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'vibe')")
             conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('last_review', ?)", (str(int(time.time())),))
@@ -1089,8 +1112,937 @@ def system_health_check() -> str:
         })
 
 # =============================================================================
+# v24.1 WORKER-BRAIN ASYNC COMMUNICATION (Robust Closed Loop)
+# =============================================================================
+#
+# Implements the "Async Ping-Pong" architecture with:
+#   - Ownership + Leases (prevents task stealing / zombie workers)
+#   - Message Log (multi-turn conversations, audit trail)
+#
+# Workflow:
+#   1. Worker calls claim_task() -> atomic claim with lease
+#   2. Worker calls ask_clarification() -> status='blocked', logged to history
+#   3. Worker polls check_task_status() until status != 'blocked'
+#   4. Brain calls respond_to_blocker() -> status='pending', logged to history
+#   5. Worker calls submit_for_review() -> status='review_needed', logged to history
+#   6. Worker calls renew_lease() periodically to prevent timeout
+#
+
+# Default lease duration in seconds (5 minutes)
+DEFAULT_LEASE_DURATION = 300
+
+
+def _log_task_message(conn, task_id: int, role: str, msg_type: str, content: str):
+    """Helper to log a message to task_messages table."""
+    conn.execute(
+        "INSERT INTO task_messages (task_id, role, msg_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        (task_id, role, msg_type, content, int(time.time()))
+    )
+
+
+def _check_task_ownership(conn, task_id: int, worker_id: str = None) -> dict:
+    """
+    Check if a task exists and optionally verify ownership.
+    Returns: {"ok": bool, "task": Row or None, "error": str or None}
+    """
+    task = conn.execute(
+        "SELECT id, status, worker_id, lease_id, lease_expires_at FROM tasks WHERE id = ?",
+        (task_id,)
+    ).fetchone()
+    
+    if not task:
+        return {"ok": False, "task": None, "error": f"Task {task_id} not found"}
+    
+    if worker_id:
+        now = int(time.time())
+        # Check ownership: either worker_id matches, or lease expired
+        if task["worker_id"] and task["worker_id"] != worker_id:
+            lease_expires = task["lease_expires_at"] or 0
+            if lease_expires > now:
+                return {
+                    "ok": False, 
+                    "task": task, 
+                    "error": f"Task {task_id} is owned by {task['worker_id']} (lease valid until {lease_expires})"
+                }
+    
+    return {"ok": True, "task": task, "error": None}
+
+
+@mcp.tool()
+def claim_task(task_id: int, worker_id: str, lease_duration_s: int = 300) -> str:
+    """
+    Atomically claim a pending task with a lease. Only succeeds if task is 
+    pending and not already claimed by another worker with a valid lease.
+    
+    Args:
+        task_id: The task ID to claim
+        worker_id: Your unique worker identifier
+        lease_duration_s: Lease duration in seconds (default: 300)
+    
+    Returns:
+        JSON with status, lease_id, and lease expiry time
+    """
+    validate_task_id(task_id)
+    if not worker_id or not worker_id.strip():
+        return json.dumps({"status": "ERROR", "error": "worker_id cannot be empty"})
+    
+    try:
+        now = int(time.time())
+        lease_id = f"{worker_id}_{now}"
+        expires_at = now + max(60, min(lease_duration_s, 3600))  # Clamp: 1min to 1hr
+        
+        with get_db() as conn:
+            # Atomic claim: only succeeds if pending AND (no lease OR lease expired)
+            result = conn.execute("""
+                UPDATE tasks SET 
+                    status='in_progress',
+                    worker_id=?,
+                    lease_id=?,
+                    lease_expires_at=?,
+                    updated_at=?
+                WHERE id=? AND status='pending' AND (lease_expires_at < ? OR lease_expires_at = 0 OR lease_expires_at IS NULL)
+            """, (worker_id.strip(), lease_id, expires_at, now, task_id, now))  # SAFETY-ALLOW: status-write
+            
+            if result.rowcount == 0:
+                # Check why it failed
+                task = conn.execute("SELECT status, worker_id, lease_expires_at FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if not task:
+                    return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+                if task["status"] != "pending":
+                    return json.dumps({"status": "CONFLICT", "error": f"Task is {task['status']}, not pending"})
+                return json.dumps({"status": "CONFLICT", "error": f"Task already claimed by {task['worker_id']}"})
+            
+            conn.commit()
+            
+            # Log claim to message history
+            _log_task_message(conn, task_id, "system", "claim", f"Claimed by {worker_id}")
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} claimed by {worker_id}, lease expires at {expires_at}")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "lease_id": lease_id,
+            "expires_at": expires_at,
+            "message": f"Task claimed. Lease expires in {lease_duration_s}s. Call renew_lease() to extend."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"claim_task error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def renew_lease(task_id: int, worker_id: str, lease_duration_s: int = 300) -> str:
+    """
+    Extend the lease on a task you own. Call periodically to prevent timeout.
+    
+    Args:
+        task_id: The task ID you own
+        worker_id: Your worker identifier (must match current owner)
+        lease_duration_s: New lease duration from now (default: 300)
+    
+    Returns:
+        JSON with new expiry time
+    """
+    validate_task_id(task_id)
+    if not worker_id or not worker_id.strip():
+        return json.dumps({"status": "ERROR", "error": "worker_id cannot be empty"})
+    
+    try:
+        now = int(time.time())
+        expires_at = now + max(60, min(lease_duration_s, 3600))
+        
+        with get_db() as conn:
+            # Only renew if we own the task
+            result = conn.execute("""
+                UPDATE tasks SET 
+                    lease_expires_at=?,
+                    heartbeat_at=?,
+                    updated_at=?
+                WHERE id=? AND worker_id=?
+            """, (expires_at, now, now, task_id, worker_id.strip()))
+            
+            if result.rowcount == 0:
+                check = _check_task_ownership(conn, task_id, worker_id.strip())
+                return json.dumps({"status": "ERROR", "error": check.get("error", "Lease renewal failed")})
+            
+            conn.commit()
+        
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "expires_at": expires_at,
+            "message": f"Lease renewed. Expires in {lease_duration_s}s."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"renew_lease error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def ask_clarification(task_id: int, question: str, worker_id: str = "") -> str:
+    """
+    Call when you encounter ambiguity that blocks progress.
+    Sets status='blocked' and stores your question in message history.
+    
+    After calling, you MUST enter a polling loop:
+      - Call check_task_status(task_id) every 10 seconds
+      - Continue until status != 'blocked'
+      - Read the 'feedback' field for the Brain's answer
+    
+    Args:
+        task_id: The task ID you are working on
+        question: Your specific clarification question
+        worker_id: (Optional) Your worker ID for ownership verification
+    
+    Returns:
+        JSON with instruction to poll
+    """
+    validate_task_id(task_id)
+    if not question or not question.strip():
+        return json.dumps({"status": "ERROR", "error": "Question cannot be empty"})
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            # Verify task exists (and optionally ownership)
+            if worker_id:
+                check = _check_task_ownership(conn, task_id, worker_id.strip())
+                if not check["ok"]:
+                    return json.dumps({"status": "ERROR", "error": check["error"]})
+            else:
+                task = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not task:
+                    return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            # Set blocked status with question
+            conn.execute(
+                "UPDATE tasks SET status='blocked', blocker_msg=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
+                (question.strip(), timestamp, task_id)
+            )
+            
+            # Log to message history
+            _log_task_message(conn, task_id, "worker", "clarification", question.strip())
+            conn.commit()
+            
+        server_logger.info(f"Task {task_id} blocked with question: {question[:50]}...")
+        return json.dumps({
+            "status": "BLOCKED",
+            "task_id": task_id,
+            "instruction": "Enter polling loop. Call check_task_status(task_id) every 10 seconds until status='pending'."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"ask_clarification error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def check_task_status(task_id: int) -> str:
+    """
+    Poll task status while waiting for Brain response.
+    Call this every 10 seconds when status is 'blocked'.
+    
+    Args:
+        task_id: The task ID to check
+    
+    Returns:
+        JSON with status, feedback (if available), and instruction for next action
+    """
+    validate_task_id(task_id)
+    
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT status, manager_feedback, blocker_msg FROM tasks WHERE id = ?",
+                (task_id,)
+            ).fetchone()
+            
+            if not row:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            task_status = row["status"]
+            
+            if task_status == "blocked":
+                return json.dumps({
+                    "status": "blocked",
+                    "blocker_msg": row["blocker_msg"] or "",
+                    "instruction": "Still waiting for Brain. Sleep 10 seconds and retry."
+                })
+            elif task_status == "pending":
+                return json.dumps({
+                    "status": "pending",
+                    "feedback": row["manager_feedback"] or "",
+                    "instruction": "Unblocked! Resume execution using the feedback."
+                })
+            else:
+                return json.dumps({
+                    "status": task_status,
+                    "feedback": row["manager_feedback"] or "",
+                    "instruction": f"Task is {task_status}. Proceed accordingly."
+                })
+                
+    except Exception as e:
+        server_logger.error(f"check_task_status error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def respond_to_blocker(task_id: int, answer: str) -> str:
+    """
+    Brain tool to unblock a stuck worker by providing feedback.
+    Resets status to 'pending' so worker can resume. Logs to message history.
+    
+    Args:
+        task_id: The blocked task ID
+        answer: Your answer/guidance for the worker
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    if not answer or not answer.strip():
+        return json.dumps({"status": "ERROR", "error": "Answer cannot be empty"})
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            # Verify task exists and is blocked
+            task = conn.execute(
+                "SELECT id, status, blocker_msg FROM tasks WHERE id = ?",
+                (task_id,)
+            ).fetchone()
+            
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            if task["status"] != "blocked":
+                return json.dumps({
+                    "status": "WARN",
+                    "message": f"Task {task_id} is not blocked (status={task['status']}). Feedback stored anyway.",
+                    "task_id": task_id
+                })
+            
+            # Unblock: set feedback, clear blocker_msg, reset to in_progress (not pending, worker still owns it)
+            conn.execute(
+                "UPDATE tasks SET status='in_progress', manager_feedback=?, blocker_msg=NULL, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
+                (answer.strip(), timestamp, task_id)
+            )
+            
+            # Log to message history
+            _log_task_message(conn, task_id, "brain", "feedback", answer.strip())
+            conn.commit()
+            
+        server_logger.info(f"Task {task_id} unblocked with feedback: {answer[:50]}...")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "message": f"Task {task_id} unblocked. Worker will resume with your feedback."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"respond_to_blocker error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def submit_for_review(task_id: int, summary: str, artifacts: str, worker_id: str = "") -> str:
+    """
+    Call when work is done. Sets status='review_needed' and stores artifacts.
+    Brain will review and either approve (complete) or reject (kickback).
+    Logs submission to message history.
+    
+    Args:
+        task_id: The task ID you completed
+        summary: Short description of what was built
+        artifacts: The worker_output (file paths, code snippets, etc.)
+        worker_id: (Optional) Your worker ID for ownership verification
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    if not summary or not summary.strip():
+        return json.dumps({"status": "ERROR", "error": "Summary cannot be empty"})
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            # Verify task exists (and optionally ownership)
+            if worker_id:
+                check = _check_task_ownership(conn, task_id, worker_id.strip())
+                if not check["ok"]:
+                    return json.dumps({"status": "ERROR", "error": check["error"]})
+            else:
+                task = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not task:
+                    return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            # Set review_needed status with artifacts
+            conn.execute(
+                "UPDATE tasks SET status='review_needed', worker_output=?, output=?, updated_at=? WHERE id=?",  # SAFETY-ALLOW: status-write
+                (artifacts.strip() if artifacts else "", summary.strip(), timestamp, task_id)
+            )
+            
+            # Log to message history
+            log_content = f"SUMMARY: {summary.strip()}\nARTIFACTS: {artifacts.strip() if artifacts else 'none'}"
+            _log_task_message(conn, task_id, "worker", "submission", log_content)
+            conn.commit()
+            
+        server_logger.info(f"Task {task_id} submitted for review: {summary[:50]}...")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "message": "Work submitted. Brain will review."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"submit_for_review error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def get_task_history(task_id: int, limit: int = 20) -> str:
+    """
+    Retrieve conversation history for a task.
+    Useful for context when resuming work or reviewing submissions.
+    
+    Args:
+        task_id: The task ID
+        limit: Maximum number of messages to return (default: 20)
+    
+    Returns:
+        JSON array of messages in chronological order
+    """
+    validate_task_id(task_id)
+    limit = max(1, min(limit, 100))  # Clamp: 1 to 100
+    
+    try:
+        with get_db() as conn:
+            # Verify task exists
+            task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            rows = conn.execute("""
+                SELECT role, msg_type, content, created_at 
+                FROM task_messages 
+                WHERE task_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            """, (task_id, limit)).fetchall()
+            
+            # Reverse to get chronological order
+            messages = [dict(r) for r in reversed(rows)]
+            
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "count": len(messages),
+            "messages": messages
+        })
+        
+    except Exception as e:
+        server_logger.error(f"get_task_history error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+# =============================================================================
+# v24.2 PHASE 4: APPROVE/REJECT REVIEW WORKFLOW
+# =============================================================================
+
+# Max rejection attempts before auto-escalation
+MAX_REJECTION_ATTEMPTS = 3
+
+
+@mcp.tool()
+def approve_work(task_id: int, notes: str = "") -> str:
+    """
+    Brain approves a submitted task. Sets status='completed'.
+    Logs approval to message history.
+    
+    Args:
+        task_id: The task ID to approve
+        notes: Optional approval notes
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            task = conn.execute(
+                "SELECT id, status, worker_id FROM tasks WHERE id = ?",
+                (task_id,)
+            ).fetchone()
+            
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            if task["status"] != "review_needed":
+                return json.dumps({
+                    "status": "WARN",
+                    "message": f"Task {task_id} is {task['status']}, not review_needed. Approving anyway."
+                })
+            
+            # Approve: set completed, clear lease
+            conn.execute(
+                """UPDATE tasks SET 
+                    status='completed', 
+                    review_decision='approved',
+                    review_notes=?,
+                    worker_id=NULL,
+                    lease_id=NULL,
+                    lease_expires_at=0,
+                    updated_at=? 
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (notes.strip() if notes else "", timestamp, task_id)
+            )
+            
+            # Log to history
+            log_content = f"APPROVED" + (f": {notes.strip()}" if notes else "")
+            _log_task_message(conn, task_id, "brain", "approval", log_content)
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} approved")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "message": f"Task {task_id} approved and completed."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"approve_work error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def reject_work(task_id: int, feedback: str, reassign: bool = True) -> str:
+    """
+    Brain rejects a submitted task. Increments attempt_count and sends feedback.
+    If max attempts reached, auto-escalates to human decision queue.
+    
+    Args:
+        task_id: The task ID to reject
+        feedback: Critique/feedback for the worker
+        reassign: If True, set back to 'in_progress' for same worker (default).
+                  If False, set to 'pending' for any worker.
+    
+    Returns:
+        JSON confirmation with attempt count
+    """
+    validate_task_id(task_id)
+    if not feedback or not feedback.strip():
+        return json.dumps({"status": "ERROR", "error": "Feedback cannot be empty"})
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            task = conn.execute(
+                "SELECT id, status, attempt_count, worker_id FROM tasks WHERE id = ?",
+                (task_id,)
+            ).fetchone()
+            
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            new_attempt = (task["attempt_count"] or 0) + 1
+            
+            # Check if max attempts exceeded
+            if new_attempt >= MAX_REJECTION_ATTEMPTS:
+                # Auto-escalate to decision queue
+                conn.execute(
+                    """INSERT INTO decisions (priority, question, context, status, created_at)
+                       VALUES ('red', ?, ?, 'pending', ?)""",
+                    (f"Task {task_id} rejected {new_attempt} times - needs human decision",
+                     f"Last feedback: {feedback[:200]}", timestamp)
+                )
+                conn.execute(
+                    """UPDATE tasks SET 
+                        status='blocked', 
+                        attempt_count=?,
+                        manager_feedback=?,
+                        updated_at=? 
+                    WHERE id=?""",  # SAFETY-ALLOW: status-write
+                    (new_attempt, f"ESCALATED: {feedback.strip()}", timestamp, task_id)
+                )
+                _log_task_message(conn, task_id, "system", "escalation", 
+                    f"Auto-escalated after {new_attempt} rejections. Feedback: {feedback}")
+                conn.commit()
+                
+                server_logger.warning(f"Task {task_id} escalated after {new_attempt} rejections")
+                return json.dumps({
+                    "status": "ESCALATED",
+                    "task_id": task_id,
+                    "attempt_count": new_attempt,
+                    "message": f"Task escalated to human decision queue after {new_attempt} rejections."
+                })
+            
+            # Normal rejection: send back for rework
+            new_status = "in_progress" if reassign else "pending"
+            update_worker = "" if reassign else ", worker_id=NULL, lease_id=NULL, lease_expires_at=0"
+            
+            conn.execute(
+                f"""UPDATE tasks SET 
+                    status='{new_status}', 
+                    attempt_count=?,
+                    manager_feedback=?,
+                    review_decision='rejected',
+                    updated_at=?
+                    {update_worker}
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (new_attempt, feedback.strip(), timestamp, task_id)
+            )
+            
+            _log_task_message(conn, task_id, "brain", "rejection", 
+                f"REJECTED (attempt {new_attempt}/{MAX_REJECTION_ATTEMPTS}): {feedback.strip()}")
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} rejected (attempt {new_attempt})")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "attempt_count": new_attempt,
+            "max_attempts": MAX_REJECTION_ATTEMPTS,
+            "message": f"Task rejected. Worker should address: {feedback[:50]}..."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"reject_work error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+# =============================================================================
+# v24.2 PHASE 5: ENHANCED EVIDENCE CAPTURE 
+# =============================================================================
+# (submit_for_review already extended with worker_id; here we add evidence helpers)
+
+@mcp.tool()
+def submit_for_review_with_evidence(
+    task_id: int,
+    summary: str,
+    artifacts: str,
+    worker_id: str = "",
+    test_cmd: str = "",
+    test_result: str = "",
+    git_sha: str = "",
+    files_changed: str = ""
+) -> str:
+    """
+    Enhanced version of submit_for_review with structured evidence capture.
+    
+    Args:
+        task_id: The task ID
+        summary: Short description of what was built
+        artifacts: File paths, code snippets, etc.
+        worker_id: Your worker ID for ownership verification
+        test_cmd: The test command run (e.g., 'pytest tests/test_auth.py')
+        test_result: Test outcome ('PASS', 'FAIL', 'SKIPPED')
+        git_sha: Git commit SHA for the changes
+        files_changed: Comma-separated list of changed files
+    
+    Returns:
+        JSON confirmation with evidence summary
+    """
+    validate_task_id(task_id)
+    if not summary or not summary.strip():
+        return json.dumps({"status": "ERROR", "error": "Summary cannot be empty"})
+    
+    try:
+        timestamp = int(time.time())
+        
+        # Build evidence JSON
+        evidence = {
+            "test_cmd": test_cmd.strip() if test_cmd else "",
+            "test_result": test_result.strip().upper() if test_result else "SKIPPED",
+            "git_sha": git_sha.strip() if git_sha else "",
+            "files_changed": [f.strip() for f in files_changed.split(",") if f.strip()] if files_changed else []
+        }
+        evidence_json = json.dumps(evidence)
+        
+        with get_db() as conn:
+            # Verify ownership if provided
+            if worker_id:
+                check = _check_task_ownership(conn, task_id, worker_id.strip())
+                if not check["ok"]:
+                    return json.dumps({"status": "ERROR", "error": check["error"]})
+            else:
+                task = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not task:
+                    return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            # Update task with evidence in worker_output
+            full_output = f"{artifacts.strip() if artifacts else ''}\n\nEVIDENCE: {evidence_json}"
+            conn.execute(
+                """UPDATE tasks SET 
+                    status='review_needed', 
+                    worker_output=?, 
+                    output=?,
+                    test_result=?,
+                    updated_at=? 
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (full_output, summary.strip(), evidence.get("test_result", "SKIPPED"), timestamp, task_id)
+            )
+            
+            # Log to history
+            log_content = f"SUMMARY: {summary}\nARTIFACTS: {artifacts}\nTEST: {test_result or 'N/A'}\nCOMMIT: {git_sha or 'N/A'}"
+            _log_task_message(conn, task_id, "worker", "submission", log_content)
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} submitted with evidence: {evidence}")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "evidence": evidence,
+            "message": "Work submitted with evidence. Brain will review."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"submit_for_review_with_evidence error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+# =============================================================================
+# v24.2 PHASE 6: ADMIN RECOVERY TOOLS
+# =============================================================================
+
+@mcp.tool()
+def requeue_task(task_id: int, reason: str = "") -> str:
+    """
+    Admin tool: Requeue a stuck or abandoned task.
+    Clears worker assignment and resets to 'pending'.
+    
+    Args:
+        task_id: The task ID to requeue
+        reason: Optional reason for requeue
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            task = conn.execute("SELECT id, status, worker_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            old_status = task["status"]
+            old_worker = task["worker_id"] or "none"
+            
+            conn.execute(
+                """UPDATE tasks SET 
+                    status='pending',
+                    worker_id=NULL,
+                    lease_id=NULL,
+                    lease_expires_at=0,
+                    updated_at=?
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (timestamp, task_id)
+            )
+            
+            log_msg = f"REQUEUED from {old_status} (worker: {old_worker})"
+            if reason:
+                log_msg += f". Reason: {reason}"
+            _log_task_message(conn, task_id, "system", "admin_requeue", log_msg)
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} requeued from {old_status}")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "previous_status": old_status,
+            "message": "Task requeued and available for claim."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"requeue_task error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def force_unblock(task_id: int, reason: str = "") -> str:
+    """
+    Admin tool: Force-unblock a stuck task without waiting for Brain feedback.
+    Sets status to 'in_progress' if worker assigned, else 'pending'.
+    
+    Args:
+        task_id: The task ID to unblock
+        reason: Optional reason for force-unblock
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            task = conn.execute("SELECT id, status, worker_id, blocker_msg FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            if task["status"] != "blocked":
+                return json.dumps({"status": "WARN", "message": f"Task is {task['status']}, not blocked"})
+            
+            # Set to in_progress if worker assigned, else pending
+            new_status = "in_progress" if task["worker_id"] else "pending"
+            
+            conn.execute(
+                """UPDATE tasks SET 
+                    status=?,
+                    blocker_msg=NULL,
+                    manager_feedback=?,
+                    updated_at=?
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (new_status, f"FORCE UNBLOCKED: {reason or 'Admin override'}", timestamp, task_id)
+            )
+            
+            log_msg = f"FORCE UNBLOCKED to {new_status}. Original blocker: {task['blocker_msg'] or 'none'}"
+            if reason:
+                log_msg += f". Reason: {reason}"
+            _log_task_message(conn, task_id, "system", "admin_unblock", log_msg)
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} force-unblocked to {new_status}")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "new_status": new_status,
+            "message": "Task force-unblocked."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"force_unblock error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def cancel_task(task_id: int, reason: str) -> str:
+    """
+    Admin tool: Cancel a task that is no longer needed.
+    Sets status to 'cancelled'. This is a terminal state.
+    
+    Args:
+        task_id: The task ID to cancel
+        reason: Required reason for cancellation
+    
+    Returns:
+        JSON confirmation
+    """
+    validate_task_id(task_id)
+    if not reason or not reason.strip():
+        return json.dumps({"status": "ERROR", "error": "Reason is required for cancellation"})
+    
+    try:
+        timestamp = int(time.time())
+        with get_db() as conn:
+            task = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if not task:
+                return json.dumps({"status": "ERROR", "error": f"Task {task_id} not found"})
+            
+            if task["status"] == "cancelled":
+                return json.dumps({"status": "WARN", "message": "Task already cancelled"})
+            
+            old_status = task["status"]
+            
+            conn.execute(
+                """UPDATE tasks SET 
+                    status='cancelled',
+                    worker_id=NULL,
+                    lease_id=NULL,
+                    lease_expires_at=0,
+                    review_notes=?,
+                    updated_at=?
+                WHERE id=?""",  # SAFETY-ALLOW: status-write
+                (f"CANCELLED: {reason.strip()}", timestamp, task_id)
+            )
+            
+            _log_task_message(conn, task_id, "system", "admin_cancel", 
+                f"CANCELLED from {old_status}. Reason: {reason.strip()}")
+            conn.commit()
+        
+        server_logger.info(f"Task {task_id} cancelled: {reason[:50]}")
+        return json.dumps({
+            "status": "OK",
+            "task_id": task_id,
+            "previous_status": old_status,
+            "message": f"Task cancelled: {reason[:50]}..."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"cancel_task error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+@mcp.tool()
+def sweep_stale_leases(max_stale_seconds: int = 600) -> str:
+    """
+    Admin tool: Find and requeue tasks with expired leases.
+    Call periodically (e.g., every 5 minutes) to recover from zombie workers.
+    
+    Args:
+        max_stale_seconds: Leases older than this are considered stale (default: 600)
+    
+    Returns:
+        JSON with count of requeued tasks
+    """
+    try:
+        now = int(time.time())
+        
+        with get_db() as conn:
+            # Find stale tasks
+            stale = conn.execute("""
+                SELECT id, worker_id, lease_expires_at 
+                FROM tasks 
+                WHERE status='in_progress' 
+                AND lease_expires_at > 0 
+                AND lease_expires_at < ?
+            """, (now,)).fetchall()
+            
+            requeued = []
+            for task in stale:
+                task_id = task["id"]
+                conn.execute(
+                    """UPDATE tasks SET 
+                        status='pending',
+                        worker_id=NULL,
+                        lease_id=NULL,
+                        lease_expires_at=0,
+                        updated_at=?
+                    WHERE id=?""",  # SAFETY-ALLOW: status-write
+                    (now, task_id)
+                )
+                _log_task_message(conn, task_id, "system", "lease_expired",
+                    f"Lease expired (was: {task['worker_id']}). Requeued.")
+                requeued.append(task_id)
+            
+            conn.commit()
+        
+        if requeued:
+            server_logger.info(f"Stale lease sweep: requeued {len(requeued)} tasks: {requeued}")
+        
+        return json.dumps({
+            "status": "OK",
+            "requeued_count": len(requeued),
+            "requeued_ids": requeued,
+            "message": f"Sweep complete. {len(requeued)} tasks requeued."
+        })
+        
+    except Exception as e:
+        server_logger.error(f"sweep_stale_leases error: {e}")
+        return json.dumps({"status": "ERROR", "error": str(e)})
+
+
+# =============================================================================
 # v9.3 DASHBOARD STATUS FUNCTIONS
 # =============================================================================
+
 
 import glob
 

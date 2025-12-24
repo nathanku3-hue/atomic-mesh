@@ -1,9 +1,11 @@
 function Get-UiSnapshotRaw {
     param([string]$DbPath)
 
-    # Phase 1: return a minimal snapshot without touching disk.
+    # DEPRECATED: Stub adapter for testing only.
+    # Production uses Get-RealSnapshot from RealAdapter.ps1 (calls snapshot.py)
+    # Keep zeros to avoid confusion if accidentally used.
     $lanes = @(
-        @{ name = "BACKEND"; queued = 1; active = 0; tokens = 0 },
+        @{ name = "BACKEND"; queued = 0; active = 0; tokens = 0 },
         @{ name = "FRONTEND"; queued = 0; active = 0; tokens = 0 },
         @{ name = "QA/AUDIT"; queued = 0; active = 0; tokens = 0 },
         @{ name = "LIBRARIAN"; queued = 0; active = 0; tokens = 0 }

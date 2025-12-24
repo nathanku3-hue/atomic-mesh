@@ -1,0 +1,178 @@
+# PROJECT: Atomic Mesh
+# VERSION: v22.0
+# PURPOSE: Navigational Map for AI and Developers
+# USAGE: Paste this file at the start of any AI chat for instant context
+
+schema_version: "1.0"
+project_root: "."
+
+components:
+  sys_scheduler:
+    machine_id: "sys:scheduler"
+    file: "mesh_server.py"
+    language: "python"
+    exports:
+      - name: "pick_task_braided"
+        type: "function"
+        line: 4766
+      - name: "add_task"
+        type: "function"
+        line: 2100
+      - name: "_resolve_model_tier"
+        type: "function"
+        line: 123
+      - name: "MODEL_TIER_BY_LANE"
+        type: "dict"
+        line: 103
+      - name: "DEFAULT_WORKER_ALLOWED_LANES"
+        type: "dict"
+        line: 71
+    consumes: ["sys:db"]
+    responsibility: "Task selection, priority logic, model tier routing"
+
+  sys_worker:
+    machine_id: "sys:worker"
+    file: "worker.ps1"
+    language: "powershell"
+    exports:
+      - name: "Get-BlockedLanes"
+        type: "function"
+        line: 31
+      - name: "MainLoop"
+        type: "block"
+        line: 89
+    consumes: ["sys:scheduler", "sys:ai_client"]
+    responsibility: "Polls scheduler, claims tasks, invokes AI client"
+
+  sys_ai_client:
+    machine_id: "sys:ai_client"
+    file: "mcp_client.py"
+    language: "python"
+    exports:
+      - name: "run_tool"
+        type: "function"
+        line: 15
+    consumes: ["sys:scheduler"]
+    responsibility: "MCP protocol bridge to mesh_server.py"
+
+  sys_cli:
+    machine_id: "sys:cli"
+    file: "src/AtomicMesh.UI/Public/Invoke-CommandRouter.ps1"
+    language: "powershell"
+    exports:
+      - name: "Invoke-CommandRouter"
+        type: "function"
+        line: 18
+    consumes: ["sys:scheduler"]
+    responsibility: "User CLI, parses /go, /stream, /draft-plan commands"
+
+data_flow:
+  - step: 1
+    name: "submission"
+    from: "sys:cli"
+    to: "sys:scheduler"
+    method: "Add-Task"
+  - step: 2
+    name: "selection"
+    from: "sys:worker"
+    to: "sys:scheduler"
+    method: "pick_task_braided"
+  - step: 3
+    name: "execution"
+    from: "sys:worker"
+    to: "sys:ai_client"
+    method: "run_tool"
+  - step: 4
+    name: "logging"
+    from: "sys:ai_client"
+    to: "filesystem"
+    method: "logs/*.log"
+
+model_routing:
+  config_file: "config/models.json"
+  config_version: "7.8"
+  tiers:
+    logic_max:
+      model_id: "gpt-5.1-codex-max"
+      roles: ["backend", "librarian", "qa1", "commander"]
+    creative_fast:
+      model_id: "claude-sonnet-4-5-20251101"
+      roles: ["frontend", "qa2", "writer"]
+    reasoning_ultra:
+      model_id: "claude-opus-4-5-20251101"
+      roles: ["heavy", "architect"]
+
+lane_routing:
+  backend:
+    worker_tool: "codex"
+    model_tier: "logic_max"
+    allowed_workers: ["sys:worker"]
+  frontend:
+    worker_tool: "claude"
+    model_tier: "creative_fast"
+    allowed_workers: ["sys:worker"]
+  qa:
+    worker_tool: "dual"
+    model_tier: ["logic_max", "creative_fast"]
+    strategy: "first_to_claim"
+    future_strategy: "task_forking"
+  docs:
+    worker_tool: "claude"
+    model_tier: "reasoning_ultra"
+    allowed_workers: ["sys:worker"]
+  ops:
+    worker_tool: "codex"
+    model_tier: "logic_max"
+    allowed_workers: ["sys:worker"]
+
+# Machine-queryable intent index
+# Query: intents[?domain=='priority'].target
+intents:
+  - id: "INT001"
+    domain: "priority"
+    keywords: ["prioritize", "task order", "scheduling"]
+    target:
+      file: "mesh_server.py"
+      symbol: "pick_task_braided"
+  - id: "INT002"
+    domain: "worker"
+    keywords: ["worker", "executor", "loop"]
+    target:
+      file: "worker.ps1"
+      symbol: "MainLoop"
+  - id: "INT003"
+    domain: "model"
+    keywords: ["model", "prompt", "AI", "LLM"]
+    target:
+      file: "worker.ps1"
+      symbol: "$ModelId"
+  - id: "INT004"
+    domain: "ui"
+    keywords: ["command", "/go", "/stream", "CLI"]
+    target:
+      file: "src/AtomicMesh.UI/Public/Invoke-CommandRouter.ps1"
+      symbol: "Invoke-CommandRouter"
+  - id: "INT005"
+    domain: "tools"
+    keywords: ["MCP", "tool", "new tool"]
+    target:
+      file: "mesh_server.py"
+      symbol: "@mcp.tool"
+  - id: "INT006"
+    domain: "logs"
+    keywords: ["log", "debug", "empty logs"]
+    target:
+      file: "worker.ps1"
+      symbol: "$LogFile"
+  - id: "INT007"
+    domain: "lanes"
+    keywords: ["lane", "routing", "allowed lanes"]
+    target:
+      file: "mesh_server.py"
+      symbol: "DEFAULT_WORKER_ALLOWED_LANES"
+  - id: "INT008"
+    domain: "model_tier"
+    keywords: ["tier", "model mapping", "opus", "sonnet"]
+    target:
+      file: "mesh_server.py"
+      symbol: "MODEL_TIER_BY_LANE"

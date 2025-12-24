@@ -16,10 +16,22 @@ function Render-Header {
     $snapshot = if ($Snapshot) { $Snapshot } else { [UiSnapshot]::new() }
     $state = if ($State) { $State } else { [UiState]::new() }
 
-    # Mode label (golden: EXEC for initialized, BOOTSTRAP otherwise)
-    $isInitialized = $snapshot.PlanState -and $snapshot.PlanState.Status -ne "BOOTSTRAP"
+    # Mode label: EXEC when initialized, BOOTSTRAP otherwise
+    # Uses IsInitialized from state metadata (single source of truth set by Update-AutoPageFromPlanStatus)
+    # This is based on actual initialization check (marker/docs), not plan status
+    $isInitialized = if ($state.Cache -and $state.Cache.Metadata -and $state.Cache.Metadata.ContainsKey("IsInitialized")) {
+        $state.Cache.Metadata["IsInitialized"]
+    } else {
+        $false  # Default to not initialized if flag not set yet
+    }
     $modeLabel = if ($isInitialized) { "EXEC" } else { "BOOTSTRAP" }
     $modeLabelColor = if ($isInitialized) { "White" } else { "Yellow" }
+
+    # FAIL-OPEN OVERRIDE: Use precomputed ReadinessUi (no ad-hoc ReadinessMode checks)
+    $readinessUi = Get-ReadinessUi -Snapshot $snapshot
+    if ($readinessUi -and $readinessUi.IsFailOpen) {
+        $modeLabelColor = $readinessUi.HeaderBadgeColor
+    }
 
     # GOLDEN NUANCE 6: Health dot color from snapshot.HealthStatus
     # "OK" → Green, "WARN" → Yellow, "FAIL" → Red
@@ -34,20 +46,40 @@ function Render-Header {
         $healthColor = "Red"
     }
 
-    # GOLDEN NUANCE 5: Lane counts from snapshot.DistinctLaneCounts
-    # Uses DISTINCT lanes (not total tasks) as per golden SQL
+    # GOLDEN NUANCE 5 (adapted): Use lane totals when available; otherwise fall back to task samples or distinct counts
     $pendingCount = 0
     $activeCount = 0
-    if ($snapshot.DistinctLaneCounts) {
-        $pendingCount = [int]$snapshot.DistinctLaneCounts.pending
-        $activeCount = [int]$snapshot.DistinctLaneCounts.active
-    } elseif ($snapshot.LaneMetrics) {
-        # Fallback: compute from lane metrics if DistinctLaneCounts not available
+    $maxParallel = 4
+
+    if ($snapshot.LaneMetrics) {
+        $maxParallel = [Math]::Max(1, $snapshot.LaneMetrics.Count)
         foreach ($lane in $snapshot.LaneMetrics) {
-            $pendingCount += $lane.Queued
-            $activeCount += $lane.Active
+            $pendingCount += [int]$lane.Queued
+            $activeCount += [int]$lane.Active
         }
     }
+
+    # If lane metrics missing or zero, fall back to PendingTasks sample for pending
+    if ($pendingCount -le 0 -and $snapshot.PendingTasks) {
+        try { $pendingCount = [int]$snapshot.PendingTasks.Count } catch { $pendingCount = 0 }
+    }
+
+    # Prefer distinct counts for active when present (more reliable), then clamp to max lanes
+    if ($snapshot.DistinctLaneCounts) {
+        if ($pendingCount -le 0) { $pendingCount = [int]$snapshot.DistinctLaneCounts.pending }
+        $activeCount = [int]$snapshot.DistinctLaneCounts.active
+    }
+
+    # Final fallback to DistinctLaneCounts if everything else missing
+    if ($pendingCount -le 0 -and $snapshot.DistinctLaneCounts) {
+        $pendingCount = [int]$snapshot.DistinctLaneCounts.pending
+    }
+    if ($activeCount -le 0 -and $snapshot.DistinctLaneCounts) {
+        $activeCount = [int]$snapshot.DistinctLaneCounts.active
+    }
+
+    # Clamp active to max parallel lanes (safety: default 4)
+    $activeCount = [Math]::Min($activeCount, $maxParallel)
     $pendingStr = "$pendingCount pending"
     $activeStr = "$activeCount active"
     $pendingColor = if ($pendingCount -gt 0) { "White" } else { "DarkGray" }

@@ -48,6 +48,7 @@ logs/
 .claude/
 
 # Generated artifacts / local outputs
+tests/fixtures/_actual/
 control/state/plan_preview.json
 docs/PLANS/draft_*.md
 stdout.txt

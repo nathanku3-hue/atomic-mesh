@@ -340,6 +340,24 @@ Test-GoldenFixture -Name "plan_adapter_error" -RenderBlock {
     }
 }
 
+# -----------------------------------------------------------------------------
+# TEST: plan_fail_open
+# PLAN page in fail-open readiness mode showing source line
+# -----------------------------------------------------------------------------
+Test-GoldenFixture -Name "plan_fail_open" -RenderBlock {
+    $snapshot = New-EmptySnapshot
+    $snapshot.PlanState.Status = "UNKNOWN"
+    $snapshot.ReadinessMode = "fail-open"
+    $snapshot.IsInitialized = $false
+
+    $state = New-EmptyState
+    $state.CurrentPage = "PLAN"
+
+    Render-FullFrame -Snapshot $snapshot -State $state -ContentRenderer {
+        Render-Plan -Snapshot $snapshot -State $state -StartRow 4
+    }
+}
+
 # =============================================================================
 # FIXTURE SANITY CHECK
 # =============================================================================
@@ -357,7 +375,8 @@ $script:TestedFixtures = @(
     "exec_empty",
     "history_docs",
     "history_ship",
-    "plan_adapter_error"
+    "plan_adapter_error",
+    "plan_fail_open"
 )
 
 function Test-FixtureSanity {

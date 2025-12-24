@@ -54,10 +54,22 @@ function Render-Go {
         @{ Text = "Active: $activeCount  Queued: $queuedCount"; Color = if ($activeCount -gt 0) { "Yellow" } else { "DarkGray" } }
     )
 
+    # Legend (only when any non-idle lane)
+    $showLegend = ($activeCount -gt 0 -or $queuedCount -gt 0)
+    if ($showLegend) {
+        if ($activeCount -gt 0) {
+            $leftLines += @{ Text = "Legend: $($lanes[0].DotChar) Running"; Color = "Green" }
+        }
+        if ($queuedCount -gt 0) {
+            $leftLines += @{ Text = "Legend: $([char]0x25CB) Queued"; Color = "Yellow" }  # ○ queued
+        }
+    }
+
     # Add lane summary lines
     foreach ($lane in $lanes) {
         if ($lane.Active -gt 0 -or $lane.Queued -gt 0) {
-            $leftLines += @{ Text = "  [$($lane.Name)] A:$($lane.Active) Q:$($lane.Queued)"; Color = if ($lane.Active -gt 0) { "Cyan" } else { "Yellow" } }
+            $laneColor = if ($lane.StateColor) { $lane.StateColor } elseif ($lane.Active -gt 0) { "Cyan" } elseif ($lane.Queued -gt 0) { "Yellow" } else { "DarkGray" }
+            $leftLines += @{ Text = "  [$($lane.Name)] A:$($lane.Active) Q:$($lane.Queued)"; Color = $laneColor }
         }
     }
 

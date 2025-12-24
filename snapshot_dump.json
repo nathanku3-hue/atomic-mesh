@@ -1,0 +1,112 @@
+{
+  "ProjectName": "new",
+  "GeneratedAtUtc": "",
+  "LaneCounts": [
+    {
+      "Lane": "backend",
+      "Status": "in_progress",
+      "Count": 1
+    },
+    {
+      "Lane": "backend",
+      "Status": "pending",
+      "Count": 8
+    },
+    {
+      "Lane": "docs",
+      "Status": "pending",
+      "Count": 2
+    },
+    {
+      "Lane": "frontend",
+      "Status": "pending",
+      "Count": 2
+    },
+    {
+      "Lane": "ops",
+      "Status": "pending",
+      "Count": 12
+    },
+    {
+      "Lane": "qa",
+      "Status": "pending",
+      "Count": 7
+    }
+  ],
+  "Drift": {
+    "HasDrift": false,
+    "Reason": "drift-unimplemented"
+  },
+  "ReadinessMode": "live",
+  "HealthStatus": "OK",
+  "DistinctLaneCounts": {
+    "pending": 5,
+    "active": 1
+  },
+  "GitClean": true,
+  "FirstBlockedTaskId": null,
+  "FirstErrorTaskId": null,
+  "HighRiskUnverifiedCount": 0,
+  "BlockingFiles": [],
+  "FirstUnoptimizedTaskId": null,
+  "HasAnyOptimized": false,
+  "OptimizeTotalTasks": 0,
+  "DocScores": {
+    "PRD": {
+      "score": 100,
+      "exists": true,
+      "threshold": 90,
+      "hint": "ready"
+    },
+    "SPEC": {
+      "score": 100,
+      "exists": true,
+      "threshold": 90,
+      "hint": "ready"
+    },
+    "DECISION_LOG": {
+      "score": 60,
+      "exists": true,
+      "threshold": 60,
+      "hint": "ready"
+    }
+  },
+  "DocsAllPassed": true,
+  "DocsReadiness": {
+    "PRD": true,
+    "SPEC": true,
+    "DECISION_LOG": true
+  },
+  "DocsReadyCount": 3,
+  "DocsTotalCount": 3,
+  "LibrarianDocFeedback": {
+    "PRD": {
+      "one_liner": "",
+      "paragraph": ""
+    },
+    "SPEC": {
+      "one_liner": "",
+      "paragraph": ""
+    },
+    "DECISION_LOG": {
+      "one_liner": "",
+      "paragraph": ""
+    }
+  },
+  "LibrarianDocFeedbackStale": false,
+  "LibrarianDocFeedbackPresent": false,
+  "LibrarianOverallQuality": 0,
+  "LibrarianConfidence": 0,
+  "LibrarianCriticalRisksCount": 0,
+  "IsInitialized": true,
+  "plan": {
+    "has_draft": true,
+    "accepted": true,
+    "status": "ACCEPTED",
+    "id": "draft_20251221_1547.md",
+    "summary": ""
+  },
+  "DbPathTried": "E:\\Code\\new\\mesh.db",
+  "ProjectRoot": "E:\\Code\\new",
+  "DbPresent": true
+}

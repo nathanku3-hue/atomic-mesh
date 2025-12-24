@@ -8,9 +8,6 @@ function Render-Bootstrap {
 
     if (-not (Get-ConsoleFrameValid)) { return }
 
-    $snapshot = if ($Snapshot) { $Snapshot } else { [UiSnapshot]::new() }
-    $planState = if ($snapshot.PlanState) { $snapshot.PlanState } else { [PlanState]::new() }
-
     # Get dimensions
     $W = if ($script:CaptureMode) { $script:CaptureWidth } else {
         $window = $Host.UI.RawUI.WindowSize
@@ -20,32 +17,25 @@ function Render-Bootstrap {
     $HalfRight = $W - $Half
     $ContentWidthR = $HalfRight - 4  # For pipeline rendering
 
-    # Compute reason (golden logic)
-    $reason = "Workspace not initialized (/init)"
-
-    # Compute plan status
-    $planStatus = if ($planState.Accepted) {
-        "Accepted plan detected"
-    }
-    elseif ($planState.HasDraft) {
-        "Draft plan present, not yet accepted"
-    }
-    else {
-        "No draft plan found"
-    }
-
-    # Left column content (page-specific)
+    # Left column: minimal bootstrap layout
     $leftLines = @(
-        @{ Text = "BOOTSTRAP"; Color = "Yellow" },
-        @{ Text = $reason; Color = "White" },
-        @{ Text = $planStatus; Color = "White" },
-        @{ Text = "Run /init to initialize"; Color = "Yellow" },
+        @{ Text = "New repo"; Color = "Yellow" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = "Next: /init"; Color = "Cyan" },
         @{ Text = ""; Color = "DarkGray" },
         @{ Text = ""; Color = "DarkGray" }
     )
 
-    # Right column: PIPELINE directives (golden layout)
-    $pipelineDirectives = Get-PipelineRightColumn -Snapshot $snapshot
+    # Right column: empty
+    $pipelineDirectives = @(
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" },
+        @{ Text = ""; Color = "DarkGray" }
+    )
 
     # Render rows using golden two-column format
     $R = $StartRow

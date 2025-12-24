@@ -1,10 +1,10 @@
-﻿+------------------------------------------------------------------------------+
-|  EXEC ● | 0 pending | 0 active                                               |
++------------------------------------------------------------------------------+
+|  BOOTSTRAP ● | 0 pending | 0 active                                          |
 |                                                                              |
 +------------------------------------------------------------------------------+
-| PLAN                                 || PIPELINE                             |
-| Plan: draft exists (not accepted)    || Source: snapshot.py (live)           |
-|                                      ||                                      |
-|                                      || [Ctx]→[Pln]→[Wrk]→[Opt]→[Ver]→[Shp]  |
-|                                      ||                                      |
+| STREAMS                              || PIPELINE                             |
+| BACKEND    □□□□□ IDLE                ||                                      |
+| FRONTEND   □□□□□ IDLE                ||                                      |
+| QA         □□□□□ IDLE                || [Ctx]→[Pln]→[Wrk]→[Opt]→[Ver]→[Shp]  |
+| LIBRARIAN  □□□□□ IDLE                || Reason: Draft ready to accept        |
 |                                      || Next: /accept-plan                   |

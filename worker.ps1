@@ -19,6 +19,26 @@ param (
 $ID = "${Type}_$(Get-Date -Format 'HHmm')"
 $MeshRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $MeshRoot) { $MeshRoot = (Get-Location).Path }
+
+# v23.1: Track current task for Ctrl+C cleanup
+$script:CurrentTaskId = $null
+$script:CurrentLeaseId = $null
+
+# Ctrl+C trap: Reset task to pending so it can be picked up again
+trap {
+    if ($script:CurrentTaskId) {
+        Write-Host "`n⚠️  Interrupted! Resetting task $($script:CurrentTaskId) to pending..." -ForegroundColor Yellow
+        try {
+            # Direct SQLite reset (faster than MCP call during interrupt)
+            $resetCmd = "import sqlite3; conn = sqlite3.connect('$($env:ATOMIC_MESH_DB)'); conn.execute('UPDATE tasks SET status=''pending'', worker_id=NULL, lease_id=NULL WHERE id=$($script:CurrentTaskId)'); conn.commit(); print('Reset OK')"
+            python -c $resetCmd 2>$null
+            Write-Host "   Task $($script:CurrentTaskId) reset to pending." -ForegroundColor Green
+        } catch {
+            Write-Host "   Failed to reset task. Run /go again to retry." -ForegroundColor Red
+        }
+    }
+    break
+}
 # --- MULTI-PROJECT ISOLATION: Use ProjectPath or current directory for logs ---
 $CurrentDir = if ($ProjectPath -and (Test-Path $ProjectPath)) { $ProjectPath } else { (Get-Location).Path }
 $LogDir = "$CurrentDir\logs"
@@ -28,12 +48,22 @@ if ($SingleShot) {
     Write-Host "`n======================================" -ForegroundColor Cyan
     Write-Host "  SINGLE-SHOT MODE: Will exit after one task" -ForegroundColor Cyan
     Write-Host "======================================`n" -ForegroundColor Cyan
+    # Debug: Show path resolution
+    Write-Host "  ProjectPath param: $ProjectPath" -ForegroundColor DarkGray
+    Write-Host "  CurrentDir: $CurrentDir" -ForegroundColor DarkGray
+    Write-Host "  env:ATOMIC_MESH_DB: $env:ATOMIC_MESH_DB" -ForegroundColor DarkGray
 }
 
-# v21.0: Ensure worker uses same DB as control panel
-$DB_FILE = Join-Path $MeshRoot "mesh.db"
-if (-not $env:ATOMIC_MESH_DB) { $env:ATOMIC_MESH_DB = $DB_FILE }
-Write-Host "  DB: $env:ATOMIC_MESH_DB" -ForegroundColor DarkGray
+# v23.1: Use PROJECT's DB (not module's DB) - critical for multi-project isolation
+# Priority: 1) env:ATOMIC_MESH_DB (set by /go), 2) ProjectPath, 3) CurrentDir
+if ($env:ATOMIC_MESH_DB -and (Test-Path $env:ATOMIC_MESH_DB)) {
+    $DB_FILE = $env:ATOMIC_MESH_DB
+    Write-Host "  DB (from env): $DB_FILE" -ForegroundColor DarkGray
+} else {
+    $DB_FILE = Join-Path $CurrentDir "mesh.db"
+    $env:ATOMIC_MESH_DB = $DB_FILE
+    Write-Host "  DB (from path): $DB_FILE" -ForegroundColor DarkGray
+}
 $LogFile = "$LogDir\$(Get-Date -Format 'yyyy-MM-dd')-$Type.log"
 $CombinedLog = "$LogDir\combined.log"  # Shared log for Control Panel
 
@@ -116,7 +146,8 @@ while ($true) {
                 task_ids = @()  # Will be updated when task is picked
             }
             $heartbeatJson = ($heartbeatArgs | ConvertTo-Json -Compress)
-            python $MCP_CLIENT worker_heartbeat $heartbeatJson 2>$null | Out-Null
+            $hbEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($heartbeatJson))
+            python $MCP_CLIENT worker_heartbeat $hbEncoded --base64 2>$null | Out-Null
             $LastHeartbeatAt = Get-Date
         }
     } catch {
@@ -133,10 +164,13 @@ while ($true) {
             blocked_lanes = $blocked
         }
         $argsJson = ($argsObj | ConvertTo-Json -Compress)
-        # Capture stdout only (stderr includes MCP protocol logs)
-        $JsonResult = python $MCP_CLIENT pick_task_braided $argsJson 2>$null | Out-String
+        $argsEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($argsJson))
+        # Capture stdout + stderr for debugging
+        $JsonResult = python $MCP_CLIENT pick_task_braided $argsEncoded --base64 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "   ⚠️ MCP call failed (exit $LASTEXITCODE). Retrying..." -ForegroundColor Yellow
+            $firstLine = ($JsonResult -split "`n" | Where-Object { $_ -ne "" }) | Select-Object -First 1
+            if (-not $firstLine) { $firstLine = "(no stderr/stdout)" }
+            Write-Host "   ⚠️ MCP call failed (exit $LASTEXITCODE): $firstLine" -ForegroundColor Yellow
             Start-Sleep -Seconds 5
             continue
         }
@@ -152,8 +186,8 @@ while ($true) {
         # v23.1: SingleShot mode exits immediately on empty queue
         if ($SingleShot) {
             Write-Host "`n📭 No tasks available. Queue empty or blocked." -ForegroundColor Yellow
-            Write-Host "   Window will close in 3 seconds..." -ForegroundColor DarkGray
-            Start-Sleep -Seconds 3
+            Write-Host "   Window will close in 10 seconds..." -ForegroundColor DarkGray
+            Start-Sleep -Seconds 10
             exit 0
         }
         $NoWorkStreak = [Math]::Min($NoWorkStreak + 1, 6)
@@ -189,6 +223,10 @@ while ($true) {
     $Lane = if ($TaskData.lane) { [string]$TaskData.lane } else { $Type }
     $LeaseId = $null
     try { $LeaseId = [string]$TaskData.lease_id } catch { $LeaseId = $null }
+
+    # v23.1: Track for Ctrl+C cleanup
+    $script:CurrentTaskId = $TaskID
+    $script:CurrentLeaseId = $LeaseId
 
     # v22.0: Extract model tier from scheduler response
     $ModelTier = $DefaultModel
@@ -289,21 +327,27 @@ while ($true) {
             catch {}
         }
 
-        if ($Tool -eq "claude") {
-            # v22.0: Map model tier to Claude model ID
+        # v23.1: Model tier from scheduler drives tool selection (not -Tool param)
+        # Claude tiers: sonnet-4.5, opus-4.5, haiku
+        # Codex tiers: codex-max, gpt-* (or fallback)
+        $useClaude = $ModelTier -match "^(sonnet|opus|haiku)"
+
+        if ($useClaude) {
+            # Map model tier to Claude model ID
             $ModelId = switch ($ModelTier) {
                 "opus-4.5"   { "claude-opus-4-5-20251101" }
                 "sonnet-4.5" { "claude-sonnet-4-5-20251101" }
                 "haiku"      { "claude-haiku-3-5-20250620" }
                 default      { "claude-sonnet-4-5-20251101" }
             }
-            Write-Host "   🤖 Model: $ModelId" -ForegroundColor DarkGray
+            Write-Host "   🤖 Claude: $ModelId" -ForegroundColor DarkGray
             $Output = claude --model $ModelId --print "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
         }
-        elseif ($Tool -eq "codex") {
-            # v22.0: Codex uses GPT-5.1 Codex Max
-            Write-Host "   🤖 Codex: gpt-5.1-codex-max" -ForegroundColor DarkGray
-            $Output = codex -m gpt-5.1-codex-max exec "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
+        else {
+            # Codex/GPT models
+            $CodexModel = if ($ModelTier -match "codex|gpt") { $ModelTier } else { "gpt-5.1-codex-max" }
+            Write-Host "   🤖 Codex: $CodexModel" -ForegroundColor DarkGray
+            $Output = codex -m $CodexModel exec "$Prompt" 2>&1 | Tee-Object -FilePath $LogFile -Append
         }
     }
     catch {
@@ -354,5 +398,16 @@ while ($true) {
         }
         $completeJson = ($completeArgs | ConvertTo-Json -Compress)
         python $MCP_CLIENT complete_task $completeJson 2>$null | Out-Null
+    }
+
+    # v23.1: Clear task tracking (task completed, no need to reset on Ctrl+C)
+    $script:CurrentTaskId = $null
+    $script:CurrentLeaseId = $null
+
+    # v23.1: SingleShot mode exits after one task
+    if ($SingleShot) {
+        Write-Host "`n✅ Task complete. Window will close in 5 seconds..." -ForegroundColor Green
+        Start-Sleep -Seconds 5
+        exit 0
     }
 }

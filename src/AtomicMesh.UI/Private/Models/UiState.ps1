@@ -31,6 +31,12 @@ class UiState {
     [string]$LastInputBuffer
     [string]$LastAdapterError
     [int]$LastPickerHeight    # For picker area clearing
+    [bool]$EnableSnapshotLogging
+    [string]$LastPipelineSnapshotHash
+    [bool]$LastPipelineNonGreen
+    [bool]$ForceDataRefresh           # Force immediate data refresh (bypasses interval)
+    [bool]$ShowDocDetails             # Toggle for Librarian paragraph display (D key)
+    [string]$LastDebug                # Debug message for right panel display
 
     UiState() {
         # Golden state defaults
@@ -62,6 +68,12 @@ class UiState {
         $this.LastInputBuffer = ""
         $this.LastAdapterError = ""
         $this.LastPickerHeight = 0
+        $this.EnableSnapshotLogging = $false
+        $this.LastPipelineSnapshotHash = ""
+        $this.LastPipelineNonGreen = $false
+        $this.ForceDataRefresh = $false
+        $this.ShowDocDetails = $false
+        $this.LastDebug = ""
     }
 
     # Mark a specific region dirty (default: "all" for full render)
@@ -92,6 +104,11 @@ class UiState {
             $this.OverlayMode = "None"
         } else {
             $this.OverlayMode = $mode
+            if ($mode -eq "History") {
+                $this.HistorySelectedRow = 0
+                $this.HistoryScrollOffset = 0
+                $this.HistoryDetailsVisible = $false
+            }
         }
         $this.MarkDirty("content")  # Overlay changes require content redraw
     }
@@ -109,6 +126,9 @@ class UiState {
         $tabs = @("TASKS", "DOCS", "SHIP")
         $idx = [Array]::IndexOf($tabs, $this.HistorySubview)
         $this.HistorySubview = $tabs[($idx + 1) % $tabs.Length]
+        $this.HistorySelectedRow = 0
+        $this.HistoryScrollOffset = 0
+        $this.HistoryDetailsVisible = $false
         $this.MarkDirty("content")  # Tab change = content change
     }
 
@@ -123,13 +143,27 @@ class UiState {
     # Golden Contract: Toggle history details pane (Enter key in History overlay)
     [void] ToggleHistoryDetails() {
         $this.HistoryDetailsVisible = -not $this.HistoryDetailsVisible
-        $this.MarkDirty("content")
+        $this.MarkDirty("history")
     }
 
     # Golden Contract: Close history details pane (ESC priority)
     [void] CloseHistoryDetails() {
         if ($this.HistoryDetailsVisible) {
             $this.HistoryDetailsVisible = $false
+            $this.MarkDirty("content")
+        }
+    }
+
+    # Toggle doc details panel (D key, only in PLAN pre-draft + empty input)
+    [void] ToggleDocDetails() {
+        $this.ShowDocDetails = -not $this.ShowDocDetails
+        $this.MarkDirty("content")
+    }
+
+    # Close doc details (ESC or when leaving pre-draft state)
+    [void] CloseDocDetails() {
+        if ($this.ShowDocDetails) {
+            $this.ShowDocDetails = $false
             $this.MarkDirty("content")
         }
     }

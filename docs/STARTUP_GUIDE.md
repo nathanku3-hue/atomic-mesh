@@ -67,7 +67,27 @@ Get-Process python | Where-Object { $_.CommandLine -like "*mesh_server*" }
 Stop-Process -Id <PID>
 ```
 
-### 2. Control Panel (`control_panel.ps1`)
+### 2. Control Panel
+
+**Recommended: Use the launcher**
+```powershell
+# From your project directory:
+cd E:\Code\your-project
+.\launcher\mesh-test.ps1
+
+# Or add to your $PROFILE for quick access:
+function mesh-test { & "E:\Code\atomic-mesh-ui-sandbox\launcher\mesh-test.ps1" }
+# Then just: cd your-project; mesh-test
+```
+
+**Direct usage (must pass -ProjectPath):**
+```powershell
+.\control_panel.ps1 -ProjectPath "E:\Code\your-project"
+```
+
+> **Warning:** Running `control_panel.ps1` without `-ProjectPath` uses your current
+> directory. If you run it from the module directory, you'll see the module's
+> database, not your project's.
 
 **What it does:**
 - Provides human interface to mesh operations

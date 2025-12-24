@@ -1,5 +1,5 @@
 function Compute-PlanState {
-    param([hashtable]$RawSnapshot)
+    param($RawSnapshot)  # Accept PSCustomObject from ConvertFrom-Json OR hashtable
 
     $state = [PlanState]::new()
 

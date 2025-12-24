@@ -18,11 +18,24 @@ $script:MaxDropdownRows = 5
 # Aligns input bar with "  Next:" label (2-space indent)
 $script:InputLeft = 2
 
+# --- STREAM ROW CONSTANTS (golden lines 7973) ---
+# Format: | <Name:10> <Bar:5+1> <State:8> | <Summary:remaining> |
+$script:StreamNameWidth = 10
+$script:StreamBarWidth = 5
+$script:StreamStateWidth = 8
+$script:StreamBarFilled = [char]0x25A0  # ■
+$script:StreamBarEmpty = [char]0x25A1   # □
+
 # Accessor functions
 function Get-RowHeader { return $script:RowHeader }
 function Get-RowDashStart { return $script:RowDashStart }
 function Get-MaxDropdownRows { return $script:MaxDropdownRows }
 function Get-InputLeft { return $script:InputLeft }
+function Get-StreamNameWidth { return $script:StreamNameWidth }
+function Get-StreamBarWidth { return $script:StreamBarWidth }
+function Get-StreamStateWidth { return $script:StreamStateWidth }
+function Get-StreamBarFilled { return $script:StreamBarFilled }
+function Get-StreamBarEmpty { return $script:StreamBarEmpty }
 
 # =============================================================================
 # GOLDEN TRANSPLANT: Get-PromptLayout (lines 4148-4166)
@@ -64,12 +77,12 @@ function Get-PromptLayout {
         RowInputTop   = $inputRow - 1    # Top border of input box
         RowInputBottom = $inputRow + 1   # Bottom border of input box
         RowFooter     = $inputRow - 2    # Footer/hint bar row
-        RowToast      = $inputRow - 3    # Toast message row
+        RowToast      = $inputRow + 2    # Toast right below input box (same row as dropdown start)
         DropdownRow   = $inputRow + 2    # Below bottom border (golden line 4161)
         Width         = $w
         Height        = $h
         MaxVisible    = [Math]::Min(8, $h - $inputRow - 3)  # Don't exceed terminal
         ContentStart  = $script:RowDashStart
-        ContentEnd    = $inputRow - 3    # Last row for main content (before toast)
+        ContentEnd    = $inputRow - 2    # Last row for main content (before footer)
     }
 }

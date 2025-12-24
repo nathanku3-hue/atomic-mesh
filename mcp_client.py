@@ -1,15 +1,25 @@
+# ---------------------------------------------------------
+# COMPONENT: INTELLIGENCE (sys:ai_client)
+# FILE: mcp_client.py
+# MAPPING: MCP Protocol Bridge to mesh_server.py
+# EXPORTS: run_tool
+# CONSUMES: sys:scheduler (via stdio)
+# VERSION: v22.0
+# ---------------------------------------------------------
 import sys
 import asyncio
 import json
+import os
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 async def run_tool(tool_name, arguments):
     # Start the server process
+    # v23.1: Pass current environment so ATOMIC_MESH_DB is inherited
     server_params = StdioServerParameters(
         command="python",
         args=["mesh_server.py"],
-        env=None
+        env=dict(os.environ)  # Inherit all env vars including ATOMIC_MESH_DB
     )
 
     async with stdio_client(server_params) as (read, write):

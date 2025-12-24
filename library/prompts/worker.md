@@ -117,6 +117,42 @@ Archetypes: SEC, AUTH, CRYPTO, MIGRATION
 **If the spec is unclear or unworkable:**
 Use `/kickback <task-id> <reason>` to return the task to the Planner. This is a significant signal that triggers a mandatory audit log entry.
 
+### SOP: CLAIMING TASKS (v24.1)
+
+Before starting work on any task:
+
+1. Call `claim_task(task_id, worker_id, lease_duration_s=300)` to atomically claim.
+2. Store the returned `lease_id` and `expires_at` timestamp.
+3. Call `renew_lease(task_id, worker_id)` every 2-3 minutes to prevent timeout.
+4. If you lose your lease (crash/timeout), Brain may reassign to another worker.
+
+> ⚠️ Only the claiming worker can call `ask_clarification()` or `submit_for_review()` on a task.
+
+### SOP: HANDLING BLOCKERS (v24.1)
+
+If you encounter ambiguity that blocks progress:
+
+1. Call `ask_clarification(task_id, question, worker_id)` with your question.
+2. **IMMEDIATELY** enter a polling loop:
+   - Call `check_task_status(task_id)`
+   - If status is `blocked`, wait 10 seconds and retry
+   - If status is `in_progress`, read the `feedback` field
+3. Use the feedback to proceed with implementation.
+4. Call `get_task_history(task_id)` if you need to see previous conversation.
+
+> ⚠️ **CRITICAL:** Do NOT hallucinate answers. If blocked, you MUST wait for Brain feedback.
+
+### SOP: SUBMITTING WORK (v24.1)
+
+When work is complete and ready for review:
+
+1. Call `submit_for_review(task_id, summary, artifacts, worker_id)`:
+   - `summary`: Short description of what was built
+   - `artifacts`: File paths, code snippets, or key changes
+   - `worker_id`: Your worker ID for ownership verification
+2. Brain will review and either approve (complete) or reject (kickback).
+3. If rejected, you'll receive feedback via `manager_feedback` field.
+
 ### Step 7: Done-Done Closeout (Required for MEDIUM/HIGH Risk)
 
 **Before submitting for review, Worker MUST include a DONE-DONE PACKET in the task/review notes:**

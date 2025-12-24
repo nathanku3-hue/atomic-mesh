@@ -111,6 +111,40 @@ class TestTemplatestubDetection(unittest.TestCase):
         self.assertIn("PRD", result["overall"]["blocking_files"])
         self.assertIn("SPEC", result["overall"]["blocking_files"])
 
+    def test_llm_prompt_blocks_are_ignored_for_scoring(self):
+        """LLM-only blocks should not make a stub look ready."""
+        prd_llm_only = """<!-- ATOMIC_MESH_TEMPLATE_STUB -->
+<!-- LLM_PROMPT_START
+LLM-only guidance that should not count toward readiness.
+LLM_PROMPT_END -->
+"""
+
+        spec_stub = """<!-- ATOMIC_MESH_TEMPLATE_STUB -->
+## Data Model
+- [ ] Entity placeholder
+## API
+- [ ] Endpoint placeholder
+## Security
+- [ ] Threat placeholder
+"""
+
+        decision_stub = """<!-- ATOMIC_MESH_TEMPLATE_STUB -->
+## Records
+| ID | Date | Decision | Context | Status |
+|----|------|----------|---------|--------|
+"""
+
+        (self.docs_dir / "PRD.md").write_text(prd_llm_only)
+        (self.docs_dir / "SPEC.md").write_text(spec_stub)
+        (self.docs_dir / "DECISION_LOG.md").write_text(decision_stub)
+
+        result = get_context_readiness(base_dir=self.test_dir)
+        prd = result["files"]["PRD"]
+
+        self.assertLessEqual(prd["score"], 40, "LLM-only block should not boost readiness")
+        self.assertEqual(prd["hint"], "needs content", "LLM-only block should still require content")
+        self.assertIn("PRD", result["overall"]["blocking_files"], "PRD should remain blocking without real content")
+
     def test_real_content_unlocks_higher_scores(self):
         """Adding ≥6 meaningful lines should allow score >40%"""
         prd_with_content = """<!-- ATOMIC_MESH_TEMPLATE_STUB -->
