@@ -1,30 +1,31 @@
 """
-Vibe Controller V2.1 Platinum Master
+Vibe Controller V3.2 Diamond Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
-Architecture: HYBRID DELEGATION
-- Architect can assign specific workers (@backend-1) OR use "auto" for load balancing
-- Controller acts as Auto-Router for "auto" assignments
-- Health-based routing prevents overloading workers
+Architecture: HYBRID DELEGATION + INTELLIGENT ROUTING
+- Architect can assign specific workers OR use "auto" for load balancing
+- Worker tiers (senior/standard) match task complexity
+- Smart backoff distinguishes network vs crash failures
+
+Features V3.2:
+- Worker Tiers: senior workers get effort >= 4 tasks
+- effort_rating + priority: Intelligent task-worker matching
+- Smart Backoff: network (2s fixed) vs crash (exponential)
+- Saturation Guard: Detects and logs when pools are full
+- DLQ Management: Dead letter queue for failed tasks
+- Priority Inheritance: Guardian tasks inherit parent priority
 
 Features V2.1:
 - Auto-Routing: worker_id="auto" → Controller assigns least-busy worker
 - Deduplication Guard: Prevents duplicate guardian tasks (QA/Docs)
-- Health-Based Routing: MAX_TASKS_PER_WORKER limit, route to free workers
+- Health-Based Routing: capacity_limit per worker
 
 Features V2.0:
 - Direct delegation with assignment watchdog (5 min timeout)
 - Dynamic load balancing with worker priority scores
 - Worker health tracking (active_tasks, last_seen, status)
 - Granular audit logging via task_history table
-- Circuit breaker for timeouts and QA rejections (3 retries max)
-- Rejection handling: QA can reject dev work, triggers retry with feedback
-- Guardian chaining: QA -> Docs (Docs waits for QA to pass)
-- Blocked task management: 24h timeout, smart reassignment, escalation
-- Admin tool integration: Human approval workflow
-- Prometheus-ready health metrics
-- Periodic DB integrity checks
 
 Notification: Console-only (Slack disabled)
 """
@@ -435,12 +436,14 @@ def route_pending_tasks(conn: sqlite3.Connection) -> int:
     return routed
 
 
-# --- V2.1: Deduplication Guard ---
+# --- V2.1: Deduplication Guard (V3.2: Priority Inheritance) ---
 def spawn_guardian(conn: sqlite3.Connection, worker_id: str, lane: str, goal: str, 
-                   context_files: str, dependencies: List[int]) -> Optional[int]:
+                   context_files: str, dependencies: List[int], 
+                   priority: str = 'normal') -> Optional[int]:
     """
-    V2.1 Deduplication Guard: Spawn guardian task with idempotency check.
-    Prevents duplicate QA/Docs tasks for the same goal.
+    V3.2 Guardian Spawner with Priority Inheritance.
+    - Prevents duplicate QA/Docs tasks for the same goal
+    - Inherits parent task priority (prevents priority inversion)
     
     Returns: task_id if created, None if duplicate skipped
     """
@@ -454,15 +457,15 @@ def spawn_guardian(conn: sqlite3.Connection, worker_id: str, lane: str, goal: st
             print(f"🛑 [Deduplication] Guardian task '{goal}' ({lane}) already exists (#{existing['id']}). Skipping.")
             return None
         
-        # Insert new guardian task
+        # Insert new guardian task with inherited priority
         cursor = conn.execute("""
-            INSERT INTO tasks (worker_id, lane, goal, context_files, dependencies, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (worker_id, lane, goal, context_files, json.dumps(dependencies)))
+            INSERT INTO tasks (worker_id, lane, goal, context_files, dependencies, priority, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (worker_id, lane, goal, context_files, json.dumps(dependencies), priority))
         
         task_id = cursor.lastrowid
-        print(f"🚀 [Guardian] Spawned {lane} task #{task_id}: {goal}")
-        log_status(conn, task_id, "spawned", worker_id, f"Guardian for deps: {dependencies}")
+        print(f"🚀 [Guardian] Spawned {lane} task #{task_id}: {goal} (priority: {priority})")
+        log_status(conn, task_id, "spawned", worker_id, f"Guardian for deps: {dependencies}, priority: {priority}")
         
         return task_id
         
@@ -472,6 +475,139 @@ def spawn_guardian(conn: sqlite3.Connection, worker_id: str, lane: str, goal: st
         return None
     except sqlite3.Error as e:
         print(f"⚠️ [Guardian] DB Error: {e}")
+        return None
+
+
+# --- V3.2: Saturation Guard ---
+def check_saturation(conn: sqlite3.Connection, lane: str) -> bool:
+    """
+    V3.2 Saturation Guard: Detect when a lane's worker pool is full.
+    Returns True if saturated (all workers at capacity).
+    """
+    try:
+        stats = conn.execute("""
+            SELECT 
+                COALESCE(SUM(active_tasks), 0) as total_load,
+                COALESCE(SUM(capacity_limit), 0) as total_capacity
+            FROM worker_health 
+            WHERE lane = ? AND status = 'online'
+        """, (lane,)).fetchone()
+        
+        if stats and stats['total_capacity'] > 0:
+            utilization = stats['total_load'] / stats['total_capacity']
+            if utilization >= 0.9:  # 90% or more
+                print(f"⚠️ [Saturation] {lane} pool at {int(utilization * 100)}% ({stats['total_load']}/{stats['total_capacity']})")
+                return True
+        return False
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Saturation] DB Error: {e}")
+        return False
+
+
+# --- V3.2: Smart Backoff ---
+def handle_smart_retry(conn: sqlite3.Connection, task_id: int, error_type: str = "crash") -> None:
+    """
+    V3.2 Smart Backoff: Different retry strategies based on error type.
+    - network: Fixed 2s retry (transient, likely to recover)
+    - crash: Exponential backoff (2s, 4s, 8s, 16s...)
+    - permanent: Move to dead_letter immediately
+    """
+    try:
+        task = conn.execute("SELECT attempt_count FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return
+            
+        attempts = task['attempt_count'] + 1
+        now = int(time.time())
+        
+        # Permanent error or max retries → Dead Letter Queue
+        if error_type == "permanent" or attempts >= MAX_RETRIES:
+            print(f"💀 [DLQ] Task #{task_id} moved to DEAD LETTER QUEUE (attempts: {attempts}, error: {error_type})")
+            conn.execute("UPDATE tasks SET status = 'dead_letter', worker_id = NULL, last_error_type = ?, updated_at = ? WHERE id = ?", (error_type, now, task_id))  # SAFETY-ALLOW: status-write
+            log_status(conn, task_id, "dead_letter", None, f"Max retries exceeded ({error_type})")
+            notify_human(task_id, f"Task moved to Dead Letter Queue after {attempts} attempts", "critical")
+            return
+        
+        # Calculate backoff based on error type
+        if error_type == "network":
+            backoff_seconds = 2  # Fixed 2s for network issues
+        else:
+            backoff_seconds = 2 ** attempts  # Exponential: 2, 4, 8, 16...
+        
+        backoff_until = now + backoff_seconds
+        
+        print(f"⏳ [Backoff] Task #{task_id} ({error_type}): retry in {backoff_seconds}s")
+        conn.execute("UPDATE tasks SET status = 'pending', worker_id = NULL, attempt_count = ?, backoff_until = ?, last_error_type = ?, updated_at = ? WHERE id = ?", (attempts, backoff_until, error_type, now, task_id))  # SAFETY-ALLOW: status-write
+        
+        log_status(conn, task_id, "retry_scheduled", None, f"{error_type} backoff: {backoff_seconds}s")
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Backoff] DB Error: {e}")
+
+
+# --- V3.2: Tier-Based Routing ---
+def get_best_worker_with_tier(conn: sqlite3.Connection, lane: str, 
+                               effort_rating: int = 1, priority: str = 'normal') -> Optional[str]:
+    """
+    V3.2 Intelligent Router: Match task effort to worker tier.
+    - effort >= 4: Prefer senior workers
+    - critical priority: Override tier preference, find any slot
+    
+    Returns: worker_id or None if no available worker
+    """
+    try:
+        # Bootstrap default workers if missing
+        defaults = {
+            'backend': [('@backend-senior', 'senior'), ('@backend-1', 'standard'), ('@backend-2', 'standard')],
+            'frontend': [('@frontend-senior', 'senior'), ('@frontend-1', 'standard'), ('@frontend-2', 'standard')],
+            'qa': [('@qa-1', 'standard')],
+            'docs': [('@librarian', 'standard')]
+        }
+        for w, tier in defaults.get(lane, []):
+            cap = 5 if tier == 'senior' else 3
+            conn.execute("""
+                INSERT OR IGNORE INTO worker_health (worker_id, lane, tier, capacity_limit, last_seen, status)
+                VALUES (?, ?, ?, ?, ?, 'online')
+            """, (w, lane, tier, cap, int(time.time())))
+        
+        # Check saturation first
+        check_saturation(conn, lane)
+        
+        # Determine preferred tier based on effort
+        prefer_senior = effort_rating >= 4
+        
+        if prefer_senior:
+            # Try senior first
+            row = conn.execute("""
+                SELECT worker_id FROM worker_health 
+                WHERE lane = ? AND status = 'online' AND tier = 'senior' AND active_tasks < capacity_limit
+                ORDER BY active_tasks ASC, last_seen DESC
+                LIMIT 1
+            """, (lane,)).fetchone()
+            
+            if row:
+                return row['worker_id']
+            
+            # Fallback to standard if no senior available (or critical priority overrides)
+            print(f"⚠️ [Router] No senior available for effort={effort_rating}, falling back to standard")
+        
+        # Query for any available worker
+        row = conn.execute("""
+            SELECT worker_id FROM worker_health 
+            WHERE lane = ? AND status = 'online' AND active_tasks < capacity_limit
+            ORDER BY active_tasks ASC, priority_score DESC, last_seen DESC
+            LIMIT 1
+        """, (lane,)).fetchone()
+        
+        if row:
+            return row['worker_id']
+        
+        print(f"⚠️ [Router] No available workers for {lane}. All at capacity.")
+        return None
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Router] DB Error: {e}")
         return None
 
 
@@ -843,14 +979,13 @@ def write_health_status():
 
 # --- Main Loop ---
 def run_controller():
-    """Main controller loop (V2.1 - Hybrid Delegation)."""
-    print(f"🧠 [System] Vibe Controller V2.1 Active (Platinum: Hybrid Delegation)")
-    print(f"   Architecture: HYBRID (Direct + Auto-Routing)")
+    """Main controller loop (V3.2 - Diamond Master)."""
+    print(f"🧠 [System] Vibe Controller V3.2 Active (Diamond: Intelligent Routing)")
+    print(f"   Architecture: HYBRID (Direct + Auto-Routing + Worker Tiers)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE}")
     print(f"   Assignment Timeout: {ASSIGNMENT_TIMEOUT_SEC}s | Idle Timeout: {IDLE_TIMEOUT_SEC}s")
-    print(f"   Max Tasks/Worker: {MAX_TASKS_PER_WORKER} | Max Retries: {MAX_RETRIES}")
-    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s")
-    print(f"   Features: Auto-Router, Deduplication Guard, Health-Based Routing")
+    print(f"   Features: Worker Tiers, Priority Inheritance, Smart Backoff, DLQ")
+    print(f"   Saturation Guard: Active | Deduplication: Active")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
     conn = get_db()

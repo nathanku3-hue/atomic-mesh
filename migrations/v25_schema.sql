@@ -1,7 +1,7 @@
 -- ============================================================
--- Vibe Coding V2.0 Infrastructure Schema
+-- Vibe Coding V3.2 Infrastructure Schema
 -- ============================================================
--- Support for Direct Delegation, Detailed Logging, and Worker Health
+-- Features: Direct Delegation, Worker Tiers, Smart Backoff, DLQ
 -- Run: sqlite3 vibe_coding.db < migrations/v25_schema.sql
 -- ============================================================
 
@@ -17,8 +17,8 @@ PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     
-    -- Assignment (REQUIRED)
-    worker_id TEXT NOT NULL,            -- Target worker (e.g., @backend-1)
+    -- Assignment (NULL = pending reassignment after failure)
+    worker_id TEXT,                      -- Target worker or NULL for pending/retry
     lane TEXT NOT NULL,                 -- Skill lane (backend, frontend, qa, docs)
     
     -- Status
@@ -33,11 +33,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     lease_id TEXT,                      -- Worker session ID (for crash recovery)
     lease_expires_at INTEGER DEFAULT 0,
     
-    -- Retry Logic
+    -- Retry Logic (V3.2)
     attempt_count INTEGER DEFAULT 0,
+    backoff_until INTEGER DEFAULT 0,    -- V3.2: Don't retry before this timestamp
+    last_error_type TEXT,               -- V3.2: 'network', 'crash', 'permanent'
+    
+    -- Priority & Complexity (V3.2)
+    priority TEXT DEFAULT 'normal',     -- 'critical', 'high', 'normal'
+    effort_rating INTEGER DEFAULT 1,    -- 1 (easy) to 5 (hard)
     
     -- Metadata (JSON)
-    metadata TEXT,                      -- risk, priority, fallback_tried, blocker_msg, etc.
+    metadata TEXT,                      -- risk, fallback_tried, blocker_msg, etc.
     
     -- Timestamps
     created_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -83,6 +89,10 @@ CREATE TABLE IF NOT EXISTS worker_health (
     worker_id TEXT PRIMARY KEY,         -- e.g., @backend-1
     lane TEXT NOT NULL,                 -- backend, frontend, qa, docs
     
+    -- V3.2: Worker Tier
+    tier TEXT DEFAULT 'standard',       -- 'senior', 'standard'
+    capacity_limit INTEGER DEFAULT 3,   -- Max concurrent tasks (V3.2)
+    
     -- Availability
     last_seen INTEGER DEFAULT 0,        -- Unix timestamp of last heartbeat
     status TEXT DEFAULT 'online',       -- online, busy, offline
@@ -116,14 +126,16 @@ CREATE INDEX IF NOT EXISTS idx_worker_lane ON worker_health(lane, status, active
 -- ============================================================
 -- Insert default workers for each lane.
 
-INSERT OR IGNORE INTO worker_health (worker_id, lane, status, priority_score)
+INSERT OR IGNORE INTO worker_health (worker_id, lane, tier, capacity_limit, status, priority_score)
 VALUES 
-    ('@backend-1', 'backend', 'online', 60),
-    ('@backend-2', 'backend', 'online', 50),
-    ('@frontend-1', 'frontend', 'online', 60),
-    ('@frontend-2', 'frontend', 'online', 50),
-    ('@qa-1', 'qa', 'online', 50),
-    ('@librarian', 'docs', 'online', 50);
+    ('@backend-senior', 'backend', 'senior', 5, 'online', 80),
+    ('@backend-1', 'backend', 'standard', 3, 'online', 60),
+    ('@backend-2', 'backend', 'standard', 3, 'online', 50),
+    ('@frontend-senior', 'frontend', 'senior', 5, 'online', 80),
+    ('@frontend-1', 'frontend', 'standard', 3, 'online', 60),
+    ('@frontend-2', 'frontend', 'standard', 3, 'online', 50),
+    ('@qa-1', 'qa', 'standard', 3, 'online', 50),
+    ('@librarian', 'docs', 'standard', 3, 'online', 50);
 
 -- ============================================================
 -- 7. V2.1: Deduplication Index for Guardians
@@ -143,4 +155,12 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
-INSERT OR REPLACE INTO schema_version (version) VALUES ('v25_2.1');
+INSERT OR REPLACE INTO schema_version (version) VALUES ('v25_3.2');
+
+-- ============================================================
+-- 8. V3.2: Dead Letter Queue View
+-- ============================================================
+
+CREATE VIEW IF NOT EXISTS view_dead_letter_queue AS
+SELECT id, goal, lane, attempt_count, last_error_type, created_at
+FROM tasks WHERE status = 'dead_letter';

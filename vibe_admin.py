@@ -1,5 +1,5 @@
 """
-Vibe Admin Tool V1.3 Platinum Master
+Vibe Admin Tool V3.2 Diamond Master
 ====================================
 Human Control Panel for the Vibe Coding System.
 
@@ -7,7 +7,12 @@ Features:
 - Audit Trails: Every admin action logged to task_messages
 - Transactional Safety: Strict try/except/rollback patterns
 - Role Gating: VIBE_ROLE environment check
-- Commands: list, approve, retry
+- Commands: list, approve, retry, dlq
+
+V3.2 DLQ Commands:
+- dlq list: Show dead letter tasks
+- dlq retry: Retry all (set priority=high)
+- dlq purge: Delete all dead letter tasks
 """
 
 import sqlite3
@@ -122,9 +127,102 @@ def retry_task(task_id):
     finally:
         conn.close()
 
+# --- V3.2: Dead Letter Queue Commands ---
+
+def dlq_list():
+    """List all tasks in the Dead Letter Queue."""
+    conn = get_db()
+    try:
+        rows = conn.execute("""
+            SELECT id, goal, lane, attempt_count, last_error_type, created_at 
+            FROM tasks WHERE status = 'dead_letter'
+            ORDER BY created_at DESC
+        """).fetchall()
+        
+        if not rows:
+            print("✅ Dead Letter Queue is empty.")
+            return
+        
+        print(f"\n💀 Found {len(rows)} tasks in Dead Letter Queue:")
+        for r in rows:
+            age_hours = (int(time.time()) - r['created_at']) // 3600
+            print(f"  [#{r['id']}] {r['goal']}")
+            print(f"      Lane: {r['lane']} | Attempts: {r['attempt_count']} | Error: {r['last_error_type'] or 'unknown'}")
+            print(f"      Age: {age_hours}h")
+    finally:
+        conn.close()
+
+
+def dlq_retry():
+    """Retry all tasks in the Dead Letter Queue (set priority=high)."""
+    check_permissions()
+    conn = get_db()
+    try:
+        conn.execute("BEGIN")
+        
+        # Count before update
+        count = conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'dead_letter'").fetchone()['c']
+        
+        if count == 0:
+            print("✅ Dead Letter Queue is empty. Nothing to retry.")
+            return
+        
+        # Reset all DLQ tasks
+        conn.execute("""
+            UPDATE tasks 
+            SET status = 'pending', attempt_count = 0, worker_id = NULL, 
+                backoff_until = 0, priority = 'high', updated_at = ?
+            WHERE status = 'dead_letter'
+        """, (int(time.time()),))  # SAFETY-ALLOW: status-write
+        
+        # Audit log (use task_id=0 for system-wide actions)
+        log_admin_action(conn, 0, "DLQ_RETRY", f"Resuscitated {count} dead letter tasks with priority=high")
+        
+        conn.commit()
+        print(f"🚑 Resuscitated {count} tasks from Dead Letter Queue (priority: high).")
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"💥 Failed to retry DLQ: {e}")
+    finally:
+        conn.close()
+
+
+def dlq_purge():
+    """Permanently delete all tasks in the Dead Letter Queue."""
+    check_permissions()
+    conn = get_db()
+    try:
+        count = conn.execute("SELECT COUNT(*) as c FROM tasks WHERE status = 'dead_letter'").fetchone()['c']
+        
+        if count == 0:
+            print("✅ Dead Letter Queue is empty. Nothing to purge.")
+            return
+        
+        # Confirm before purge
+        print(f"⚠️ About to PERMANENTLY DELETE {count} dead letter tasks.")
+        confirm = input("Type 'PURGE' to confirm: ")
+        if confirm != "PURGE":
+            print("❌ Purge cancelled.")
+            return
+        
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM tasks WHERE status = 'dead_letter'")
+        log_admin_action(conn, 0, "DLQ_PURGE", f"Purged {count} dead letter tasks")
+        conn.commit()
+        
+        print(f"🗑️ Purged {count} tasks from Dead Letter Queue.")
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"💥 Failed to purge DLQ: {e}")
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python vibe_admin.py [list|approve <id>|retry <id>]")
+        print("Usage: python vibe_admin.py [list|approve <id>|retry <id>|dlq <list|retry|purge>]")
         sys.exit(1)
     
     cmd = sys.argv[1]
@@ -137,5 +235,18 @@ if __name__ == "__main__":
     elif cmd == "retry": 
         if len(sys.argv) < 3: print("Error: Missing Task ID"); sys.exit(1)
         retry_task(sys.argv[2])
+    elif cmd == "dlq":
+        if len(sys.argv) < 3:
+            print("Usage: python vibe_admin.py dlq [list|retry|purge]")
+            sys.exit(1)
+        subcmd = sys.argv[2]
+        if subcmd == "list":
+            dlq_list()
+        elif subcmd == "retry":
+            dlq_retry()
+        elif subcmd == "purge":
+            dlq_purge()
+        else:
+            print(f"Unknown DLQ command: {subcmd}")
     else:
         print(f"Unknown command: {cmd}")
