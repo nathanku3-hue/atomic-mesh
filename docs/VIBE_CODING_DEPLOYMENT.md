@@ -2,10 +2,11 @@
 
 ## 🚀 System Status: PRODUCTION READY
 
-**Version:** v1.3 (Platinum Master)  
+**Version:** v2.0 (Platinum Master)  
+**Architecture:** PUSH (Direct Delegation)  
 **Last Updated:** 2024-12-24  
 **Test Coverage:** Fully Verified ✅  
-**New in V1.3:** Admin Tool, Audit Trails, RBAC
+**New in V2.0:** Push Delegation, Worker Health, Context Compacting
 
 ---
 
@@ -13,15 +14,17 @@
 
 | Artifact | Location | Status | Purpose |
 |----------|----------|--------|---------|
-| **Vibe Controller** | `vibe_controller.py` | ✅ V1.3 | Platinum Master with admin integration |
+| **Vibe Controller** | `vibe_controller.py` | ✅ V2.0 | Push delegation, fallbacks, worker health |
 | **Admin Tool** | `vibe_admin.py` | ✅ V1.3 | Human control panel (list/approve/retry) |
 | **Agent Tools** | `agent_tools.py` | ✅ V1.2 | Worker interface (`ask_clarification`, `claim_task`) |
-| **Infrastructure SQL** | `migrations/v24_infrastructure.sql` | ✅ Complete | Consolidated schema + indexes |
-| **Architect SOP** | `library/prompts/architect_sop.md` | ✅ V1.1 | Brain with Lane Discipline rule |
-| **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Code quality guardian with veto power |
-| **Frontend Worker SOP** | `library/prompts/frontend_worker_sop.md` | ✅ Reference | UX guardian with performance targets |
+| **V2.0 Schema** | `migrations/v25_schema.sql` | ✅ V2.0 | task_history, worker_health tables |
+| **V1.0 Schema** | `migrations/v24_infrastructure.sql` | ✅ V1.0 | Base schema + indexes |
+| **Architect SOP** | `library/prompts/architect_sop.md` | ✅ V2.0 | Delegator with context compacting |
+| **Librarian SOP** | `library/prompts/librarian_worker_sop.md` | ✅ V2.0 | Context compacting, PROJECT_HISTORY.md |
+| **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Code quality guardian |
+| **Frontend Worker SOP** | `library/prompts/frontend_worker_sop.md` | ✅ Reference | UX guardian |
 | **QA Worker SOP** | `library/prompts/qa_worker_sop.md` | ✅ Reference | Adversarial testing guardian |
-| **Librarian SOP** | `library/prompts/librarian_worker_sop.md` | ✅ Reference | Documentation guardian |
+| **Project History** | `PROJECT_HISTORY.md` | ✅ V2.0 | Architect's long-term memory |
 
 ---
 

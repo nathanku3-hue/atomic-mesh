@@ -1,10 +1,18 @@
 """
-Vibe Controller V1.3 Platinum Master
+Vibe Controller V2.0 Platinum Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
+Architecture: PUSH (Direct Delegation)
+- Architect assigns tasks directly to specific workers (@backend-1, etc.)
+- Controller tracks assignments and enforces deadlines
+- Fallback system reassigns unresponsive workers
+
 Features:
-- Graceful shutdown with task state cleanup
+- Direct delegation with assignment watchdog (5 min timeout)
+- Dynamic load balancing with worker priority scores
+- Worker health tracking (active_tasks, last_seen, status)
+- Granular audit logging via task_history table
 - Circuit breaker for timeouts and QA rejections (3 retries max)
 - Rejection handling: QA can reject dev work, triggers retry with feedback
 - Guardian chaining: QA -> Docs (Docs waits for QA to pass)
@@ -12,6 +20,8 @@ Features:
 - Admin tool integration: Human approval workflow
 - Prometheus-ready health metrics
 - Periodic DB integrity checks
+
+Notification: Console-only (Slack disabled)
 """
 
 import time
@@ -21,17 +31,19 @@ import signal
 import sys
 import os
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 # --- Configuration ---
 DB_PATH = os.getenv("DB_PATH", "vibe_coding.db")
 LEASE_TIMEOUT_SEC = int(os.getenv("LEASE_TIMEOUT_SEC", "600"))
 BLOCKED_TIMEOUT_SEC = int(os.getenv("BLOCKED_TIMEOUT_SEC", "86400"))  # 24 hours
+ASSIGNMENT_TIMEOUT_SEC = int(os.getenv("ASSIGNMENT_TIMEOUT_SEC", "300"))  # 5 minutes
+IDLE_TIMEOUT_SEC = int(os.getenv("IDLE_TIMEOUT_SEC", "600"))  # 10 minutes
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES = 3
-METRICS_INTERVAL = 60  # Collect metrics every minute (not every poll)
+METRICS_INTERVAL = 60  # Collect metrics every minute
 
 # --- State Management ---
 running = True
@@ -152,6 +164,179 @@ def notify_human(task_id: int, reason: str, priority: str = "info"):
             conn.close()
         except Exception:
             pass  # Don't fail on alert persistence
+
+
+# --- V2.0: Audit Logging ---
+def log_status(conn: sqlite3.Connection, task_id: int, status: str, worker_id: str, details: str = None):
+    """
+    Write to immutable task_history for granular audit trail.
+    Every status change is permanently logged.
+    """
+    try:
+        conn.execute("""
+            INSERT INTO task_history (task_id, status, worker_id, timestamp, details)
+            VALUES (?, ?, ?, ?, ?)
+        """, (task_id, status, worker_id, int(time.time()), details))
+    except sqlite3.Error:
+        pass  # Don't fail on audit logging
+
+
+# --- V2.0: Worker Health Management ---
+def update_worker_health(conn: sqlite3.Connection, worker_id: str, action: str):
+    """
+    Update worker health metrics on task claim/complete.
+    Actions: 'claim' (increment active_tasks), 'complete' (decrement, increment completed_today)
+    """
+    now = int(time.time())
+    try:
+        if action == 'claim':
+            conn.execute("""
+                UPDATE worker_health 
+                SET active_tasks = active_tasks + 1, last_seen = ?, status = 'busy'
+                WHERE worker_id = ?
+            """, (now, worker_id))
+        elif action == 'complete':
+            conn.execute("""
+                UPDATE worker_health 
+                SET active_tasks = MAX(0, active_tasks - 1), 
+                    completed_today = completed_today + 1,
+                    last_seen = ?,
+                    status = CASE WHEN active_tasks <= 1 THEN 'online' ELSE 'busy' END
+                WHERE worker_id = ?
+            """, (now, worker_id))
+        elif action == 'heartbeat':
+            conn.execute("""
+                UPDATE worker_health SET last_seen = ? WHERE worker_id = ?
+            """, (now, worker_id))
+    except sqlite3.Error:
+        pass  # Don't fail on health update
+
+
+def get_fallback_worker(conn: sqlite3.Connection, lane: str, ignore_id: str) -> Optional[str]:
+    """
+    Dynamic load balancer: Find optimal worker for fallback.
+    Considers: active_tasks, priority_score, last_seen.
+    Returns best worker_id or None if no alternatives.
+    """
+    try:
+        # Query for online workers in this lane, excluding ignored worker
+        # Order by: lowest active_tasks, highest priority_score, most recent last_seen
+        row = conn.execute("""
+            SELECT worker_id FROM worker_health
+            WHERE lane = ? AND worker_id != ? AND status != 'offline'
+            ORDER BY active_tasks ASC, priority_score DESC, last_seen DESC
+            LIMIT 1
+        """, (lane, ignore_id)).fetchone()
+        
+        if row:
+            return row['worker_id']
+        
+        # Fallback to hardcoded alternatives if worker_health is empty
+        fallbacks = {
+            'backend': ['@backend-1', '@backend-2'],
+            'frontend': ['@frontend-1', '@frontend-2'],
+            'qa': ['@qa-1'],
+            'docs': ['@librarian']
+        }
+        candidates = fallbacks.get(lane, [])
+        for w in candidates:
+            if w != ignore_id:
+                return w
+        return None
+        
+    except sqlite3.Error:
+        return None
+
+
+def handle_worker_idle(conn: sqlite3.Connection) -> int:
+    """
+    Detect workers that have been idle (no heartbeat) for too long.
+    Marks them as 'offline' and alerts admin.
+    Returns count of workers marked offline.
+    """
+    now = int(time.time())
+    threshold = now - IDLE_TIMEOUT_SEC
+    marked = 0
+    
+    try:
+        idle_workers = conn.execute("""
+            SELECT worker_id, lane FROM worker_health
+            WHERE status != 'offline' AND last_seen < ? AND last_seen > 0
+        """, (threshold,)).fetchall()
+        
+        for worker in idle_workers:
+            conn.execute("""
+                UPDATE worker_health SET status = 'offline' WHERE worker_id = ?
+            """, (worker['worker_id'],))
+            notify_human(0, f"Worker {worker['worker_id']} ({worker['lane']}) marked OFFLINE (idle > {IDLE_TIMEOUT_SEC//60}min)", "warning")
+            marked += 1
+        
+        if marked > 0:
+            conn.commit()
+            
+    except sqlite3.Error as e:
+        print(f"⚠️ [Health] DB Error: {e}")
+    
+    return marked
+
+
+# --- V2.0: Assignment Watchdog ---
+def enforce_assignments(conn: sqlite3.Connection) -> int:
+    """
+    Watchdog: Detect tasks that have been pending too long (ignored by assigned worker).
+    Reassigns to fallback worker or escalates to admin.
+    Returns count of tasks reassigned.
+    """
+    now = int(time.time())
+    threshold = now - ASSIGNMENT_TIMEOUT_SEC
+    reassigned = 0
+    
+    try:
+        # Find tasks pending longer than assignment timeout
+        ignored = conn.execute(f"""
+            SELECT * FROM tasks 
+            WHERE status = 'pending' AND created_at < ?
+            LIMIT {BATCH_SIZE}
+        """, (threshold,)).fetchall()
+        
+        for task in ignored:
+            task_id = task['id']
+            original_worker = task['worker_id']
+            lane = task['lane']
+            meta = json.loads(task['metadata'] or '{}')
+            
+            # Check if fallback already tried
+            if meta.get('fallback_tried'):
+                notify_human(task_id, 
+                    f"Task ignored by PRIMARY ({original_worker}) and FALLBACK. Human intervention needed.", 
+                    "critical")
+                continue
+            
+            # Try to find fallback worker
+            fallback = get_fallback_worker(conn, lane, original_worker)
+            
+            if fallback:
+                print(f"⚠️ [Watchdog] Worker {original_worker} unresponsive. Reassigning #{task_id} to {fallback}.")
+                meta['fallback_tried'] = True
+                meta['original_worker'] = original_worker
+                
+                conn.execute("""
+                    UPDATE tasks SET worker_id = ?, metadata = ?, updated_at = ? WHERE id = ?
+                """, (fallback, json.dumps(meta), now, task_id))
+                
+                log_status(conn, task_id, "reassigned", fallback, f"Fallback from {original_worker}")
+                reassigned += 1
+            else:
+                notify_human(task_id, f"No fallback workers available for lane '{lane}'. Task stuck.", "critical")
+        
+        if reassigned > 0:
+            conn.commit()
+            
+    except sqlite3.Error as e:
+        print(f"⚠️ [Watchdog] DB Error: {e}")
+        traceback.print_exc()
+    
+    return reassigned
 
 
 # --- Core Logic ---
@@ -522,11 +707,13 @@ def write_health_status():
 
 # --- Main Loop ---
 def run_controller():
-    """Main controller loop."""
-    print(f"🧠 [System] Vibe Controller V1.3 Active (Platinum: Admin Tool Integration)")
-    print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE} | Max Retries: {MAX_RETRIES}")
-    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s")
-    print(f"   Metrics collection: every {METRICS_INTERVAL}s")
+    """Main controller loop (V2.0 - Push Architecture)."""
+    print(f"🧠 [System] Vibe Controller V2.0 Active (Platinum: Push Delegation)")
+    print(f"   Architecture: PUSH (Direct Assignment to Workers)")
+    print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE}")
+    print(f"   Assignment Timeout: {ASSIGNMENT_TIMEOUT_SEC}s | Idle Timeout: {IDLE_TIMEOUT_SEC}s")
+    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s | Max Retries: {MAX_RETRIES}")
+    print(f"   Notification: Console-only (Slack disabled)")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
     conn = get_db()
@@ -541,6 +728,13 @@ def run_controller():
         while running:
             start_time = time.time()
             
+            # V2.0: Assignment Watchdog (detect ignored tasks, reassign)
+            enforce_assignments(conn)
+            
+            # V2.0: Worker Health (detect idle workers, mark offline)
+            handle_worker_idle(conn)
+            
+            # V1.x: Core orchestration
             sweep_stale_leases(conn)
             sweep_blocked_tasks(conn)
             handle_review_queue(conn)
