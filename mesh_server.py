@@ -1372,8 +1372,8 @@ def check_task_status(task_id: int) -> str:
                     "instruction": "Still waiting for Brain. Sleep 10 seconds and retry."
                 })
             elif task_status == "pending":
-                return json.dumps({  # SAFETY-ALLOW: status-write (response dict, not DB mutation)
-                    "status": "pending",
+                return json.dumps({
+                    "status": "pending",  # SAFETY-ALLOW: status-write (response dict, not DB mutation)
                     "feedback": row["manager_feedback"] or "",
                     "instruction": "Unblocked! Resume execution using the feedback."
                 })
