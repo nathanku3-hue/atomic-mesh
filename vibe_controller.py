@@ -638,6 +638,8 @@ def archive_old_history(conn: sqlite3.Connection, days: int = None) -> int:
 
 
 # --- V3.3: Auto-Scaler Hook ---
+_auto_scale_counter = 0  # Unique ID counter
+
 def provision_virtual_worker(conn: sqlite3.Connection, lane: str) -> Optional[str]:
     """
     V3.3: Auto-scale by provisioning a virtual worker.
@@ -646,6 +648,7 @@ def provision_virtual_worker(conn: sqlite3.Connection, lane: str) -> Optional[st
     
     Returns: new worker_id or None if limit reached
     """
+    global _auto_scale_counter
     try:
         # Check current auto-scaled worker count
         count = conn.execute("""
@@ -657,8 +660,9 @@ def provision_virtual_worker(conn: sqlite3.Connection, lane: str) -> Optional[st
             print(f"⚠️ [Scaler] {lane} at auto-scale limit ({count}/{MAX_AUTO_SCALE_WORKERS})")
             return None
         
-        # Provision new worker
-        new_id = f"@{lane}-auto-{int(time.time())}"
+        # Provision new worker with unique ID
+        _auto_scale_counter += 1
+        new_id = f"@{lane}-auto-{int(time.time())}-{_auto_scale_counter}"
         print(f"⚡ [Scaler] Provisioning virtual worker: {new_id}")
         
         conn.execute("""
