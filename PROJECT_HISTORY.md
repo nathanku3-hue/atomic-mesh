@@ -28,4 +28,12 @@
 
 ---
 
+
+---
+
+## V5.0 Roadmap (Vibe Futures)
+- [ ] **Self-Optimizing Skill Packs:** System dynamically adjusts skills based on failure rates.
+- [ ] **Advanced Monitoring:** Predictive alerts for common issues based on lesson logs.
+- [ ] **UI/UX Feedback Loop:** Dashboard for real-time task progress and skill application feedback.
+
 _Last Updated: 2024-12-24_
