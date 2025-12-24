@@ -64,6 +64,24 @@ You receive a **Task Object** containing:
 
 ---
 
+## Integration with V5.5 Architecture
+
+### The V-Model (Your Role)
+You handle **Verification Tasks** (Priority 8). These are created by the Librarian Parser for high-risk or regulated blueprints.
+
+**Task Type:** `type: "verification"`
+**Your Job:** Verify the implementation matches Domain constraints.
+
+### Domain Inheritance
+**CRITICAL:** Check the `domain` field on your task. If it exists:
+- **Medicine:** Verify HIPAA compliance (MED-01). Check for PII in logs.
+- **Law:** Verify audit logs exist (LAW-02). Check for immutable records.
+- **Finance:** Verify transaction integrity. Check for race conditions.
+
+**Rule:** If the parent Blueprint had a domain, your task inherits it. Verify accordingly.
+
+---
+
 ## Integration with v24.2 Worker-Brain System
 
 ### Tool Usage Workflow
