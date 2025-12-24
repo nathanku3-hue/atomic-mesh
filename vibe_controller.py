@@ -85,6 +85,8 @@ def inject_domain_and_lane_rules(task, domain=None, lane=None):
                      context_str += f"\n\n--- LANE RULES (Fallback) ---\n{f.read()}"
             else:
                  print(f" >> [Controller] ⚠️  Lane '{lane}' missing and No Default found.")
+    
+    return context_str, None
 
 def run_librarian_review(task, worker_summary):
     print(f" >> [Controller] Librarian reviewing Task #{task['id']}...")
