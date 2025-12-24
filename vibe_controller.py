@@ -1,5 +1,5 @@
 """
-Vibe Controller V1.2 Platinum Master
+Vibe Controller V1.3 Platinum Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
@@ -8,7 +8,8 @@ Features:
 - Circuit breaker for timeouts and QA rejections (3 retries max)
 - Rejection handling: QA can reject dev work, triggers retry with feedback
 - Guardian chaining: QA -> Docs (Docs waits for QA to pass)
-- **Blocked task management: 24h timeout, smart reassignment, escalation**
+- Blocked task management: 24h timeout, smart reassignment, escalation
+- Admin tool integration: Human approval workflow
 - Prometheus-ready health metrics
 - Periodic DB integrity checks
 """
@@ -522,7 +523,7 @@ def write_health_status():
 # --- Main Loop ---
 def run_controller():
     """Main controller loop."""
-    print(f"🧠 [System] Vibe Controller V1.2 Active (Platinum: Blocked Task Management)")
+    print(f"🧠 [System] Vibe Controller V1.3 Active (Platinum: Admin Tool Integration)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE} | Max Retries: {MAX_RETRIES}")
     print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s")
     print(f"   Metrics collection: every {METRICS_INTERVAL}s")
