@@ -1,5 +1,5 @@
 -- ============================================================
--- Vibe Coding V3.2 Infrastructure Schema
+-- Vibe Coding V3.3 Infrastructure Schema
 -- ============================================================
 -- Features: Direct Delegation, Worker Tiers, Smart Backoff, DLQ
 -- Run: sqlite3 vibe_coding.db < migrations/v25_schema.sql
@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     
     -- Timestamps
     created_at INTEGER DEFAULT (strftime('%s', 'now')),
-    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+    updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+    status_updated_at INTEGER DEFAULT (strftime('%s', 'now'))  -- V3.3: Precise status tracking
 );
 
 -- ============================================================
@@ -155,12 +156,31 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
 
-INSERT OR REPLACE INTO schema_version (version) VALUES ('v25_3.2');
-
--- ============================================================
--- 8. V3.2: Dead Letter Queue View
--- ============================================================
-
 CREATE VIEW IF NOT EXISTS view_dead_letter_queue AS
 SELECT id, goal, lane, attempt_count, last_error_type, created_at
 FROM tasks WHERE status = 'dead_letter';
+
+-- ============================================================
+-- 9. V3.3: Task History Archive
+-- ============================================================
+-- Stores archived history records for data hygiene
+
+CREATE TABLE IF NOT EXISTS task_history_archive (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER,
+    status TEXT,
+    worker_id TEXT,
+    timestamp INTEGER,
+    details TEXT
+);
+
+-- ============================================================
+-- 10. V3.3: Backoff Ready Index
+-- ============================================================
+-- Fast lookup of tasks ready for retry
+
+CREATE INDEX IF NOT EXISTS idx_backoff_ready 
+ON tasks(status, backoff_until);
+
+-- Update schema version
+INSERT OR REPLACE INTO schema_version (version) VALUES ('v25_3.3');

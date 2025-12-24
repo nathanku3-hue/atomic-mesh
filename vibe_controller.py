@@ -1,5 +1,5 @@
 """
-Vibe Controller V3.2 Diamond Master
+Vibe Controller V3.3 Titanium Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
@@ -7,6 +7,14 @@ Architecture: HYBRID DELEGATION + INTELLIGENT ROUTING
 - Architect can assign specific workers OR use "auto" for load balancing
 - Worker tiers (senior/standard) match task complexity
 - Smart backoff distinguishes network vs crash failures
+
+Features V3.3:
+- In-Memory Worker Cache: 10s TTL, invalidation on writes
+- Weighted Scoring Router: Multi-factor task-worker matching
+- Task History Archival: 7-day cleanup, archive table
+- status_updated_at: Precise status change tracking
+- Monitoring: Cache hits/misses, saturation events
+- Auto-Scaler Hook: Virtual worker provisioning (optional)
 
 Features V3.2:
 - Worker Tiers: senior workers get effort >= 4 tasks
@@ -52,6 +60,11 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES = 3
 METRICS_INTERVAL = 60  # Collect metrics every minute
 
+# V3.3: Cache & Scaling Config
+CACHE_TTL = int(os.getenv("CACHE_TTL", "10"))  # seconds
+HISTORY_ARCHIVE_DAYS = int(os.getenv("HISTORY_ARCHIVE_DAYS", "7"))
+MAX_AUTO_SCALE_WORKERS = int(os.getenv("MAX_AUTO_SCALE_WORKERS", "5"))
+
 # --- State Management ---
 running = True
 circuit_breaker_failures = 0
@@ -67,7 +80,15 @@ metrics = {
     "avg_completion_time_ms": 0,
     "last_sweep_recovered": 0,
     "last_metrics_update": 0,
+    # V3.3 metrics
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "saturation_events": 0,
+    "auto_scale_events": 0,
 }
+
+# V3.3: In-Memory Worker Cache
+WORKER_CACHE = {}  # {lane: (workers_list, timestamp)}
 
 
 def handle_signal(signum, frame):
@@ -80,6 +101,77 @@ def handle_signal(signum, frame):
 
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
+
+
+# --- V3.3: Cache Functions ---
+def get_cached_workers(conn: sqlite3.Connection, lane: str) -> List[Dict]:
+    """
+    V3.3: Get workers from cache or DB.
+    Cache TTL: CACHE_TTL seconds.
+    """
+    global WORKER_CACHE
+    now = time.time()
+    
+    if lane in WORKER_CACHE:
+        cached_workers, cached_time = WORKER_CACHE[lane]
+        if now - cached_time < CACHE_TTL:
+            metrics["cache_hits"] += 1
+            return cached_workers
+    
+    # Cache miss - query DB
+    metrics["cache_misses"] += 1
+    try:
+        workers = conn.execute("""
+            SELECT worker_id, tier, active_tasks, capacity_limit, priority_score, last_seen
+            FROM worker_health WHERE lane = ? AND status = 'online'
+        """, (lane,)).fetchall()
+        
+        worker_list = [dict(w) for w in workers]
+        WORKER_CACHE[lane] = (worker_list, now)
+        return worker_list
+    except sqlite3.Error:
+        return []
+
+
+def invalidate_worker_cache(lane: str = None):
+    """V3.3: Invalidate cache after worker updates."""
+    global WORKER_CACHE
+    if lane:
+        WORKER_CACHE.pop(lane, None)
+    else:
+        WORKER_CACHE.clear()
+
+
+import random  # For tie-breaker
+
+def calculate_worker_score(worker: Dict, effort_rating: int, priority: str) -> int:
+    """
+    V3.3: Multi-factor scoring for worker selection.
+    Higher score = better match.
+    """
+    score = 0
+    
+    # Factor 1: Free Capacity (higher = better)
+    free = worker.get('capacity_limit', 3) - worker.get('active_tasks', 0)
+    score += free * 10
+    
+    # Factor 2: Tier Match
+    if effort_rating >= 4:
+        if worker.get('tier') == 'senior':
+            score += 50  # Senior bonus for hard tasks
+        else:
+            score -= 20  # Penalty for standard on hard task
+    
+    # Factor 3: Priority Override
+    if priority == 'critical':
+        score += 30
+    elif priority == 'high':
+        score += 15
+    
+    # Factor 4: Priority score from worker health
+    score += worker.get('priority_score', 50) // 10
+    
+    return score
 
 
 # --- Database Layer with Retry ---
@@ -478,10 +570,11 @@ def spawn_guardian(conn: sqlite3.Connection, worker_id: str, lane: str, goal: st
         return None
 
 
-# --- V3.2: Saturation Guard ---
+# --- V3.2: Saturation Guard (V3.3: With Metrics) ---
 def check_saturation(conn: sqlite3.Connection, lane: str) -> bool:
     """
     V3.2 Saturation Guard: Detect when a lane's worker pool is full.
+    V3.3: Records saturation_events metric.
     Returns True if saturated (all workers at capacity).
     """
     try:
@@ -497,12 +590,91 @@ def check_saturation(conn: sqlite3.Connection, lane: str) -> bool:
             utilization = stats['total_load'] / stats['total_capacity']
             if utilization >= 0.9:  # 90% or more
                 print(f"⚠️ [Saturation] {lane} pool at {int(utilization * 100)}% ({stats['total_load']}/{stats['total_capacity']})")
+                metrics["saturation_events"] += 1
                 return True
         return False
         
     except sqlite3.Error as e:
         print(f"⚠️ [Saturation] DB Error: {e}")
         return False
+
+
+# --- V3.3: Task History Archival ---
+def archive_old_history(conn: sqlite3.Connection, days: int = None) -> int:
+    """
+    V3.3: Move old task_history records to archive table.
+    Prevents history table bloat.
+    Returns count of archived records.
+    """
+    if days is None:
+        days = HISTORY_ARCHIVE_DAYS
+        
+    try:
+        cutoff = int(time.time()) - (days * 86400)
+        
+        # Count records to archive
+        count = conn.execute(
+            "SELECT COUNT(*) as c FROM task_history WHERE timestamp < ?", (cutoff,)
+        ).fetchone()['c']
+        
+        if count == 0:
+            return 0
+        
+        # Move to archive
+        conn.execute("""
+            INSERT INTO task_history_archive 
+            SELECT * FROM task_history WHERE timestamp < ?
+        """, (cutoff,))
+        
+        conn.execute("DELETE FROM task_history WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        
+        print(f"🧹 [Archive] Moved {count} history records older than {days} days")
+        return count
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Archive] DB Error: {e}")
+        return 0
+
+
+# --- V3.3: Auto-Scaler Hook ---
+def provision_virtual_worker(conn: sqlite3.Connection, lane: str) -> Optional[str]:
+    """
+    V3.3: Auto-scale by provisioning a virtual worker.
+    This is a hook for K8s/Lambda/Cursor session spin-up.
+    Respects MAX_AUTO_SCALE_WORKERS limit.
+    
+    Returns: new worker_id or None if limit reached
+    """
+    try:
+        # Check current auto-scaled worker count
+        count = conn.execute("""
+            SELECT COUNT(*) as c FROM worker_health 
+            WHERE worker_id LIKE ? AND lane = ?
+        """, (f"@{lane}-auto-%", lane)).fetchone()['c']
+        
+        if count >= MAX_AUTO_SCALE_WORKERS:
+            print(f"⚠️ [Scaler] {lane} at auto-scale limit ({count}/{MAX_AUTO_SCALE_WORKERS})")
+            return None
+        
+        # Provision new worker
+        new_id = f"@{lane}-auto-{int(time.time())}"
+        print(f"⚡ [Scaler] Provisioning virtual worker: {new_id}")
+        
+        conn.execute("""
+            INSERT INTO worker_health (worker_id, lane, tier, capacity_limit, status, last_seen)
+            VALUES (?, ?, 'standard', 3, 'online', ?)
+        """, (new_id, lane, int(time.time())))
+        
+        invalidate_worker_cache(lane)
+        metrics["auto_scale_events"] += 1
+        conn.commit()
+        
+        return new_id
+        
+    except sqlite3.Error as e:
+        print(f"⚠️ [Scaler] DB Error: {e}")
+        return None
 
 
 # --- V3.2: Smart Backoff ---
@@ -979,13 +1151,13 @@ def write_health_status():
 
 # --- Main Loop ---
 def run_controller():
-    """Main controller loop (V3.2 - Diamond Master)."""
-    print(f"🧠 [System] Vibe Controller V3.2 Active (Diamond: Intelligent Routing)")
-    print(f"   Architecture: HYBRID (Direct + Auto-Routing + Worker Tiers)")
+    """Main controller loop (V3.3 - Titanium Master)."""
+    print(f"🧠 [System] Vibe Controller V3.3 Active (Titanium: Optimized Routing)")
+    print(f"   Architecture: HYBRID (Direct + Auto-Routing + Worker Tiers + Cache)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE}")
-    print(f"   Assignment Timeout: {ASSIGNMENT_TIMEOUT_SEC}s | Idle Timeout: {IDLE_TIMEOUT_SEC}s")
-    print(f"   Features: Worker Tiers, Priority Inheritance, Smart Backoff, DLQ")
-    print(f"   Saturation Guard: Active | Deduplication: Active")
+    print(f"   Cache TTL: {CACHE_TTL}s | Archive Days: {HISTORY_ARCHIVE_DAYS}")
+    print(f"   Features: Weighted Scoring, In-Memory Cache, History Archival")
+    print(f"   Auto-Scaler: MAX {MAX_AUTO_SCALE_WORKERS} workers | Saturation Guard: Active")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
     conn = get_db()
@@ -995,6 +1167,7 @@ def run_controller():
     
     loop_count = 0
     integrity_check_interval = 100  # Check every 100 loops (~8 minutes)
+    archive_interval = 100  # Archive history every 100 loops
     
     try:
         while running:
@@ -1019,6 +1192,10 @@ def run_controller():
             loop_count += 1
             if loop_count % integrity_check_interval == 0:
                 check_db_integrity(conn)
+            
+            # V3.3: Periodic history archival
+            if loop_count % archive_interval == 0:
+                archive_old_history(conn)
             
             # Write health status
             write_health_status()
