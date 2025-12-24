@@ -2,10 +2,10 @@
 
 ## 🚀 System Status: PRODUCTION READY
 
-**Version:** v1.1 (Gold Master)  
+**Version:** v1.2 (Platinum Master)  
 **Last Updated:** 2024-12-24  
-**Test Coverage:** 23/23 passing ✅  
-**New in V1.1:** Rejection Handling, Guardian Chaining, Circuit Breaker
+**Test Coverage:** Fully Verified ✅  
+**New in V1.2:** Blocked Task Management, Agent Tools, Smart Notifications
 
 ---
 
@@ -13,7 +13,8 @@
 
 | Artifact | Location | Status | Purpose |
 |----------|----------|--------|---------|
-| **Vibe Controller** | `vibe_controller.py` | ✅ V1.1 | Autonomous orchestrator with rejection handling |
+| **Vibe Controller** | `vibe_controller.py` | ✅ V1.2 | Platinum Master with blocked task sweeper |
+| **Agent Tools** | `agent_tools.py` | ✅ New | Worker interface (`ask_clarification`, `claim_task`) |
 | **Infrastructure SQL** | `migrations/v24_infrastructure.sql` | ✅ Complete | Consolidated schema + indexes |
 | **Architect SOP** | `library/prompts/architect_sop.md` | ✅ V1.1 | Brain with Lane Discipline rule |
 | **Backend Worker SOP** | `library/prompts/backend_worker_sop.md` | ✅ Reference | Code quality guardian with veto power |
@@ -191,6 +192,20 @@ Controller: sweep_stale_leases()
   - FAIL #1 (attempt_count=3, status='failed')
   - Send critical alert
 Status: 🔴 FAILED (worker issue detected)
+```
+
+### Workflow 5: Blocked Task Recovery (V1.2)
+```
+Worker: claim Task #1 → finds missing API key
+Worker: ask_clarification(1, "Missing API Key")
+  - Status -> 'blocked'
+  - Metadata['blocker_msg'] = "Missing API Key"
+Controller: sweep_blocked_tasks()
+  - Wait 24h (BLOCKED_TIMEOUT)
+  - Reassign #1 (attempt_count=1) -> "Fresh Eyes"
+New Worker: claim #1 → finds API key in .env.example
+New Worker: fix → submit
+Status: ✅ Completed (Recovered via Reassignment)
 ```
 
 

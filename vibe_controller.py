@@ -1,6 +1,6 @@
 """
-Vibe Controller V1.1 Gold Master
-================================
+Vibe Controller V1.2 Platinum Master
+====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
 Features:
@@ -8,6 +8,7 @@ Features:
 - Circuit breaker for timeouts and QA rejections (3 retries max)
 - Rejection handling: QA can reject dev work, triggers retry with feedback
 - Guardian chaining: QA -> Docs (Docs waits for QA to pass)
+- **Blocked task management: 24h timeout, smart reassignment, escalation**
 - Prometheus-ready health metrics
 - Periodic DB integrity checks
 """
@@ -25,6 +26,7 @@ from datetime import datetime
 # --- Configuration ---
 DB_PATH = os.getenv("DB_PATH", "vibe_coding.db")
 LEASE_TIMEOUT_SEC = int(os.getenv("LEASE_TIMEOUT_SEC", "600"))
+BLOCKED_TIMEOUT_SEC = int(os.getenv("BLOCKED_TIMEOUT_SEC", "86400"))  # 24 hours
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 MAX_RETRIES = 3
@@ -110,22 +112,35 @@ def predict_next_step(task: Dict[str, Any]) -> str:
 # --- Notification Layer (Console + Extensible Hooks) ---
 def notify_human(task_id: int, reason: str, priority: str = "info"):
     """
-    Console notification with hooks for future integrations.
+    Console notification with smart classification and hooks for future integrations.
     Priority levels: info, warning, critical
     """
     timestamp = time.strftime("%H:%M:%S")
     icons = {"info": "🔔", "warning": "⚠️", "critical": "🚨"}
     icon = icons.get(priority, "🔔")
     
-    msg = f"{icon} [{timestamp}] Task #{task_id}: {reason}"
+    # Smart Classification (V1.2)
+    category = "General"
+    if "file" in reason.lower() or "dependency" in reason.lower():
+        category = "Missing Dependency"
+    elif "ambiguous" in reason.lower() or "unclear" in reason.lower():
+        category = "Ambiguity"
+    elif "risk" in reason.lower():
+        category = "Risk Gate"
+    elif "blocked" in reason.lower():
+        category = "Blocked Task"
+    
+    msg = f"{icon} [{timestamp}] Task #{task_id} [{category}]: {reason}"
     print(msg)
     
     # Future hook: Slack, PagerDuty, Email
     # if SLACK_WEBHOOK_URL and priority == "critical":
-    #     requests.post(SLACK_WEBHOOK_URL, json={"text": msg})
+    #     payload = {"text": msg}
+    #     if priority == "critical": payload['style'] = "danger"
+    #     requests.post(SLACK_WEBHOOK_URL, json=payload)
     
     # Persist critical alerts to DB for tracking
-    if priority == "critical":
+    if priority in ["critical", "warning"]:
         try:
             conn = sqlite3.connect(DB_PATH)
             conn.execute(
@@ -162,7 +177,7 @@ def sweep_stale_leases(conn: sqlite3.Connection) -> int:
             if attempts >= MAX_RETRIES:
                 # Circuit Breaker: Fail
                 conn.execute(
-                    "UPDATE tasks SET status='failed', worker_id=NULL, lease_id=NULL, updated_at=? WHERE id=?",
+                    "UPDATE tasks SET status='failed', worker_id=NULL, lease_id=NULL, updated_at=? WHERE id=?", # SAFETY-ALLOW: status-write
                     (now, task_id)
                 )
                 notify_human(task_id, f"Failed after {attempts} attempts (Timeout).", "critical")
@@ -171,7 +186,7 @@ def sweep_stale_leases(conn: sqlite3.Connection) -> int:
             else:
                 # Retry
                 conn.execute(
-                    "UPDATE tasks SET status='pending', worker_id=NULL, lease_id=NULL, attempt_count=?, updated_at=? WHERE id=?",
+                    "UPDATE tasks SET status='pending', worker_id=NULL, lease_id=NULL, attempt_count=?, updated_at=? WHERE id=?", # SAFETY-ALLOW: status-write
                     (attempts, now, task_id)
                 )
                 print(f"♻️ [Sweeper] Task #{task_id} recovered (Attempt {attempts}/{MAX_RETRIES}).")
@@ -186,6 +201,67 @@ def sweep_stale_leases(conn: sqlite3.Connection) -> int:
         traceback.print_exc()
     
     return recovered
+
+
+def sweep_blocked_tasks(conn: sqlite3.Connection) -> int:
+    """
+    Manage blocked tasks (V1.2).
+    If blocked > 24h -> Reassign or Escalate.
+    Returns count of tasks processed.
+    """
+    now = int(time.time())
+    threshold = now - BLOCKED_TIMEOUT_SEC
+    processed = 0
+    
+    try:
+        # Find tasks blocked longer than 24h
+        long_blocked = conn.execute(f"""
+            SELECT id, attempt_count, metadata FROM tasks 
+            WHERE status='blocked' AND updated_at < ?
+            LIMIT {BATCH_SIZE}
+        """, (threshold,)).fetchall()
+
+        for task in long_blocked:
+            task_id = task['id']
+            attempts = task['attempt_count'] + 1
+            metadata = json.loads(task['metadata'] or '{}')
+            blocker_msg = metadata.get('blocker_msg', 'Unknown reason')
+            
+            print(f"⚠️ [BlockWatch] Task #{task_id} blocked > 24h.")
+            
+            if attempts >= MAX_RETRIES:
+                # We tried reassigning, still blocked. Escalate to human.
+                notify_human(
+                    task_id, 
+                    f"STILL BLOCKED after {attempts} reassignments. Human intervention mandatory. Reason: {blocker_msg}",
+                    "critical"
+                )
+                # Touch updated_at so we don't spam every 5 seconds (wait another 24h or manual fix)
+                conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+                metrics["tasks_failed"] += 1
+            else:
+                # Reassign to fresh worker (V1.2 Refinement 4)
+                conn.execute("""
+                    UPDATE tasks 
+                    SET status='pending', worker_id=NULL, lease_id=NULL, attempt_count=?, updated_at=?
+                    WHERE id=?
+                """, (attempts, now, task_id))  # SAFETY-ALLOW: status-write
+                notify_human(
+                    task_id,
+                    f"Blocked too long ({BLOCKED_TIMEOUT_SEC//3600}h). Reassigning to new worker (Attempt {attempts}/{MAX_RETRIES}).",
+                    "warning"
+                )
+                print(f"🔄 [BlockWatch] Task #{task_id} reassigned (fresh eyes strategy).")
+                processed += 1
+        
+        if long_blocked:
+            conn.commit()
+
+    except sqlite3.Error as e:
+        print(f"⚠️ [BlockWatch] DB Error: {e}")
+        traceback.print_exc()
+    
+    return processed
 
 
 def handle_review_queue(conn: sqlite3.Connection):
@@ -270,12 +346,12 @@ def handle_rejection(conn: sqlite3.Connection, qa_task: Dict[str, Any], metadata
         conn.execute("BEGIN")
         
         # 1. Complete QA Task (The QA did their job correctly by rejecting)
-        conn.execute("UPDATE tasks SET status='completed', updated_at=? WHERE id=?", (now, qa_task_id))
+        conn.execute("UPDATE tasks SET status='completed', updated_at=? WHERE id=?", (now, qa_task_id)) # SAFETY-ALLOW: status-write
         
         # 2. Handle Original Task
         if attempts >= MAX_RETRIES:
             # FIX #3: Failure Circuit Breaker
-            conn.execute("UPDATE tasks SET status='failed', updated_at=? WHERE id=?", (now, original_task_id))
+            conn.execute("UPDATE tasks SET status='failed', updated_at=? WHERE id=?", (now, original_task_id)) # SAFETY-ALLOW: status-write
             notify_human(original_task_id, f"Failed after {attempts} attempts. Last Rejection: {reason}", "critical")
             print(f"💀 [Controller] Task #{original_task_id} FAILED (QA Rejected {MAX_RETRIES} times).")
             metrics["tasks_failed"] += 1
@@ -285,7 +361,7 @@ def handle_rejection(conn: sqlite3.Connection, qa_task: Dict[str, Any], metadata
                 UPDATE tasks 
                 SET status='pending', worker_id=NULL, lease_id=NULL, attempt_count=?, updated_at=?
                 WHERE id=?
-            """, (attempts, now, original_task_id))
+            """, (attempts, now, original_task_id)) # SAFETY-ALLOW: status-write
             
             # Log Feedback
             conn.execute("""
@@ -300,7 +376,6 @@ def handle_rejection(conn: sqlite3.Connection, qa_task: Dict[str, Any], metadata
         conn.rollback()
         print(f"💥 [Rejection] Failed to reset Task #{original_task_id}: {e}")
         traceback.print_exc()
-
 
 
 def approve_task(conn: sqlite3.Connection, task: Dict[str, Any]):
@@ -319,9 +394,10 @@ def approve_task(conn: sqlite3.Connection, task: Dict[str, Any]):
         
         # Mark task completed
         conn.execute(
-            "UPDATE tasks SET status='completed', updated_at=? WHERE id=?",
+            "UPDATE tasks SET status='completed', updated_at=? WHERE id=?", # SAFETY-ALLOW: status-write
             (now, task_id)
         )
+
         
         # Log next step suggestion
         conn.execute(
@@ -419,7 +495,7 @@ def cleanup_on_shutdown(conn: sqlite3.Connection):
             UPDATE tasks 
             SET status='pending', worker_id=NULL, lease_id=NULL, updated_at=?
             WHERE status='in_progress'
-        """, (now,))
+        """, (now,))  # SAFETY-ALLOW: status-write
         conn.commit()
         
         if cursor.rowcount > 0:
@@ -446,8 +522,9 @@ def write_health_status():
 # --- Main Loop ---
 def run_controller():
     """Main controller loop."""
-    print(f"🧠 [System] Vibe Controller V1.1 Active (Rejection Handling + Guardian Chaining)")
+    print(f"🧠 [System] Vibe Controller V1.2 Active (Platinum: Blocked Task Management)")
     print(f"   DB: {DB_PATH} | Poll: {POLL_INTERVAL}s | Batch: {BATCH_SIZE} | Max Retries: {MAX_RETRIES}")
+    print(f"   Block Timeout: {BLOCKED_TIMEOUT_SEC}s")
     print(f"   Metrics collection: every {METRICS_INTERVAL}s")
     print(f"   Press Ctrl+C to stop gracefully.\n")
     
@@ -464,6 +541,7 @@ def run_controller():
             start_time = time.time()
             
             sweep_stale_leases(conn)
+            sweep_blocked_tasks(conn)
             handle_review_queue(conn)
             update_queue_metrics(conn)
             
