@@ -1,19 +1,23 @@
 """
-Vibe Controller V4.0 Uranium Master
+Vibe Controller V4.1 Uranium Master
 ====================================
 Autonomous orchestration engine for the Vibe Coding System.
 
-Architecture: HYBRID DELEGATION + PROMPT COMPILER
+Architecture: HYBRID DELEGATION + MCP COMPILER
 - Architect can assign specific workers OR use "auto" for load balancing
 - Worker tiers (senior/standard) match task complexity
-- Skill packs (skills/*.md) auto-injected into task context
+- Skill packs (skills/*.md) auto-injected into task context via MCP
+
+Features V4.1 (Tier 1):
+- Enhanced Guardrails: 3-layer protection (Injection, Data, Code)
+- MCP Tooling: skill_compactor, git_server, search_server
+- Auto-Fallback Logging: Missing skills logged to LESSONS_LEARNED.md
 
 Features V4.0:
 - Prompt Compiler: expand_task_context() injects lane skill packs
 - AGENTS.md: Global constitution for all workers
 - LESSONS_LEARNED.md: Auto-appended anti-regression lessons
 - Skill Packs: frontend, backend, security, ux, data, qa, _default
-- MAX_SKILL_CHARS: Truncation for large skill packs
 
 Features V3.4:
 - Specialist Workers: @security-1, @ux-designer, @data-analyst
@@ -795,6 +799,13 @@ def expand_task_context(conn: sqlite3.Connection, task: Dict) -> bool:
         if not os.path.exists(skill_file):
             print(f"⚠️ [Compiler] No skill pack for lane '{lane}', proceeding without")
             return False
+            
+        # V4.1: Log fallback to lessons
+        print(f"⚠️ [Compiler] Missing skill pack for lane '{lane}', using default")
+        append_lesson_learned(
+            f"Missing skill pack for lane '{lane}'. Fallback applied. Create 'skills/{lane}.md'.", 
+            category="System"
+        )
     
     try:
         # Read skill pack

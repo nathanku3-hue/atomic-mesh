@@ -23,7 +23,13 @@ A task is ONLY complete when:
 - **ALWAYS** use parameterized queries for SQL
 - **ALWAYS** validate user input
 
-### 5. Communication Protocol
+### 5. MCP Tool Protocols (V4.1)
+- **Compiler:** `get_lane_rules` + `get_relevant_lessons` required before task gen.
+- **X-Ray:** Use `search_code` / `find_definition` instead of reading all files.
+- **Atomic Git:** `git_status` -> `git_diff` -> `git_commit` (clean state required).
+- **Guardrails:** Commit fails if secrets detected. Revert immediately.
+
+### 6. Communication Protocol
 - Status updates: `📋 STATUS: [brief description]`
 - Blockers: `🚧 BLOCKED: [reason]`
 - Questions: `❓ QUESTION: [specific question]`
